@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <linearGradient id="vbGold" x1="96" y1="64" x2="416" y2="448" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#F7DF8E" />
+      <stop offset="50%" stop-color="#D4AF37" />
+      <stop offset="100%" stop-color="#9A7316" />
+    </linearGradient>
+    <linearGradient id="vbInner" x1="160" y1="120" x2="360" y2="390" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFF2BD" />
+      <stop offset="45%" stop-color="#D4AF37" />
+      <stop offset="100%" stop-color="#8A6208" />
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="#0A0906" />
+  <path d="M256 64L404 118V250C404 345 341 416 256 450C171 416 108 345 108 250V118L256 64Z" stroke="url(#vbGold)" stroke-width="20" fill="#120F09" />
+  <path d="M256 96L374 139V246C374 323 324 382 256 412C188 382 138 323 138 246V139L256 96Z" fill="#0D0B07" stroke="#D4AF37" stroke-opacity="0.3" stroke-width="4" />
+  <!-- Geometric Lion-Crest Crown & Mane -->
+  <path d="M256 128L298 158L340 152L322 198L348 232L312 254L324 298L280 318L256 368L232 318L188 298L200 254L164 232L190 198L172 152L214 158L256 128Z" fill="url(#vbInner)" />
+  <!-- Sculpted Lion Visor Cutouts -->
+  <path d="M256 176L294 216L278 268L256 290L234 268L218 216L256 176Z" fill="#0A0906" />
+  <path d="M226 218L246 226L234 236L226 218Z" fill="#F5D77A" />
+  <path d="M286 218L266 226L278 236L286 218Z" fill="#F5D77A" />
+  <path d="M256 242L270 256L256 276L242 256L256 242Z" fill="#D4AF37" />
+</svg>

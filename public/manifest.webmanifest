@@ -1,0 +1,32 @@
+{
+  "id": "/",
+  "name": "VeriBox — Free SMS, OTP & Temp Email",
+  "short_name": "VeriBox",
+  "description": "Receive real-time SMS verification codes and temporary emails for Facebook, Instagram, TikTok, and WhatsApp.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "theme_color": "#0D0B07",
+  "background_color": "#0A0906",
+  "icons": [
+    {
+      "src": "/pwa-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-maskable-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}

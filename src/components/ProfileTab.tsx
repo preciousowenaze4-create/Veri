@@ -1,0 +1,377 @@
+import { useState } from 'react';
+import {
+  Check,
+  Copy,
+  Mail,
+  MailPlus,
+  MessageSquareText,
+  Moon,
+  Sun,
+  Trash2,
+  User,
+} from 'lucide-react';
+import type { CopiedOtpRecord, PhoneNumberEntry, TempEmailAccount } from '../types';
+import { formatRelativeTime } from '../utils/clipboard';
+import { PWAInstallButton } from './PWAInstallButton';
+
+interface ProfileTabProps {
+  activeEmail: TempEmailAccount | null;
+  savedEmails: TempEmailAccount[];
+  savedNumbers: PhoneNumberEntry[];
+  otpHistory: CopiedOtpRecord[];
+  autoRefresh: boolean;
+  isDark: boolean;
+  onCreateEmail: () => void;
+  onSelectEmail: (account: TempEmailAccount) => void;
+  onRemoveEmail: (address: string) => void;
+  onOpenSmsNumber: (entry: PhoneNumberEntry) => void;
+  onRemoveSavedNumber: (digits: string) => void;
+  onToggleAutoRefresh: () => void;
+  onToggleTheme: () => void;
+  onClearHistory: () => void;
+  onCopyText: (value: string, label: string) => void;
+}
+
+export function ProfileTab({
+  activeEmail,
+  savedEmails,
+  savedNumbers,
+  otpHistory,
+  autoRefresh,
+  isDark,
+  onCreateEmail,
+  onSelectEmail,
+  onRemoveEmail,
+  onOpenSmsNumber,
+  onRemoveSavedNumber,
+  onToggleAutoRefresh,
+  onToggleTheme,
+  onClearHistory,
+  onCopyText,
+}: ProfileTabProps) {
+  const [confirmClear, setConfirmClear] = useState(false);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
+
+  const handleCopy = (id: string, value: string, label: string) => {
+    onCopyText(value, label);
+    setCopiedId(id);
+    window.setTimeout(() => setCopiedId((prev) => (prev === id ? null : prev)), 1500);
+  };
+
+  return (
+    <div className="space-y-6">
+      {/* Profile Summary Header */}
+      <section className="rounded-2xl border border-[#D4AF37]/30 bg-white p-5 dark:bg-[#14120D]">
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <div className="flex items-center gap-3.5 min-w-0">
+            <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-[#D4AF37] text-[#0A0906]">
+              <User className="h-6 w-6" />
+            </div>
+            <div className="min-w-0">
+              <h1 className="font-display text-xl font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
+                Your Verification Profile
+              </h1>
+              <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-[#6E6552] tabular-nums dark:text-[#A89F8C]">
+                <span>{savedEmails.length} emails</span>
+                <span aria-hidden="true">·</span>
+                <span>{savedNumbers.length} saved numbers</span>
+                <span aria-hidden="true">·</span>
+                <span>{otpHistory.length} copied codes</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2.5">
+            <PWAInstallButton />
+            <button
+              type="button"
+              onClick={onCreateEmail}
+              className="inline-flex min-h-[40px] items-center gap-2 rounded-xl bg-[#D4AF37] px-4 py-2 text-xs font-bold text-[#0A0906] transition-colors hover:bg-[#E5C150] whitespace-nowrap"
+            >
+              <MailPlus className="h-4 w-4" />
+              <span>Create Email</span>
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-12 lg:items-start">
+        {/* Saved Emails */}
+        <section className="rounded-2xl border border-[#D4AF37]/20 bg-white p-5 lg:col-span-6 dark:bg-[#14120D]">
+          <div className="flex items-center justify-between border-b border-[#D4AF37]/15 pb-3">
+            <h2 className="font-display text-base font-bold text-[#1A160D] dark:text-[#FAF6EC]">
+              Created Emails
+            </h2>
+            <span className="text-xs text-[#6E6552] dark:text-[#A89F8C]">
+              Switch back anytime
+            </span>
+          </div>
+
+          {savedEmails.length === 0 ? (
+            <div className="py-10 text-center text-sm text-[#6E6552] dark:text-[#A89F8C]">
+              No created emails yet. Tap Create Email above to start.
+            </div>
+          ) : (
+            <div className="mt-3 space-y-2.5">
+              {savedEmails.map((acct) => {
+                const isActive = activeEmail?.address === acct.address;
+                return (
+                  <div
+                    key={acct.address}
+                    className={`flex flex-wrap items-center justify-between gap-2 rounded-xl border p-3 ${
+                      isActive
+                        ? 'border-[#D4AF37] bg-[#D4AF37]/10'
+                        : 'border-[#D4AF37]/20'
+                    }`}
+                  >
+                    <div className="min-w-0 flex-1">
+                      <p className="font-mono text-xs sm:text-sm font-bold text-[#1A160D] truncate dark:text-[#FAF6EC]">
+                        {acct.address}
+                      </p>
+                      <p className="mt-0.5 text-xs text-[#6E6552] dark:text-[#A89F8C]">
+                        {isActive ? 'Active inbox' : `Created ${formatRelativeTime(acct.createdAt)}`}
+                      </p>
+                    </div>
+
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => onSelectEmail(acct)}
+                        className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg bg-[#D4AF37] px-3 py-1.5 text-xs font-bold text-[#0A0906] hover:bg-[#E5C150]"
+                      >
+                        <Mail className="h-3.5 w-3.5" />
+                        <span>{isActive ? 'Open Inbox' : 'Receive Here'}</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleCopy(acct.address, acct.address, 'Email copied')}
+                        aria-label="Copy email"
+                        className="flex min-h-[38px] min-w-[38px] items-center justify-center rounded-lg border border-[#D4AF37]/25 text-[#6E6552] hover:bg-[#D4AF37]/10 dark:text-[#D5CCB8]"
+                      >
+                        {copiedId === acct.address ? (
+                          <Check className="h-3.5 w-3.5 text-[#D4AF37]" />
+                        ) : (
+                          <Copy className="h-3.5 w-3.5" />
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onRemoveEmail(acct.address)}
+                        aria-label="Delete saved email"
+                        className="flex min-h-[38px] min-w-[38px] items-center justify-center rounded-lg border border-[#D4AF37]/25 text-[#6E6552] hover:border-rose-400 hover:text-rose-500 dark:text-[#A89F8C]"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </section>
+
+        {/* Saved Numbers */}
+        <section className="rounded-2xl border border-[#D4AF37]/20 bg-white p-5 lg:col-span-6 dark:bg-[#14120D]">
+          <div className="flex items-center justify-between border-b border-[#D4AF37]/15 pb-3">
+            <h2 className="font-display text-base font-bold text-[#1A160D] dark:text-[#FAF6EC]">
+              Saved Phone Numbers
+            </h2>
+            <span className="text-xs text-[#6E6552] tabular-nums dark:text-[#A89F8C]">
+              {savedNumbers.length} saved
+            </span>
+          </div>
+
+          {savedNumbers.length === 0 ? (
+            <div className="py-10 text-center text-sm text-[#6E6552] dark:text-[#A89F8C]">
+              Bookmark any phone number in SMS or Numbers to keep it here.
+            </div>
+          ) : (
+            <div className="mt-3 space-y-2.5">
+              {savedNumbers.map((entry) => (
+                <div
+                  key={entry.digits}
+                  className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[#D4AF37]/20 p-3"
+                >
+                  <div className="min-w-0">
+                    <p className="font-mono text-sm font-bold text-[#1A160D] dark:text-[#FAF6EC]">
+                      {entry.number}
+                    </p>
+                    <p className="text-xs text-[#6E6552] dark:text-[#A89F8C]">
+                      {entry.country} · {entry.platform}
+                    </p>
+                  </div>
+
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => onOpenSmsNumber(entry)}
+                      className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg bg-[#D4AF37] px-3 py-1.5 text-xs font-bold text-[#0A0906] hover:bg-[#E5C150]"
+                    >
+                      <MessageSquareText className="h-3.5 w-3.5" />
+                      <span>Read SMS</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleCopy(entry.digits, entry.number, 'Number copied')}
+                      aria-label="Copy phone number"
+                      className="flex min-h-[38px] min-w-[38px] items-center justify-center rounded-lg border border-[#D4AF37]/25 text-[#6E6552] hover:bg-[#D4AF37]/10 dark:text-[#D5CCB8]"
+                    >
+                      {copiedId === entry.digits ? (
+                        <Check className="h-3.5 w-3.5 text-[#D4AF37]" />
+                      ) : (
+                        <Copy className="h-3.5 w-3.5" />
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onRemoveSavedNumber(entry.digits)}
+                      aria-label="Remove saved number"
+                      className="flex min-h-[38px] min-w-[38px] items-center justify-center rounded-lg border border-[#D4AF37]/25 text-[#6E6552] hover:border-rose-400 hover:text-rose-500 dark:text-[#A89F8C]"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+      </div>
+
+      {/* Recent Copied OTP Codes + Preferences */}
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-12 lg:items-start">
+        <section className="rounded-2xl border border-[#D4AF37]/20 bg-white p-5 lg:col-span-7 dark:bg-[#14120D]">
+          <div className="flex items-center justify-between border-b border-[#D4AF37]/15 pb-3">
+            <h2 className="font-display text-base font-bold text-[#1A160D] dark:text-[#FAF6EC]">
+              Recent Copied OTP Codes
+            </h2>
+            {otpHistory.length > 0 && (
+              <button
+                type="button"
+                onClick={onClearHistory}
+                className="text-xs font-bold text-[#6E6552] hover:text-rose-500 dark:text-[#A89F8C]"
+              >
+                Clear Log
+              </button>
+            )}
+          </div>
+
+          {otpHistory.length === 0 ? (
+            <div className="py-8 text-center text-sm text-[#6E6552] dark:text-[#A89F8C]">
+              Codes you copy from SMS or Email will appear here for quick reuse.
+            </div>
+          ) : (
+            <div className="mt-3 divide-y divide-[#D4AF37]/15">
+              {otpHistory.map((item) => (
+                <div key={item.id} className="flex items-center justify-between gap-3 py-2.5">
+                  <div className="min-w-0">
+                    <p className="font-mono text-base font-bold tracking-wider text-[#1A160D] dark:text-[#F5D77A]">
+                      {item.code}
+                    </p>
+                    <p className="text-xs text-[#6E6552] truncate dark:text-[#A89F8C]">
+                      {item.channel} · {item.source} · {formatRelativeTime(item.copiedAt)}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => handleCopy(item.id, item.code, `OTP ${item.code} copied`)}
+                    className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg border border-[#D4AF37]/30 px-3 py-1.5 text-xs font-bold text-[#4F4736] hover:bg-[#D4AF37]/10 dark:text-[#F5D77A]"
+                  >
+                    {copiedId === item.id ? (
+                      <Check className="h-3.5 w-3.5 text-[#D4AF37]" />
+                    ) : (
+                      <Copy className="h-3.5 w-3.5" />
+                    )}
+                    <span>Copy</span>
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+
+        <section className="rounded-2xl border border-[#D4AF37]/20 bg-white p-5 lg:col-span-5 dark:bg-[#14120D]">
+          <h2 className="font-display text-base font-bold text-[#1A160D] dark:text-[#FAF6EC]">
+            App Preferences
+          </h2>
+
+          <div className="mt-4 space-y-3">
+            <button
+              type="button"
+              onClick={onToggleAutoRefresh}
+              className="flex min-h-[48px] w-full items-center justify-between rounded-xl border border-[#D4AF37]/20 px-4 py-3 text-left transition-colors hover:bg-[#D4AF37]/10"
+            >
+              <div>
+                <p className="text-sm font-bold text-[#1A160D] dark:text-[#FAF6EC]">
+                  Auto-Refresh Inboxes
+                </p>
+                <p className="text-xs text-[#6E6552] dark:text-[#A89F8C]">
+                  Real-time SMS stream and live Email polling
+                </p>
+              </div>
+              <span className="font-mono text-xs font-bold text-[#9A6F09] dark:text-[#F5D77A]">
+                {autoRefresh ? 'ON' : 'OFF'}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              onClick={onToggleTheme}
+              className="flex min-h-[48px] w-full items-center justify-between rounded-xl border border-[#D4AF37]/20 px-4 py-3 text-left transition-colors hover:bg-[#D4AF37]/10"
+            >
+              <div>
+                <p className="text-sm font-bold text-[#1A160D] dark:text-[#FAF6EC]">
+                  Gold Appearance
+                </p>
+                <p className="text-xs text-[#6E6552] dark:text-[#A89F8C]">
+                  Switch between Obsidian Gold and Warm Ivory
+                </p>
+              </div>
+              {isDark ? (
+                <Sun className="h-4 w-4 text-[#F5D77A]" />
+              ) : (
+                <Moon className="h-4 w-4 text-[#8A6208]" />
+              )}
+            </button>
+
+            {confirmClear ? (
+              <div className="flex items-center justify-between gap-2 rounded-xl border border-rose-500/30 bg-rose-500/10 p-3">
+                <span className="text-xs font-semibold text-rose-700 dark:text-rose-200">
+                  Clear OTP history?
+                </span>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setConfirmClear(false)}
+                    className="min-h-[36px] rounded-lg px-2.5 text-xs font-bold text-[#4F4736] dark:text-[#D5CCB8]"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onClearHistory();
+                      setConfirmClear(false);
+                    }}
+                    className="min-h-[36px] rounded-lg bg-rose-600 px-3 text-xs font-bold text-white"
+                  >
+                    Confirm
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setConfirmClear(true)}
+                className="flex min-h-[48px] w-full items-center justify-between rounded-xl border border-[#D4AF37]/20 px-4 py-3 text-left text-sm font-bold text-rose-600 transition-colors hover:bg-rose-500/10 dark:text-rose-400"
+              >
+                <span>Clear Copied OTP Log</span>
+                <Trash2 className="h-4 w-4" />
+              </button>
+            )}
+          </div>
+        </section>
+      </div>
+    </div>
+  );
+}

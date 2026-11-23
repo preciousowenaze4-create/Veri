@@ -589,17 +589,30 @@ async function fetchSmsMessagesForEntry(
 // ==========================================
 // Multi-Provider Disposable Email Helpers
 // ==========================================
+const mailTmDomainsCache: { data: string[]; expiresAt: number } = { data: [], expiresAt: 0 };
+const tempMailIoDomainsCache: { data: string[]; expiresAt: number } = { data: [], expiresAt: 0 };
+
 async function getMailTmDomains(): Promise<string[]> {
+  if (mailTmDomainsCache.data.length > 0 && Date.now() < mailTmDomainsCache.expiresAt) {
+    return mailTmDomainsCache.data;
+  }
   const response = await fetch('https://api.mail.tm/domains?page=1', {
-    headers: { Accept: 'application/json' },
-    signal: AbortSignal.timeout(6000),
+    headers: { Accept: 'application/json', 'User-Agent': USER_AGENT },
+    signal: AbortSignal.timeout(4000),
   });
-  if (!response.ok) return [];
+  if (!response.ok) {
+    return mailTmDomainsCache.data;
+  }
   const json = (await response.json()) as
     | { 'hydra:member'?: Array<{ domain: string; isActive: boolean }> }
     | Array<{ domain: string; isActive: boolean }>;
   const list = Array.isArray(json) ? json : json['hydra:member'] || [];
-  return list.filter((d) => d.isActive !== false && d.domain).map((d) => d.domain);
+  const domains = list.filter((d) => d.isActive !== false && d.domain).map((d) => d.domain);
+  if (domains.length > 0) {
+    mailTmDomainsCache.data = domains;
+    mailTmDomainsCache.expiresAt = Date.now() + 5 * 60 * 1000;
+  }
+  return domains;
 }
 
 function randomTokenString(len: number): string {
@@ -629,18 +642,18 @@ async function createMailTmAccount(username?: string, requestedDomain?: string, 
   let address = `${prefix}@${domain}`;
   let createRes = await fetch('https://api.mail.tm/accounts', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': USER_AGENT },
     body: JSON.stringify({ address, password }),
-    signal: AbortSignal.timeout(7000),
+    signal: AbortSignal.timeout(4000),
   });
 
   if (createRes.status === 422) {
     address = `${prefix}.${randomTokenString(4)}@${domain}`;
     createRes = await fetch('https://api.mail.tm/accounts', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': USER_AGENT },
       body: JSON.stringify({ address, password }),
-      signal: AbortSignal.timeout(7000),
+      signal: AbortSignal.timeout(4000),
     });
   }
 
@@ -651,9 +664,9 @@ async function createMailTmAccount(username?: string, requestedDomain?: string, 
   const account = (await createRes.json()) as { id: string; address: string; createdAt?: string };
   const tokenRes = await fetch('https://api.mail.tm/token', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': USER_AGENT },
     body: JSON.stringify({ address: account.address, password }),
-    signal: AbortSignal.timeout(7000),
+    signal: AbortSignal.timeout(4000),
   });
   if (!tokenRes.ok) throw new Error('Mail.tm login failed');
   const tokenJson = (await tokenRes.json()) as { token: string };
@@ -671,9 +684,9 @@ async function createMailTmAccount(username?: string, requestedDomain?: string, 
 async function createTempMailLolAccount() {
   const res = await fetch('https://api.tempmail.lol/v2/inbox/create', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': USER_AGENT },
     body: JSON.stringify({}),
-    signal: AbortSignal.timeout(7000),
+    signal: AbortSignal.timeout(4000),
   });
   if (!res.ok) throw new Error(`TempMail.lol error ${res.status}`);
   const data = (await res.json()) as { address: string; token: string };
@@ -691,7 +704,7 @@ async function createTempMailLolAccount() {
 async function createGuerrillaAccount(username?: string) {
   const res = await fetch('https://api.guerrillamail.com/ajax.php?f=get_email_address', {
     headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' },
-    signal: AbortSignal.timeout(7000),
+    signal: AbortSignal.timeout(4000),
   });
   if (!res.ok) throw new Error(`GuerrillaMail error ${res.status}`);
   const data = (await res.json()) as { email_addr: string; sid_token: string };
@@ -702,7 +715,7 @@ async function createGuerrillaAccount(username?: string) {
   if (cleanPrefix.length >= 3) {
     const setRes = await fetch(
       `https://api.guerrillamail.com/ajax.php?f=set_email_user&email_user=${encodeURIComponent(cleanPrefix)}&sid_token=${encodeURIComponent(data.sid_token)}`,
-      { headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' }, signal: AbortSignal.timeout(6000) }
+      { headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' }, signal: AbortSignal.timeout(3500) }
     );
     if (setRes.ok) {
       const setJson = (await setRes.json()) as { email_addr?: string };
@@ -721,17 +734,27 @@ async function createGuerrillaAccount(username?: string) {
 }
 
 async function getTempMailIoDomains(): Promise<string[]> {
+  if (tempMailIoDomainsCache.data.length > 0 && Date.now() < tempMailIoDomainsCache.expiresAt) {
+    return tempMailIoDomainsCache.data;
+  }
   const response = await fetch('https://api.internal.temp-mail.io/api/v3/domains', {
     headers: { Accept: 'application/json', 'User-Agent': USER_AGENT },
-    signal: AbortSignal.timeout(5000),
+    signal: AbortSignal.timeout(3500),
   });
-  if (!response.ok) return [];
+  if (!response.ok) {
+    return tempMailIoDomainsCache.data;
+  }
   const json = (await response.json()) as {
     domains?: Array<{ name: string; type?: string }>;
   };
-  return (json.domains || [])
+  const domains = (json.domains || [])
     .map((d) => d.name)
     .filter((name) => Boolean(name) && name.length <= 18);
+  if (domains.length > 0) {
+    tempMailIoDomainsCache.data = domains;
+    tempMailIoDomainsCache.expiresAt = Date.now() + 5 * 60 * 1000;
+  }
+  return domains;
 }
 
 async function createTempMailIoAccount(
@@ -757,7 +780,7 @@ async function createTempMailIoAccount(
       'User-Agent': USER_AGENT,
     },
     body: JSON.stringify({ name, domain }),
-    signal: AbortSignal.timeout(6000),
+    signal: AbortSignal.timeout(4000),
   });
   if (!res.ok) throw new Error(`TempMail.io error ${res.status}`);
   const data = (await res.json()) as { email?: string; token?: string };
@@ -2464,17 +2487,31 @@ export function createApiApp() {
       const acct = await createTempMailIoAccount(username, domain, password);
       res.json(acct);
     } catch (err) {
-      try {
-        const fallback =
-          provider === 'tempmailio'
-            ? await createMailTmAccount(username, undefined, password)
-            : await createTempMailIoAccount(username, undefined, password);
-        res.json(fallback);
-      } catch {
-        res.status(502).json({
-          error: err instanceof Error ? err.message : 'Could not create selected email',
-        });
+      const fallbacks: Array<'mailtm' | 'tempmailio' | 'tempmail' | 'guerrilla'> =
+        provider === 'tempmailio'
+          ? ['mailtm', 'tempmail', 'guerrilla']
+          : ['mailtm', 'tempmailio', 'tempmail', 'guerrilla'];
+
+      for (const fb of fallbacks) {
+        if (fb === provider) continue;
+        try {
+          const fallback =
+            fb === 'mailtm'
+              ? await createMailTmAccount(username, undefined, password)
+              : fb === 'tempmailio'
+                ? await createTempMailIoAccount(username, undefined, password)
+                : fb === 'tempmail'
+                  ? await createTempMailLolAccount()
+                  : await createGuerrillaAccount(username);
+          res.json(fallback);
+          return;
+        } catch {
+          // Try next fallback
+        }
       }
+      res.status(502).json({
+        error: err instanceof Error ? err.message : 'Could not create selected email',
+      });
     }
   });
 
@@ -2484,14 +2521,16 @@ export function createApiApp() {
     const domain = typeof req.body?.domain === 'string' ? req.body.domain : undefined;
     const password = typeof req.body?.password === 'string' ? req.body.password : undefined;
 
-    const order: Array<'tempmailio' | 'mailtm' | 'tempmail' | 'guerrilla'> =
+    const order: Array<'mailtm' | 'tempmail' | 'tempmailio' | 'guerrilla'> =
       provider === 'mailtm'
-        ? ['mailtm', 'tempmailio', 'tempmail']
+        ? ['mailtm', 'tempmail', 'tempmailio', 'guerrilla']
         : provider === 'tempmail'
-          ? ['tempmail', 'tempmailio', 'mailtm']
+          ? ['tempmail', 'mailtm', 'tempmailio', 'guerrilla']
           : provider === 'guerrilla'
-            ? ['guerrilla', 'tempmailio', 'mailtm']
-            : ['tempmailio', 'mailtm', 'tempmail'];
+            ? ['guerrilla', 'mailtm', 'tempmail']
+            : provider === 'tempmailio'
+              ? ['tempmailio', 'mailtm', 'tempmail', 'guerrilla']
+              : ['mailtm', 'tempmail', 'tempmailio', 'guerrilla'];
 
     let lastError = 'All email providers are busy';
     for (const candidate of order) {
@@ -2535,7 +2574,7 @@ export function createApiApp() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
         body: JSON.stringify({ address, password }),
-        signal: AbortSignal.timeout(7000),
+        signal: AbortSignal.timeout(5000),
       });
       if (!tokenRes.ok) {
         res.status(tokenRes.status).json({ error: 'Session expired for this email' });
@@ -2562,20 +2601,13 @@ export function createApiApp() {
     try {
       if (provider === 'tempmailio') {
         if (!emailAddress) throw new Error('Missing email address');
-        let response = await fetch(
+        const response = await fetch(
           `https://api.internal.temp-mail.io/api/v3/email/${encodeURIComponent(emailAddress)}/messages`,
-          { headers: { Accept: 'application/json', 'User-Agent': USER_AGENT }, signal: AbortSignal.timeout(6000) }
+          { headers: { Accept: 'application/json', 'User-Agent': USER_AGENT }, signal: AbortSignal.timeout(5000) }
         );
         if (response.status === 400 || response.status === 404) {
-          await new Promise((r) => setTimeout(r, 600));
-          response = await fetch(
-            `https://api.internal.temp-mail.io/api/v3/email/${encodeURIComponent(emailAddress)}/messages`,
-            { headers: { Accept: 'application/json', 'User-Agent': USER_AGENT }, signal: AbortSignal.timeout(6000) }
-          );
-          if (response.status === 400 || response.status === 404) {
-            res.json({ messages: [] });
-            return;
-          }
+          res.json({ messages: [] });
+          return;
         }
         if (!response.ok) throw new Error(`Inbox error (${response.status})`);
         const rawList = (await response.json()) as Array<{
@@ -4168,7 +4200,7 @@ export function createApiApp() {
   }> {
     const imgRes = await fetch(imageUrl, {
       headers: { 'User-Agent': USER_AGENT },
-      signal: AbortSignal.timeout(12000),
+      signal: AbortSignal.timeout(6500),
     });
     if (!imgRes.ok) {
       throw new Error(`Image download failed (${imgRes.status})`);
@@ -4219,14 +4251,14 @@ export function createApiApp() {
     const suffix = STYLE_PROMPT_SUFFIX[style] || '';
     const enhancedPrompt = `${rawPrompt.slice(0, 650)}${suffix}`;
 
-    // 1. Fast path: try Pollinations free tier first (11.5s timeout so it resolves directly when available)
+    // 1. Fast path: try Pollinations free tier first (5.5s timeout so total route always stays < 9.5s on Vercel)
     try {
       const pollUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(
         enhancedPrompt
       )}?width=${dims.width}&height=${dims.height}&seed=${seed}&nologo=true`;
       const pollRes = await fetch(pollUrl, {
         headers: { 'User-Agent': USER_AGENT },
-        signal: AbortSignal.timeout(11500),
+        signal: AbortSignal.timeout(5500),
       });
       const contentType = (pollRes.headers.get('content-type') || '').split(';')[0].trim();
       if (pollRes.ok && contentType.startsWith('image/')) {
@@ -4248,10 +4280,10 @@ export function createApiApp() {
         }
       }
     } catch {
-      // Fall through cleanly to AI Horde free cluster
+      // Fall through cleanly to AI Horde async cluster
     }
 
-    // 2. Reliable Free Distributed Cluster: AI Horde anonymous generation
+    // 2. Reliable Free Distributed Cluster: submit AI Horde job immediately and let client poll /api/images/status/:jobId
     try {
       const hordeReq = await fetch('https://aihorde.net/api/v2/generate/async', {
         method: 'POST',
@@ -4277,7 +4309,7 @@ export function createApiApp() {
           trusted_workers: false,
           r2: true,
         }),
-        signal: AbortSignal.timeout(9000),
+        signal: AbortSignal.timeout(3500),
       });
 
       const hordeData = await readUpstreamJson<{ id?: string; message?: string }>(hordeReq);
@@ -4285,78 +4317,12 @@ export function createApiApp() {
         throw new Error(hordeData?.message || `Image generator queue unavailable (${hordeReq.status})`);
       }
 
-      const jobId = hordeData.id;
-      const deadline = Date.now() + 7500; // Stay safely under Vercel's 30s timeout even after fallback
-      let latestCheck: {
-        done?: boolean;
-        faulted?: boolean;
-        is_possible?: boolean;
-        queue_position?: number;
-        wait_time?: number;
-      } = {};
-
-      while (Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 2000));
-        const checkRes = await fetch(
-          `https://aihorde.net/api/v2/generate/check/${encodeURIComponent(jobId)}`,
-          {
-            headers: {
-              'Client-Agent': 'VeriBox:1.0:veribox.app',
-              'User-Agent': USER_AGENT,
-            },
-            signal: AbortSignal.timeout(5500),
-          }
-        );
-        if (checkRes.ok) {
-          const parsedCheck = await readUpstreamJson<typeof latestCheck>(checkRes);
-          if (parsedCheck) {
-            latestCheck = parsedCheck;
-          }
-          if (latestCheck.faulted || latestCheck.is_possible === false) {
-            throw new Error('Image generation job faulted in free cluster. Please retry.');
-          }
-          if (latestCheck.done) {
-            const statusRes = await fetch(
-              `https://aihorde.net/api/v2/generate/status/${encodeURIComponent(jobId)}`,
-              {
-                headers: {
-                  'Client-Agent': 'VeriBox:1.0:veribox.app',
-                  'User-Agent': USER_AGENT,
-                },
-                signal: AbortSignal.timeout(7000),
-              }
-            );
-            const statusData = await readUpstreamJson<{
-              generations?: Array<{ img?: string; model?: string; censored?: boolean }>;
-            }>(statusRes);
-            const firstGen = statusData?.generations?.[0];
-            if (!firstGen?.img) {
-              throw new Error('No image URL returned by generator.');
-            }
-            const { dataUrl, mimeType } = await downloadImageAsDataUrl(firstGen.img);
-            res.json({
-              status: 'done',
-              imageDataUrl: dataUrl,
-              mimeType,
-              prompt: rawPrompt,
-              enhancedPrompt,
-              width: dims.width,
-              height: dims.height,
-              seed,
-              provider: firstGen.model ? `AI Horde (${firstGen.model})` : 'AI Horde',
-            });
-            return;
-          }
-        }
-      }
-
-      // Still rendering: return pending jobId so client polls /api/images/status/:jobId
       res.status(202).json({
         status: 'pending',
-        jobId,
+        jobId: hordeData.id,
         provider: 'AI Horde',
-        queuePosition: latestCheck.queue_position ?? 0,
-        waitTime: latestCheck.wait_time ?? 15,
+        queuePosition: 0,
+        waitTime: 12,
         width: dims.width,
         height: dims.height,
         seed,
@@ -4385,7 +4351,7 @@ export function createApiApp() {
             'Client-Agent': 'VeriBox:1.0:veribox.app',
             'User-Agent': USER_AGENT,
           },
-          signal: AbortSignal.timeout(8000),
+          signal: AbortSignal.timeout(5000),
         }
       );
 
@@ -4441,7 +4407,7 @@ export function createApiApp() {
             'Client-Agent': 'VeriBox:1.0:veribox.app',
             'User-Agent': USER_AGENT,
           },
-          signal: AbortSignal.timeout(8000),
+          signal: AbortSignal.timeout(5000),
         }
       );
 

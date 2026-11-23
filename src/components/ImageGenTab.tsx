@@ -67,6 +67,68 @@ function saveStoredGallery(items: GeneratedImageItem[]) {
   }
 }
 
+const IMAGE_DIMENSIONS_CLIENT: Record<string, { width: number; height: number }> = {
+  '1:1': { width: 512, height: 512 },
+  '16:9': { width: 576, height: 320 },
+  '9:16': { width: 320, height: 576 },
+  '4:3': { width: 576, height: 448 },
+  '3:4': { width: 448, height: 576 },
+};
+
+const STYLE_PROMPT_SUFFIX_CLIENT: Record<string, string> = {
+  none: '',
+  photorealistic: ', photorealistic, ultra sharp, natural lighting, 8k DSLR photograph',
+  '3d': ', 3D octane render, cinema4d, soft studio lighting, polished materials',
+  cyberpunk: ', cyberpunk neon city aesthetic, moody rain reflections, volumetric glow',
+  anime: ', high quality modern anime illustration, crisp lineart, vibrant cel shading',
+  logo: ', clean minimalist vector logo design, centered composition, sharp flat shapes',
+};
+
+function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      if (typeof reader.result === 'string' && reader.result.startsWith('data:image/')) {
+        resolve(reader.result);
+      } else {
+        reject(new Error('Could not decode generated image'));
+      }
+    };
+    reader.onerror = () => reject(new Error('Failed to read image data'));
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function generateDirectPollinationsFallback(
+  rawPrompt: string,
+  style: string,
+  aspectRatio: string
+): Promise<string> {
+  const dims = IMAGE_DIMENSIONS_CLIENT[aspectRatio] || IMAGE_DIMENSIONS_CLIENT['1:1'];
+  const suffix = STYLE_PROMPT_SUFFIX_CLIENT[style] || '';
+  const enhancedPrompt = `${rawPrompt.slice(0, 650)}${suffix}`;
+  const seed = Math.floor(Math.random() * 9999999);
+  const directUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(
+    enhancedPrompt
+  )}?width=${dims.width}&height=${dims.height}&seed=${seed}&nologo=true`;
+
+  const response = await fetch(directUrl, {
+    signal: AbortSignal.timeout(18000),
+  });
+  if (!response.ok) {
+    throw new Error(`Direct image engine returned ${response.status}`);
+  }
+  const contentType = (response.headers.get('content-type') || '').split(';')[0].trim();
+  if (!contentType.startsWith('image/')) {
+    throw new Error('Upstream did not return a valid image');
+  }
+  const blob = await response.blob();
+  if (blob.size < 1024) {
+    throw new Error('Generated image was empty');
+  }
+  return blobToDataUrl(blob);
+}
+
 export function ImageGenTab({ onCopyText, onShowToast }: ImageGenTabProps) {
   const [prompt, setPrompt] = useState<string>('');
   const [style, setStyle] = useState<string>('photorealistic');
@@ -207,9 +269,37 @@ export function ImageGenTab({ onCopyText, onShowToast }: ImageGenTabProps) {
       }
 
       throw new Error('Unexpected response from image generator');
-    } catch (err) {
-      if (!abortRef.current) {
-        setError(err instanceof Error ? err.message : 'Unable to generate image right now.');
+    } catch (serverErr) {
+      if (abortRef.current) return;
+      try {
+        setQueueStatus('Switching to direct free image renderer...');
+        const fallbackDataUrl = await generateDirectPollinationsFallback(
+          finalPrompt,
+          style,
+          aspectRatio
+        );
+        if (abortRef.current) return;
+        const item: GeneratedImageItem = {
+          id: `img-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          prompt: finalPrompt,
+          style,
+          aspectRatio,
+          imageDataUrl: fallbackDataUrl,
+          provider: 'pollinations',
+          createdAt: new Date().toISOString(),
+        };
+        pushNewImage(item);
+        onShowToast('Image generated!');
+      } catch (fallbackErr) {
+        if (!abortRef.current) {
+          const msg =
+            fallbackErr instanceof Error
+              ? fallbackErr.message
+              : serverErr instanceof Error
+                ? serverErr.message
+                : 'Unable to generate image right now.';
+          setError(msg);
+        }
       }
     } finally {
       if (!abortRef.current) {

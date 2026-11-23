@@ -10,6 +10,7 @@ import {
   Wallet,
   X,
 } from 'lucide-react';
+import { parseJsonResponse } from '../utils/apiFetch';
 
 interface DepositModalProps {
   open: boolean;
@@ -49,8 +50,8 @@ export function DepositModal({
     setError(null);
     let cancelled = false;
     fetch('/api/wallet/status')
-      .then((r) => r.json())
-      .then((d: { configured?: boolean }) => {
+      .then((r) => parseJsonResponse<{ configured?: boolean }>(r))
+      .then((d) => {
         if (!cancelled) {
           setPaystackConfigured(Boolean(d.configured));
         }
@@ -104,14 +105,14 @@ export function DepositModal({
         }),
       });
 
-      const data = (await res.json()) as {
+      const data = await parseJsonResponse<{
         configured?: boolean;
         demoMode?: boolean;
         authorization_url?: string;
         reference?: string;
         error?: string;
         message?: string;
-      };
+      }>(res);
 
       if (res.ok && data.configured && data.authorization_url) {
         if (data.reference) {
@@ -132,12 +133,12 @@ export function DepositModal({
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ amount, userId: walletUserId }),
         });
-        const demoData = (await demoRes.json()) as {
+        const demoData = await parseJsonResponse<{
           success?: boolean;
           balance?: number;
           supabasePersisted?: boolean;
           error?: string;
-        };
+        }>(demoRes);
         if (demoRes.ok && demoData.success) {
           onCreditSuccess(
             amount,

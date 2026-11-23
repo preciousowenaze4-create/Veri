@@ -18,6 +18,7 @@ import {
   X,
 } from 'lucide-react';
 import type { AccountMode, EmailSuggestionOption, TempEmailAccount } from '../types';
+import { parseJsonResponse } from '../utils/apiFetch';
 
 interface CreateEmailTabProps {
   savedEmails: TempEmailAccount[];
@@ -159,10 +160,10 @@ export function CreateEmailTab({
         lastName: birthYear.slice(-2),
       });
       const res = await fetch(`/api/email/suggestions?${params.toString()}`);
-      const data = (await res.json()) as {
+      const data = await parseJsonResponse<{
         options?: EmailSuggestionOption[];
         error?: string;
-      };
+      }>(res);
 
       if (!res.ok || !Array.isArray(data.options) || data.options.length === 0) {
         throw new Error(data.error || 'Could not load email choices');
@@ -223,7 +224,7 @@ export function CreateEmailTab({
         }),
       });
 
-      const data = (await res.json()) as TempEmailAccount & { error?: string };
+      const data = await parseJsonResponse<TempEmailAccount & { error?: string }>(res);
       if (!res.ok || !data.address) {
         throw new Error(data.error || 'Account creation failed');
       }

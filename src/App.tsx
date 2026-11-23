@@ -25,6 +25,7 @@ import type {
   TabId,
   TempEmailAccount,
 } from './types';
+import { parseJsonResponse } from './utils/apiFetch';
 import { copyToClipboard } from './utils/clipboard';
 import { supabase } from './utils/supabase';
 
@@ -216,10 +217,10 @@ export default function App() {
         `/api/wallet/balance?userId=${encodeURIComponent(walletUserId)}`
       );
       if (!res.ok) return;
-      const data = (await res.json()) as {
+      const data = await parseJsonResponse<{
         balance?: number | null;
         supabasePersisted?: boolean;
-      };
+      }>(res);
       if (data.supabasePersisted && typeof data.balance === 'number') {
         setWalletBalance(data.balance);
       }
@@ -237,13 +238,13 @@ export default function App() {
             walletUserId
           )}`
         );
-        const data = (await res.json()) as {
+        const data = await parseJsonResponse<{
           success?: boolean;
           amount?: number;
           balance?: number | null;
           supabasePersisted?: boolean;
           alreadyProcessed?: boolean;
-        };
+        }>(res);
         if (res.ok && data.success) {
           try {
             localStorage.removeItem(STORAGE_KEYS.pendingRef);
@@ -378,12 +379,12 @@ export default function App() {
     setServicesLoading(true);
     try {
       const res = await fetch('/api/numbers/services');
-      const data = (await res.json()) as {
+      const data = await parseJsonResponse<{
         configured?: boolean;
         fivesimConfigured?: boolean;
         grizzlyConfigured?: boolean;
         services?: NumberServiceOption[];
-      };
+      }>(res);
       if (typeof data.fivesimConfigured === 'boolean') {
         setFiveSimConfigured(data.fivesimConfigured);
       } else if (typeof data.configured === 'boolean') {
@@ -406,7 +407,7 @@ export default function App() {
     setLowestDealsLoading(true);
     try {
       const res = await fetch(`/api/numbers/lowest${refresh ? '?refresh=1' : ''}`);
-      const data = (await res.json()) as { deals?: LowestNumberDeal[] };
+      const data = await parseJsonResponse<{ deals?: LowestNumberDeal[] }>(res);
       if (res.ok && Array.isArray(data.deals)) {
         setLowestDeals(data.deals);
       }
@@ -445,7 +446,7 @@ export default function App() {
         const res = await fetch(
           `/api/numbers/countries?service=${encodeURIComponent(serviceId)}${refresh ? '&refresh=1' : ''}`
         );
-        const data = (await res.json()) as { countries?: NumberCountryOption[]; error?: string };
+        const data = await parseJsonResponse<{ countries?: NumberCountryOption[]; error?: string }>(res);
         if (!res.ok) {
           throw new Error(data.error || 'Could not load countries for this app');
         }
@@ -537,7 +538,7 @@ export default function App() {
           walletBalance,
         }),
       });
-      const data = (await res.json()) as { orders?: PrivateNumberOrder[]; error?: string };
+      const data = await parseJsonResponse<{ orders?: PrivateNumberOrder[]; error?: string }>(res);
       if (res.status === 402) {
         setDepositModalOpen(true);
         throw new Error(data.error || 'Insufficient wallet balance for live operator price.');
@@ -606,7 +607,7 @@ export default function App() {
         const res = await fetch(
           `/api/numbers/check/${orderId}?provider=${encodeURIComponent(provider)}`
         );
-        const data = (await res.json()) as { order?: PrivateNumberOrder; error?: string };
+        const data = await parseJsonResponse<{ order?: PrivateNumberOrder; error?: string }>(res);
         if (res.ok && data.order) {
           syncOrderIntoState(data.order);
         }
@@ -626,7 +627,7 @@ export default function App() {
           `/api/numbers/cancel/${orderId}?provider=${encodeURIComponent(provider)}`,
           { method: 'POST' }
         );
-        const data = (await res.json()) as { order?: PrivateNumberOrder };
+        const data = await parseJsonResponse<{ order?: PrivateNumberOrder }>(res);
         if (res.ok && data.order) {
           syncOrderIntoState(data.order);
         } else {
@@ -680,7 +681,7 @@ export default function App() {
           `/api/numbers/finish/${orderId}?provider=${encodeURIComponent(provider)}`,
           { method: 'POST' }
         );
-        const data = (await res.json()) as { order?: PrivateNumberOrder };
+        const data = await parseJsonResponse<{ order?: PrivateNumberOrder }>(res);
         if (res.ok && data.order) {
           syncOrderIntoState(data.order);
         }
@@ -828,7 +829,7 @@ export default function App() {
             body: JSON.stringify({ address: target.address, password: target.password }),
           });
           if (loginRes.ok) {
-            const loginJson = (await loginRes.json()) as { token: string };
+            const loginJson = await parseJsonResponse<{ token: string }>(loginRes);
             token = loginJson.token;
             const refreshedAccount = { ...target, token };
             lastFetchedAddressRef.current = refreshedAccount.address;
@@ -846,7 +847,7 @@ export default function App() {
           }
         }
 
-        const data = (await res.json()) as { messages?: EmailMessageSummary[]; error?: string };
+        const data = await parseJsonResponse<{ messages?: EmailMessageSummary[]; error?: string }>(res);
         if (!res.ok) {
           throw new Error(data.error || 'Failed to read email inbox');
         }
@@ -868,7 +869,7 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ provider: 'auto' }),
       });
-      const data = (await res.json()) as TempEmailAccount & { error?: string };
+      const data = await parseJsonResponse<TempEmailAccount & { error?: string }>(res);
       if (!res.ok || !data.address) {
         throw new Error(data.error || 'Failed to generate email');
       }
@@ -896,7 +897,7 @@ export default function App() {
             'x-email-address': activeEmail.address,
           },
         });
-        const data = (await res.json()) as EmailMessageDetail & { error?: string };
+        const data = await parseJsonResponse<EmailMessageDetail & { error?: string }>(res);
         if (!res.ok) {
           throw new Error(data.error || 'Could not load email');
         }
@@ -949,7 +950,7 @@ export default function App() {
             body: JSON.stringify({ provider: 'auto' }),
           });
           if (res.ok) {
-            const data = (await res.json()) as TempEmailAccount;
+            const data = await parseJsonResponse<TempEmailAccount>(res);
             if (data.address) {
               setActiveEmail(data);
               setSavedEmails([data]);

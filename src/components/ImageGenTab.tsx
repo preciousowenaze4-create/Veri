@@ -11,6 +11,7 @@ import {
   Wand2,
 } from 'lucide-react';
 import type { GeneratedImageItem } from '../types';
+import { parseJsonResponse } from '../utils/apiFetch';
 
 interface ImageGenTabProps {
   onCopyText: (value: string, label: string) => void;
@@ -118,7 +119,7 @@ export function ImageGenTab({ onCopyText, onShowToast }: ImageGenTabProps) {
         }),
       });
 
-      const data = (await res.json()) as {
+      const data = await parseJsonResponse<{
         status?: 'done' | 'pending';
         jobId?: string;
         imageDataUrl?: string;
@@ -126,7 +127,7 @@ export function ImageGenTab({ onCopyText, onShowToast }: ImageGenTabProps) {
         queuePosition?: number;
         waitTime?: number;
         error?: string;
-      };
+      }>(res);
 
       if (!res.ok) {
         throw new Error(data.error || 'Image generation failed');
@@ -161,14 +162,14 @@ export function ImageGenTab({ onCopyText, onShowToast }: ImageGenTabProps) {
           if (abortRef.current) return;
 
           const statusRes = await fetch(`/api/images/status/${encodeURIComponent(jobId)}`);
-          const statusData = (await statusRes.json()) as {
+          const statusData = await parseJsonResponse<{
             status?: 'done' | 'pending';
             imageDataUrl?: string;
             provider?: string;
             queuePosition?: number;
             waitTime?: number;
             error?: string;
-          };
+          }>(statusRes);
 
           if (!statusRes.ok) {
             throw new Error(statusData.error || 'Image rendering failed');

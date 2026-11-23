@@ -836,7 +836,12 @@ const PRIORITY_5SIM_SLUGS = [
 ];
 
 function getFiveSimApiKey(): string {
-  const raw = (process.env.FIVESIM_API_KEY || '').trim();
+  const raw = (
+    process.env.FIVESIM_API_KEY ||
+    process.env.FIVESIM_KEY ||
+    process.env.FIVE_SIM_API_KEY ||
+    ''
+  ).trim();
   const cleaned = raw
     .replace(/^["']|["']$/g, '')
     .replace(/^Bearer\s+/i, '')
@@ -873,8 +878,9 @@ function getPaystackSecretKey(): string {
     ''
   ).trim();
   const cleaned = raw.replace(/^["']|["']$/g, '').trim();
-  if (!cleaned) {
+  if (!cleaned || cleaned === 'MY_PAYSTACK_SECRET_KEY' || cleaned.startsWith('MY_')) {
     console.warn('[VeriBox Warning] PAYSTACK_SECRET_KEY is not defined in environment variables.');
+    return '';
   }
   return cleaned;
 }
@@ -895,6 +901,7 @@ function getSupabaseServerConfig(): { url: string; key: string } {
     process.env.SUPABASE_KEY ||
     process.env.SUPABASE_ANON_KEY ||
     process.env.VITE_SUPABASE_ANON_KEY ||
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||
     ''
   )
     .trim()
@@ -4181,6 +4188,16 @@ export function createApiApp() {
     };
   }
 
+  async function readUpstreamJson<T>(res: Response): Promise<T | null> {
+    const txt = await res.text().catch(() => '');
+    if (!txt || !txt.trim().startsWith('{')) return null;
+    try {
+      return JSON.parse(txt) as T;
+    } catch {
+      return null;
+    }
+  }
+
   app.post('/api/images/generate', async (req, res) => {
     const rawPrompt = typeof req.body?.prompt === 'string' ? req.body.prompt.trim() : '';
     if (!rawPrompt || rawPrompt.length < 3) {
@@ -4202,14 +4219,14 @@ export function createApiApp() {
     const suffix = STYLE_PROMPT_SUFFIX[style] || '';
     const enhancedPrompt = `${rawPrompt.slice(0, 650)}${suffix}`;
 
-    // 1. Fast path: try Pollinations free tier first (quick 7s timeout)
+    // 1. Fast path: try Pollinations free tier first (11.5s timeout so it resolves directly when available)
     try {
       const pollUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(
         enhancedPrompt
       )}?width=${dims.width}&height=${dims.height}&seed=${seed}&nologo=true`;
       const pollRes = await fetch(pollUrl, {
         headers: { 'User-Agent': USER_AGENT },
-        signal: AbortSignal.timeout(7000),
+        signal: AbortSignal.timeout(11500),
       });
       const contentType = (pollRes.headers.get('content-type') || '').split(';')[0].trim();
       if (pollRes.ok && contentType.startsWith('image/')) {
@@ -4260,16 +4277,16 @@ export function createApiApp() {
           trusted_workers: false,
           r2: true,
         }),
-        signal: AbortSignal.timeout(10000),
+        signal: AbortSignal.timeout(9000),
       });
 
-      const hordeData = (await hordeReq.json()) as { id?: string; message?: string };
-      if (!hordeReq.ok || !hordeData.id) {
-        throw new Error(hordeData.message || `Image generator queue unavailable (${hordeReq.status})`);
+      const hordeData = await readUpstreamJson<{ id?: string; message?: string }>(hordeReq);
+      if (!hordeReq.ok || !hordeData?.id) {
+        throw new Error(hordeData?.message || `Image generator queue unavailable (${hordeReq.status})`);
       }
 
       const jobId = hordeData.id;
-      const deadline = Date.now() + 11500; // Stay safely under Vercel's 30s timeout
+      const deadline = Date.now() + 7500; // Stay safely under Vercel's 30s timeout even after fallback
       let latestCheck: {
         done?: boolean;
         faulted?: boolean;
@@ -4287,11 +4304,14 @@ export function createApiApp() {
               'Client-Agent': 'VeriBox:1.0:veribox.app',
               'User-Agent': USER_AGENT,
             },
-            signal: AbortSignal.timeout(6000),
+            signal: AbortSignal.timeout(5500),
           }
         );
         if (checkRes.ok) {
-          latestCheck = (await checkRes.json()) as typeof latestCheck;
+          const parsedCheck = await readUpstreamJson<typeof latestCheck>(checkRes);
+          if (parsedCheck) {
+            latestCheck = parsedCheck;
+          }
           if (latestCheck.faulted || latestCheck.is_possible === false) {
             throw new Error('Image generation job faulted in free cluster. Please retry.');
           }
@@ -4303,13 +4323,13 @@ export function createApiApp() {
                   'Client-Agent': 'VeriBox:1.0:veribox.app',
                   'User-Agent': USER_AGENT,
                 },
-                signal: AbortSignal.timeout(8000),
+                signal: AbortSignal.timeout(7000),
               }
             );
-            const statusData = (await statusRes.json()) as {
+            const statusData = await readUpstreamJson<{
               generations?: Array<{ img?: string; model?: string; censored?: boolean }>;
-            };
-            const firstGen = statusData.generations?.[0];
+            }>(statusRes);
+            const firstGen = statusData?.generations?.[0];
             if (!firstGen?.img) {
               throw new Error('No image URL returned by generator.');
             }
@@ -4377,7 +4397,7 @@ export function createApiApp() {
         throw new Error(`Status check failed (${checkRes.status})`);
       }
 
-      const checkData = (await checkRes.json()) as {
+      const checkData = await readUpstreamJson<{
         done?: boolean;
         faulted?: boolean;
         is_possible?: boolean;
@@ -4385,7 +4405,17 @@ export function createApiApp() {
         wait_time?: number;
         processing?: number;
         waiting?: number;
-      };
+      }>(checkRes);
+
+      if (!checkData) {
+        res.json({
+          status: 'pending',
+          jobId,
+          queuePosition: 0,
+          waitTime: 10,
+        });
+        return;
+      }
 
       if (checkData.faulted || checkData.is_possible === false) {
         res.status(502).json({ error: 'Generation failed in free worker queue. Please try again.' });
@@ -4415,10 +4445,10 @@ export function createApiApp() {
         }
       );
 
-      const statusData = (await statusRes.json()) as {
+      const statusData = await readUpstreamJson<{
         generations?: Array<{ img?: string; model?: string }>;
-      };
-      const firstGen = statusData.generations?.[0];
+      }>(statusRes);
+      const firstGen = statusData?.generations?.[0];
       if (!firstGen?.img) {
         throw new Error('Completed job did not return an image.');
       }
@@ -4437,6 +4467,25 @@ export function createApiApp() {
       });
     }
   });
+
+  // Ensure unmatched /api/* routes and errors ALWAYS return JSON (never Express HTML)
+  app.use('/api', (req, res) => {
+    res.status(404).json({ error: `API route not found: ${req.path}` });
+  });
+
+  app.use(
+    (
+      err: unknown,
+      _req: express.Request,
+      res: express.Response,
+      _next: express.NextFunction
+    ) => {
+      if (res.headersSent) return;
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Unexpected server error',
+      });
+    }
+  );
 
   return app;
 }

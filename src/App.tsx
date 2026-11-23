@@ -16,6 +16,8 @@ import type {
   EmailMessageSummary,
   LowestNumberDeal,
   NumberCountryOption,
+  NumberProviderId,
+  NumberProviderQuote,
   NumberServiceOption,
   PhoneNumberEntry,
   PlatformFilter,
@@ -90,6 +92,7 @@ export default function App() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [fiveSimConfigured, setFiveSimConfigured] = useState<boolean>(false);
+  const [grizzlyConfigured, setGrizzlyConfigured] = useState<boolean>(false);
 
   const [isDark, setIsDark] = useState<boolean>(() => {
     const stored = readStorage<string | null>(STORAGE_KEYS.theme, null);
@@ -116,6 +119,7 @@ export default function App() {
 
   const [countries, setCountries] = useState<NumberCountryOption[]>([]);
   const [selectedCountry, setSelectedCountry] = useState<NumberCountryOption | null>(null);
+  const [selectedProviderQuote, setSelectedProviderQuote] = useState<NumberProviderQuote | null>(null);
   const [countriesLoading, setCountriesLoading] = useState<boolean>(false);
   const [lowestDeals, setLowestDeals] = useState<LowestNumberDeal[]>([]);
   const [lowestDealsLoading, setLowestDealsLoading] = useState<boolean>(false);
@@ -376,10 +380,17 @@ export default function App() {
       const res = await fetch('/api/numbers/services');
       const data = (await res.json()) as {
         configured?: boolean;
+        fivesimConfigured?: boolean;
+        grizzlyConfigured?: boolean;
         services?: NumberServiceOption[];
       };
-      if (typeof data.configured === 'boolean') {
+      if (typeof data.fivesimConfigured === 'boolean') {
+        setFiveSimConfigured(data.fivesimConfigured);
+      } else if (typeof data.configured === 'boolean') {
         setFiveSimConfigured(data.configured);
+      }
+      if (typeof data.grizzlyConfigured === 'boolean') {
+        setGrizzlyConfigured(data.grizzlyConfigured);
       }
       if (Array.isArray(data.services) && data.services.length > 0) {
         setServices(data.services);
@@ -406,11 +417,30 @@ export default function App() {
     }
   }, []);
 
+  const pickBestProviderForCountry = useCallback(
+    (country: NumberCountryOption, preferredProvider?: NumberProviderId): NumberProviderQuote | null => {
+      const list = country.providers || [];
+      if (list.length === 0) return null;
+      if (preferredProvider) {
+        const match = list.find((p) => p.provider === preferredProvider);
+        if (match) return match;
+      }
+      return list.find((p) => p.configured) || list[0];
+    },
+    []
+  );
+
   const loadCountriesForService = useCallback(
-    async (serviceId: string, refresh = false, preselectCountrySlug?: string) => {
+    async (
+      serviceId: string,
+      refresh = false,
+      preselectCountrySlug?: string,
+      preselectProviderId?: NumberProviderId
+    ) => {
       setCountriesLoading(true);
       setCountries([]);
       setSelectedCountry(null);
+      setSelectedProviderQuote(null);
       try {
         const res = await fetch(
           `/api/numbers/countries?service=${encodeURIComponent(serviceId)}${refresh ? '&refresh=1' : ''}`
@@ -423,7 +453,10 @@ export default function App() {
           setCountries(data.countries);
           if (preselectCountrySlug) {
             const matched = data.countries.find((c) => c.slug === preselectCountrySlug);
-            if (matched) setSelectedCountry(matched);
+            if (matched) {
+              setSelectedCountry(matched);
+              setSelectedProviderQuote(pickBestProviderForCountry(matched, preselectProviderId));
+            }
           }
         }
       } catch (err) {
@@ -434,44 +467,49 @@ export default function App() {
         setCountriesLoading(false);
       }
     },
-    []
+    [pickBestProviderForCountry]
   );
 
   const syncOrderIntoState = useCallback((updated: PrivateNumberOrder) => {
-    setActiveOrders((prev) =>
-      prev.map((o) =>
-        o.id === updated.id
-          ? {
-              ...updated,
-              countryCode: o.countryCode || updated.countryCode,
-              serviceName: o.serviceName || updated.serviceName,
-              price: updated.price ?? o.price,
-              rawPriceUsd: updated.rawPriceUsd ?? o.rawPriceUsd,
-              currency: o.currency || updated.currency,
-            }
-          : o
-      )
-    );
-    setNumberHistory((prev) =>
-      prev.map((o) =>
-        o.id === updated.id
-          ? {
-              ...updated,
-              countryCode: o.countryCode || updated.countryCode,
-              serviceName: o.serviceName || updated.serviceName,
-              price: updated.price ?? o.price,
-              rawPriceUsd: updated.rawPriceUsd ?? o.rawPriceUsd,
-              currency: o.currency || updated.currency,
-            }
-          : o
-      )
-    );
+    const mergeOrder = (o: PrivateNumberOrder): PrivateNumberOrder => ({
+      ...o,
+      ...updated,
+      provider: o.provider || updated.provider,
+      phone: updated.phone || o.phone,
+      digits: updated.digits || o.digits,
+      country: updated.country || o.country,
+      countryCode: o.countryCode || updated.countryCode,
+      service: updated.service || o.service,
+      serviceName: o.serviceName || updated.serviceName,
+      price: updated.price ?? o.price,
+      rawPriceUsd: updated.rawPriceUsd ?? o.rawPriceUsd,
+      currency: o.currency || updated.currency,
+      expires: updated.expires || o.expires,
+      createdAt: o.createdAt || updated.createdAt,
+      sms: Array.isArray(updated.sms) ? updated.sms : o.sms,
+    });
+
+    setActiveOrders((prev) => prev.map((o) => (o.id === updated.id ? mergeOrder(o) : o)));
+    setNumberHistory((prev) => prev.map((o) => (o.id === updated.id ? mergeOrder(o) : o)));
   }, []);
 
   const handleAcquireNumbers = useCallback(async () => {
     if (!selectedService || !selectedCountry) return;
 
-    const unitPriceNgn = selectedCountry.inStockMinPrice || selectedCountry.minPrice || 0;
+    const chosenProvider: NumberProviderId =
+      selectedProviderQuote?.provider ||
+      selectedCountry.providers?.[0]?.provider ||
+      'fivesim';
+    const chosenCountryId =
+      selectedProviderQuote?.countryId ||
+      selectedCountry.providers?.[0]?.countryId ||
+      selectedCountry.slug;
+    const unitPriceNgn =
+      selectedProviderQuote?.inStockMinPrice ||
+      selectedProviderQuote?.minPrice ||
+      selectedCountry.inStockMinPrice ||
+      selectedCountry.minPrice ||
+      0;
     const requiredNgn = unitPriceNgn * quantity;
     if (walletBalance < requiredNgn) {
       setDepositModalOpen(true);
@@ -488,6 +526,9 @@ export default function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          provider: chosenProvider,
+          countryId: chosenCountryId,
+          countryName: selectedCountry.country,
           service: selectedService.id,
           serviceName: selectedService.name,
           country: selectedCountry.slug,
@@ -506,7 +547,7 @@ export default function App() {
       }
 
       const actualChargedNgn = data.orders.reduce(
-        (sum, ord) => sum + (typeof ord.price === 'number' && ord.price > 0 ? ord.price : selectedCountry.minPrice || 0),
+        (sum, ord) => sum + (typeof ord.price === 'number' && ord.price > 0 ? ord.price : unitPriceNgn),
         0
       );
 
@@ -545,12 +586,26 @@ export default function App() {
     } finally {
       setAcquiring(false);
     }
-  }, [selectedCountry, selectedService, quantity, walletBalance, walletUserId, showToast]);
+  }, [
+    selectedCountry,
+    selectedProviderQuote,
+    selectedService,
+    quantity,
+    walletBalance,
+    walletUserId,
+    showToast,
+  ]);
 
   const handleCheckOrder = useCallback(
-    async (orderId: number) => {
+    async (orderId: number, providerOverride?: NumberProviderId) => {
+      const matched =
+        activeOrders.find((o) => o.id === orderId) ||
+        numberHistory.find((o) => o.id === orderId);
+      const provider = providerOverride || matched?.provider || 'fivesim';
       try {
-        const res = await fetch(`/api/numbers/check/${orderId}`);
+        const res = await fetch(
+          `/api/numbers/check/${orderId}?provider=${encodeURIComponent(provider)}`
+        );
         const data = (await res.json()) as { order?: PrivateNumberOrder; error?: string };
         if (res.ok && data.order) {
           syncOrderIntoState(data.order);
@@ -559,14 +614,18 @@ export default function App() {
         // Non-blocking
       }
     },
-    [syncOrderIntoState]
+    [activeOrders, numberHistory, syncOrderIntoState]
   );
 
   const handleCancelOrder = useCallback(
     async (orderId: number) => {
       const targetOrder = activeOrders.find((o) => o.id === orderId);
+      const provider = targetOrder?.provider || 'fivesim';
       try {
-        const res = await fetch(`/api/numbers/cancel/${orderId}`, { method: 'POST' });
+        const res = await fetch(
+          `/api/numbers/cancel/${orderId}?provider=${encodeURIComponent(provider)}`,
+          { method: 'POST' }
+        );
         const data = (await res.json()) as { order?: PrivateNumberOrder };
         if (res.ok && data.order) {
           syncOrderIntoState(data.order);
@@ -612,8 +671,15 @@ export default function App() {
 
   const handleFinishOrder = useCallback(
     async (orderId: number) => {
+      const targetOrder =
+        activeOrders.find((o) => o.id === orderId) ||
+        numberHistory.find((o) => o.id === orderId);
+      const provider = targetOrder?.provider || 'fivesim';
       try {
-        const res = await fetch(`/api/numbers/finish/${orderId}`, { method: 'POST' });
+        const res = await fetch(
+          `/api/numbers/finish/${orderId}?provider=${encodeURIComponent(provider)}`,
+          { method: 'POST' }
+        );
         const data = (await res.json()) as { order?: PrivateNumberOrder };
         if (res.ok && data.order) {
           syncOrderIntoState(data.order);
@@ -623,7 +689,7 @@ export default function App() {
         showToast('Could not complete session');
       }
     },
-    [syncOrderIntoState, showToast]
+    [activeOrders, numberHistory, syncOrderIntoState, showToast]
   );
 
   const handleReuseFromHistory = useCallback(
@@ -634,7 +700,7 @@ export default function App() {
       });
       setSelectedOrderId(order.id);
       setNumbersViewMode('receiver');
-      void handleCheckOrder(order.id);
+      void handleCheckOrder(order.id, order.provider || 'fivesim');
     },
     [handleCheckOrder]
   );
@@ -663,7 +729,10 @@ export default function App() {
       return;
     }
 
-    const es = new EventSource(`/api/numbers/stream/${selectedOrder.id}`);
+    const provider = selectedOrder.provider || 'fivesim';
+    const es = new EventSource(
+      `/api/numbers/stream/${selectedOrder.id}?provider=${encodeURIComponent(provider)}`
+    );
     es.onopen = () => setStreamConnected(true);
     es.onmessage = (event) => {
       try {
@@ -688,6 +757,7 @@ export default function App() {
     activeTab,
     numbersViewMode,
     selectedOrder?.id,
+    selectedOrder?.provider,
     selectedOrder?.status,
     syncOrderIntoState,
   ]);
@@ -705,7 +775,7 @@ export default function App() {
     }
 
     const timer = window.setInterval(() => {
-      void handleCheckOrder(selectedOrder.id);
+      void handleCheckOrder(selectedOrder.id, selectedOrder.provider || 'fivesim');
     }, 3500);
 
     return () => window.clearInterval(timer);
@@ -713,6 +783,7 @@ export default function App() {
     activeTab,
     numbersViewMode,
     selectedOrder?.id,
+    selectedOrder?.provider,
     selectedOrder?.status,
     streamConnected,
     handleCheckOrder,
@@ -1029,11 +1100,13 @@ export default function App() {
         {activeTab === 'numbers' && (
           <SmsTab
             fiveSimConfigured={fiveSimConfigured}
+            grizzlyConfigured={grizzlyConfigured}
             services={services}
             selectedService={selectedService}
             servicesLoading={servicesLoading}
             countries={countries}
             selectedCountry={selectedCountry}
+            selectedProviderQuote={selectedProviderQuote}
             countriesLoading={countriesLoading}
             lowestDeals={lowestDeals}
             lowestDealsLoading={lowestDealsLoading}
@@ -1053,6 +1126,11 @@ export default function App() {
             }}
             onSelectCountry={(c) => {
               setSelectedCountry(c);
+              setSelectedProviderQuote(pickBestProviderForCountry(c));
+              setAcquireError(null);
+            }}
+            onSelectProviderQuote={(quote) => {
+              setSelectedProviderQuote(quote);
               setAcquireError(null);
             }}
             onSelectLowestDeal={(deal) => {
@@ -1063,7 +1141,7 @@ export default function App() {
               };
               setSelectedService(svcMatch);
               setAcquireError(null);
-              void loadCountriesForService(deal.serviceId, false, deal.slug);
+              void loadCountriesForService(deal.serviceId, false, deal.slug, deal.provider);
             }}
             onRefreshLowestDeals={() => void loadLowestDeals(true)}
             onRefreshCountries={() => {

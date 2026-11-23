@@ -118,6 +118,20 @@ export interface NumberServiceOption {
   popular?: boolean;
 }
 
+export type NumberProviderId = 'fivesim' | 'grizzly';
+
+export interface NumberProviderQuote {
+  provider: NumberProviderId;
+  name: string;
+  configured: boolean;
+  countryId: string;
+  minPrice: number;
+  rawPriceUsd: number;
+  inStockMinPrice: number;
+  inStockPriceUsd: number;
+  stockCount: number;
+}
+
 export interface NumberCountryOption {
   slug: string;
   country: string;
@@ -129,6 +143,7 @@ export interface NumberCountryOption {
   inStockPriceUsd?: number;
   currency?: string;
   stockCount?: number;
+  providers?: NumberProviderQuote[];
 }
 
 export interface LowestNumberDeal {
@@ -142,10 +157,13 @@ export interface LowestNumberDeal {
   rawPriceUsd?: number;
   currency: string;
   stockCount?: number;
+  provider?: NumberProviderId;
+  providerName?: string;
 }
 
 export interface PrivateNumberOrder {
   id: number;
+  provider?: NumberProviderId;
   phone: string;
   digits: string;
   country: string;

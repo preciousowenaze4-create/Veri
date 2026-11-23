@@ -21,6 +21,8 @@ import {
 import type {
   LowestNumberDeal,
   NumberCountryOption,
+  NumberProviderId,
+  NumberProviderQuote,
   NumberServiceOption,
   PrivateNumberOrder,
 } from '../types';
@@ -30,11 +32,13 @@ import { CountryFlag } from './CountryFlag';
 
 interface SmsTabProps {
   fiveSimConfigured: boolean;
+  grizzlyConfigured: boolean;
   services: NumberServiceOption[];
   selectedService: NumberServiceOption | null;
   servicesLoading: boolean;
   countries: NumberCountryOption[];
   selectedCountry: NumberCountryOption | null;
+  selectedProviderQuote: NumberProviderQuote | null;
   countriesLoading: boolean;
   lowestDeals: LowestNumberDeal[];
   lowestDealsLoading: boolean;
@@ -49,6 +53,7 @@ interface SmsTabProps {
   onChangeViewMode: (mode: 'setup' | 'receiver' | 'history') => void;
   onSelectService: (service: NumberServiceOption) => void;
   onSelectCountry: (country: NumberCountryOption) => void;
+  onSelectProviderQuote: (quote: NumberProviderQuote) => void;
   onSelectLowestDeal: (deal: LowestNumberDeal) => void;
   onRefreshLowestDeals: () => void;
   onRefreshCountries: () => void;
@@ -95,13 +100,19 @@ function formatStock(count?: number): string {
   return count.toLocaleString();
 }
 
+function getProviderLabel(provider?: NumberProviderId): string {
+  return provider === 'grizzly' ? 'Grizzly SMS' : '5sim';
+}
+
 export function SmsTab({
   fiveSimConfigured,
+  grizzlyConfigured,
   services,
   selectedService,
   servicesLoading,
   countries,
   selectedCountry,
+  selectedProviderQuote,
   countriesLoading,
   lowestDeals,
   lowestDealsLoading,
@@ -116,6 +127,7 @@ export function SmsTab({
   onChangeViewMode,
   onSelectService,
   onSelectCountry,
+  onSelectProviderQuote,
   onSelectLowestDeal,
   onRefreshLowestDeals,
   onRefreshCountries,
@@ -233,8 +245,8 @@ export function SmsTab({
               <p className="mt-0.5 text-xs text-[#6E6552] dark:text-[#A89F8C]">
                 {selectedService
                   ? selectedCountry
-                    ? 'Choose how many numbers to get and tap Continue'
-                    : `Select a country (A–Z) to see live lowest rates for ${selectedService.name}`
+                    ? 'Compare both server options below, pick your quantity, and buy'
+                    : `Select a country (A–Z) to compare live lowest rates for ${selectedService.name}`
                   : 'Choose the app you want to verify'}
               </p>
             </div>
@@ -250,14 +262,15 @@ export function SmsTab({
             )}
           </div>
 
-          {!fiveSimConfigured && (
+          {!fiveSimConfigured && !grizzlyConfigured && (
             <div className="mt-4 rounded-2xl border border-amber-500/35 bg-amber-500/10 p-4">
               <div className="flex items-start gap-2.5 text-xs font-medium text-amber-800 dark:text-amber-200">
                 <AlertCircle className="h-4 w-4 shrink-0 mt-0.5 text-amber-500" />
                 <div>
-                  <p className="font-bold">Number API key not set on server</p>
+                  <p className="font-bold">Number API keys not set on server</p>
                   <p className="mt-0.5 opacity-90">
-                    Add <code className="font-mono">FIVESIM_API_KEY</code> in your Vercel or server
+                    Add <code className="font-mono">GRIZZLYSMS_API_KEY</code> and/or{' '}
+                    <code className="font-mono">FIVESIM_API_KEY</code> in your Vercel or server
                     environment variables to purchase dedicated numbers. Live lowest prices are shown
                     below.
                   </p>
@@ -310,7 +323,7 @@ export function SmsTab({
                             {deal.serviceName}
                           </p>
                           <p className="truncate text-[10px] text-[#6E6552] dark:text-[#A89F8C]">
-                            {deal.country}
+                            {deal.country} · {deal.providerName || getProviderLabel(deal.provider)}
                           </p>
                         </div>
                       </div>
@@ -568,19 +581,171 @@ export function SmsTab({
               </div>
             )}
 
-            {/* STEP 3: Quantity & Continue — Revealed ONLY after Country is selected */}
+            {/* STEP 3: Choose Service Provider (2 Options shown immediately after Country is selected) */}
             {selectedService && selectedCountry && (() => {
-              const checkoutUnitNgn = selectedCountry.inStockMinPrice || selectedCountry.minPrice;
-              const checkoutUnitUsd = selectedCountry.inStockPriceUsd || selectedCountry.rawPriceUsd;
+              const grizzlyQuote =
+                selectedCountry.providers?.find((p) => p.provider === 'grizzly') || null;
+              const fivesimQuote =
+                selectedCountry.providers?.find((p) => p.provider === 'fivesim') || null;
+
+              const twoOptions: Array<{
+                provider: NumberProviderId;
+                label: string;
+                subtitle: string;
+                quote: NumberProviderQuote | null;
+                envVar: string;
+              }> = [
+                {
+                  provider: 'grizzly',
+                  label: 'Grizzly SMS',
+                  subtitle: 'Low-rate global pool',
+                  quote: grizzlyQuote,
+                  envVar: 'GRIZZLYSMS_API_KEY',
+                },
+                {
+                  provider: 'fivesim',
+                  label: '5sim',
+                  subtitle: 'Dedicated operator pool',
+                  quote: fivesimQuote,
+                  envVar: 'FIVESIM_API_KEY',
+                },
+              ];
+
+              // Order cheapest available quote first so lowest price appears top-left
+              twoOptions.sort((a, b) => {
+                const pa = a.quote?.inStockMinPrice || Number.MAX_SAFE_INTEGER;
+                const pb = b.quote?.inStockMinPrice || Number.MAX_SAFE_INTEGER;
+                return pa - pb;
+              });
+
+              const lowestAvailableQuotePrice = Math.min(
+                ...[grizzlyQuote?.inStockMinPrice, fivesimQuote?.inStockMinPrice].filter(
+                  (v): v is number => typeof v === 'number' && v > 0
+                )
+              );
+
+              const activeQuote =
+                selectedProviderQuote ||
+                selectedCountry.providers?.[0] ||
+                null;
+              const checkoutUnitNgn =
+                activeQuote?.inStockMinPrice ||
+                activeQuote?.minPrice ||
+                selectedCountry.inStockMinPrice ||
+                selectedCountry.minPrice;
+              const checkoutUnitUsd =
+                activeQuote?.inStockPriceUsd ||
+                activeQuote?.rawPriceUsd ||
+                selectedCountry.inStockPriceUsd ||
+                selectedCountry.rawPriceUsd;
               const hasHigherInStockOnly =
-                typeof selectedCountry.inStockMinPrice === 'number' &&
-                typeof selectedCountry.minPrice === 'number' &&
-                selectedCountry.inStockMinPrice > selectedCountry.minPrice;
+                activeQuote &&
+                typeof activeQuote.inStockMinPrice === 'number' &&
+                typeof activeQuote.minPrice === 'number' &&
+                activeQuote.inStockMinPrice > activeQuote.minPrice;
+              const activeProviderConfigured = Boolean(activeQuote?.configured);
+
               return (
                 <>
+                  <div>
+                    <div className="mb-1.5 flex items-center justify-between gap-2">
+                      <label className="block text-xs font-bold text-[#6E6552] dark:text-[#A89F8C]">
+                        3. Choose Service Option (2 Providers)
+                      </label>
+                      <span className="text-[11px] font-semibold text-[#8A7F6A] dark:text-[#A89F8C]">
+                        Live lowest prices compared
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+                      {twoOptions.map((opt) => {
+                        const q = opt.quote;
+                        const isSelected = Boolean(
+                          q && activeQuote && q.provider === activeQuote.provider
+                        );
+                        const isCheapest =
+                          Boolean(q) &&
+                          Number.isFinite(lowestAvailableQuotePrice) &&
+                          q!.inStockMinPrice === lowestAvailableQuotePrice;
+                        const unitUsd = q?.inStockPriceUsd || q?.rawPriceUsd || 0;
+
+                        return (
+                          <button
+                            key={opt.provider}
+                            type="button"
+                            disabled={!q}
+                            onClick={() => {
+                              if (q) onSelectProviderQuote(q);
+                            }}
+                            className={`flex flex-col justify-between gap-2 rounded-2xl border p-3.5 text-left transition-all ${
+                              !q
+                                ? 'cursor-not-allowed border-[#D4AF37]/15 bg-[#FAF7F0]/50 opacity-60 dark:bg-[#0B0A07]/60'
+                                : isSelected
+                                  ? 'border-[#D4AF37] bg-[#D4AF37]/15 shadow-sm'
+                                  : 'border-[#D4AF37]/25 bg-[#FAF7F0] hover:border-[#D4AF37]/60 dark:bg-[#0B0A07]'
+                            }`}
+                          >
+                            <div className="flex items-start justify-between gap-2">
+                              <div className="min-w-0">
+                                <div className="flex flex-wrap items-center gap-1.5">
+                                  <span className="text-sm font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
+                                    {opt.label}
+                                  </span>
+                                  {isCheapest && (
+                                    <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-extrabold text-emerald-700 dark:text-emerald-300">
+                                      Lowest
+                                    </span>
+                                  )}
+                                </div>
+                                <p className="mt-0.5 text-[11px] text-[#6E6552] dark:text-[#A89F8C]">
+                                  {opt.subtitle}
+                                </p>
+                              </div>
+                              {isSelected && (
+                                <Check className="h-4 w-4 shrink-0 text-[#D4AF37]" />
+                              )}
+                            </div>
+
+                            {q ? (
+                              <div className="flex items-end justify-between gap-2 border-t border-[#D4AF37]/15 pt-2">
+                                <div>
+                                  <p className="font-mono text-base font-extrabold text-[#8A6208] tabular-nums dark:text-[#F5D77A]">
+                                    {formatPrice(q.inStockMinPrice || q.minPrice, 'NGN')}
+                                  </p>
+                                  {unitUsd > 0 && (
+                                    <p className="text-[10px] text-[#8A7F6A] tabular-nums dark:text-[#A89F8C]">
+                                      ≈ ${unitUsd >= 0.01 ? unitUsd.toFixed(2) : unitUsd.toFixed(3)}
+                                    </p>
+                                  )}
+                                </div>
+                                <div className="text-right">
+                                  <p className="font-mono text-[11px] font-semibold text-[#6E6552] tabular-nums dark:text-[#A89F8C]">
+                                    {formatStock(q.stockCount)} avail
+                                  </p>
+                                  {!q.configured && (
+                                    <p className="text-[10px] font-bold text-amber-600 dark:text-amber-300">
+                                      Add {opt.envVar}
+                                    </p>
+                                  )}
+                                </div>
+                              </div>
+                            ) : (
+                              <div className="border-t border-[#D4AF37]/15 pt-2">
+                                <p className="text-[11px] font-semibold text-[#8A7F6A] dark:text-[#A89F8C]">
+                                  No stock for {selectedCountry.country}
+                                </p>
+                              </div>
+                            )}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* STEP 4: Quantity & Buy */}
                   <div className="relative" ref={qtyRef}>
                     <label className="mb-1.5 block text-xs font-bold text-[#6E6552] dark:text-[#A89F8C]">
-                      3. How Many Numbers
+                      4. How Many Numbers ({activeQuote ? activeQuote.name : 'Provider'})
                     </label>
                     <button
                       type="button"
@@ -655,9 +820,9 @@ export function SmsTab({
                     )}
                   </div>
 
-                  {hasHigherInStockOnly && (
+                  {hasHigherInStockOnly && activeQuote && (
                     <p className="rounded-xl border border-[#D4AF37]/25 bg-[#FAF7F0] px-3 py-2 text-[11px] font-medium text-[#6E6552] dark:bg-[#0B0A07] dark:text-[#A89F8C]">
-                      Lowest operator ({formatPrice(selectedCountry.minPrice, selectedCountry.currency)}) is currently at 0 pcs; cheapest live operator in stock is{' '}
+                      Lowest operator ({formatPrice(activeQuote.minPrice, selectedCountry.currency)}) is currently at 0 pcs; cheapest live operator in stock is{' '}
                       <span className="font-bold text-[#8A6208] dark:text-[#F5D77A]">
                         {formatPrice(checkoutUnitNgn, selectedCountry.currency)}
                       </span>
@@ -665,24 +830,32 @@ export function SmsTab({
                     </p>
                   )}
 
-                  {/* Continue Button */}
+                  {/* Buy Button */}
                   <button
                     type="button"
                     onClick={onAcquireNumbers}
-                    disabled={acquiring || !fiveSimConfigured}
+                    disabled={acquiring || !activeQuote || !activeProviderConfigured}
                     className="mt-2 inline-flex min-h-[50px] w-full items-center justify-center gap-2 rounded-2xl bg-[#D4AF37] px-5 py-3 text-sm font-extrabold text-[#0A0906] transition-colors hover:bg-[#E5C150] disabled:opacity-60"
                   >
                     {acquiring ? (
                       <>
                         <Loader2 className="h-4 w-4 animate-spin" />
-                        <span>Buying Live Number{quantity > 1 ? 's' : ''}...</span>
+                        <span>
+                          Buying via {activeQuote?.name || 'Provider'}...
+                        </span>
                       </>
-                    ) : !fiveSimConfigured ? (
-                      <span>API Key Required to Buy</span>
+                    ) : !activeQuote ? (
+                      <span>Select a Provider Option Above</span>
+                    ) : !activeProviderConfigured ? (
+                      <span>
+                        {activeQuote.provider === 'grizzly'
+                          ? 'Set GRIZZLYSMS_API_KEY to Buy'
+                          : 'Set FIVESIM_API_KEY to Buy'}
+                      </span>
                     ) : (
                       <>
                         <span>
-                          Buy Number ({formatPrice(checkoutUnitNgn ? checkoutUnitNgn * quantity : undefined, selectedCountry.currency)})
+                          Buy via {activeQuote.name} ({formatPrice(checkoutUnitNgn ? checkoutUnitNgn * quantity : undefined, selectedCountry.currency)})
                         </span>
                         <ArrowRight className="h-4 w-4" />
                       </>
@@ -737,7 +910,7 @@ export function SmsTab({
                         onClick={() => onSelectOrder(order)}
                         className="min-w-0 flex-1 text-left"
                       >
-                        <div className="flex items-center gap-2 text-xs text-[#6E6552] dark:text-[#A89F8C]">
+                        <div className="flex flex-wrap items-center gap-2 text-xs text-[#6E6552] dark:text-[#A89F8C]">
                           <AppLogo id={order.service} name={order.serviceName} size="sm" />
                           <CountryFlag code={order.countryCode || 'GB'} className="h-4 w-6" />
                           <span className="font-bold text-[#8A6208] dark:text-[#F5D77A]">
@@ -745,6 +918,9 @@ export function SmsTab({
                           </span>
                           <span aria-hidden="true">·</span>
                           <span>{order.country}</span>
+                          <span className="rounded bg-[#D4AF37]/15 px-1.5 py-0.5 text-[10px] font-bold text-[#8A6208] dark:text-[#F5D77A]">
+                            {getProviderLabel(order.provider)}
+                          </span>
                           {order.price ? (
                             <>
                               <span aria-hidden="true">·</span>
@@ -948,7 +1124,7 @@ export function SmsTab({
                   >
                     <div className="flex flex-wrap items-start justify-between gap-3">
                       <div className="min-w-0">
-                        <div className="flex items-center gap-2 text-xs text-[#6E6552] dark:text-[#A89F8C]">
+                        <div className="flex flex-wrap items-center gap-2 text-xs text-[#6E6552] dark:text-[#A89F8C]">
                           <AppLogo id={item.service} name={item.serviceName} size="sm" />
                           <CountryFlag code={item.countryCode || 'GB'} className="h-4 w-6" />
                           <span className="font-bold text-[#8A6208] dark:text-[#F5D77A]">
@@ -956,6 +1132,9 @@ export function SmsTab({
                           </span>
                           <span aria-hidden="true">·</span>
                           <span>{item.country}</span>
+                          <span className="rounded bg-[#D4AF37]/15 px-1.5 py-0.5 text-[10px] font-bold text-[#8A6208] dark:text-[#F5D77A]">
+                            {getProviderLabel(item.provider)}
+                          </span>
                           {item.price ? (
                             <>
                               <span aria-hidden="true">·</span>

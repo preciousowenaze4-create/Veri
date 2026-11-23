@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import crypto from 'node:crypto';
+import vm from 'node:vm';
 import express from 'express';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 
@@ -847,6 +848,23 @@ function getFiveSimApiKey(): string {
   return cleaned;
 }
 
+function getGrizzlyApiKey(): string {
+  const raw = (
+    process.env.GRIZZLYSMS_API_KEY ||
+    process.env.GRIZZLY_API_KEY ||
+    process.env.GRIZZLYSMS_KEY ||
+    ''
+  ).trim();
+  const cleaned = raw
+    .replace(/^["']|["']$/g, '')
+    .replace(/^api_key=/i, '')
+    .trim();
+  if (!cleaned || cleaned === 'MY_GRIZZLYSMS_API_KEY' || cleaned.startsWith('MY_')) {
+    return '';
+  }
+  return cleaned;
+}
+
 function getPaystackSecretKey(): string {
   const raw = (
     process.env.PAYSTACK_SECRET_KEY ||
@@ -1443,19 +1461,19 @@ async function getAvailableNumberServices(): Promise<CleanServiceOption[]> {
 
 function sanitizeNumberApiError(rawMsg: string): string {
   const lower = rawMsg.toLowerCase();
-  if (lower.includes('not enough') || lower.includes('balance')) {
+  if (lower.includes('not enough') || lower.includes('balance') || lower.includes('no_balance')) {
     return 'Number service quota reached on your backend account. Please check your account funding.';
   }
-  if (lower.includes('no free phones') || lower.includes('out of stock')) {
-    return 'No numbers are currently available for this country and app. Try another country.';
+  if (lower.includes('no free phones') || lower.includes('out of stock') || lower.includes('no_numbers')) {
+    return 'No numbers are currently available for this country and app. Try another provider or country.';
   }
-  if (lower.includes('unauthorized') || lower.includes('token') || lower.includes('401')) {
-    return 'Backend number key could not authenticate. Verify your FIVESIM_API_KEY environment variable.';
+  if (lower.includes('unauthorized') || lower.includes('token') || lower.includes('401') || lower.includes('bad_key') || lower.includes('no_key')) {
+    return 'Backend number key could not authenticate. Verify your API key environment variable.';
   }
-  if (lower.includes('bad country') || lower.includes('bad product')) {
+  if (lower.includes('bad country') || lower.includes('bad product') || lower.includes('bad_service') || lower.includes('bad_action')) {
     return 'This country or app selection is unavailable right now.';
   }
-  return rawMsg.replace(/5sim(\.net)?/gi, 'number service');
+  return rawMsg.replace(/5sim(\.net)?|grizzly(sms)?(\.com)?/gi, 'number service');
 }
 
 function toPublicNumberOrder(
@@ -1475,6 +1493,7 @@ function toPublicNumberOrder(
   const nairaPrice = rawUsd > 0 ? roundToNaira(rawUsd, effectiveRates.NGN) : 0;
   return {
     id: norm.id,
+    provider: 'fivesim' as const,
     phone: norm.phone,
     digits: norm.digits,
     country: norm.country,
@@ -1489,6 +1508,484 @@ function toPublicNumberOrder(
     createdAt: norm.createdAt,
     sms: norm.sms,
   };
+}
+
+// ==========================================
+// Grizzly SMS (api.grizzlysms.com) Integration — Strictly Isolated
+// ==========================================
+const GRIZZLY_API_URL = 'https://api.grizzlysms.com/stubs/handler_api.php';
+
+const FIVESIM_TO_GRIZZLY_SERVICE: Record<string, string> = {
+  whatsapp: 'wa',
+  tiktok: 'lf',
+  instagram: 'ig',
+  facebook: 'fb',
+  telegram: 'tg',
+  google: 'go',
+  youtube: 'go',
+  openai: 'dr',
+  snapchat: 'fu',
+  discord: 'ds',
+  twitter: 'tw',
+  paypal: 'ts',
+  amazon: 'am',
+  netflix: 'nf',
+  uber: 'ub',
+  microsoft: 'mm',
+  apple: 'wx',
+  yahoo: 'mb',
+  viber: 'vi',
+  line: 'me',
+  tinder: 'oi',
+  spotify: 'alj',
+  linkedin: 'tn',
+  signal: 'bw',
+  wechat: 'wb',
+  other: 'ot',
+};
+
+interface GrizzlyCountryMeta {
+  id: string;
+  name: string;
+  slug: string;
+}
+
+interface GrizzlyCountryPriceOption {
+  countryId: string;
+  country: string;
+  countryCode: string;
+  dialCode: string;
+  canonicalKey: string;
+  stockCount: number;
+  minPriceUsd: number;
+}
+
+const grizzlyCountriesCache: { data: Map<string, GrizzlyCountryMeta> | null; expiresAt: number } = {
+  data: null,
+  expiresAt: 0,
+};
+const grizzlyServicesCache: { data: Map<string, string> | null; expiresAt: number } = {
+  data: null,
+  expiresAt: 0,
+};
+const grizzlyPricesCache = new Map<string, CachedEntry<GrizzlyCountryPriceOption[]>>();
+
+function normalizeCountryMatchKey(name: string): string {
+  const cleaned = name
+    .toLowerCase()
+    .replace(/\(virtual\)/g, 'virtual')
+    .replace(/[^a-z0-9]/g, '');
+  const aliases: Record<string, string> = {
+    england: 'unitedkingdom',
+    uk: 'unitedkingdom',
+    greatbritain: 'unitedkingdom',
+    englandunitedkingdom: 'unitedkingdom',
+    unitedstates: 'usa',
+    us: 'usa',
+    unitedstatesvirt: 'usavirtual',
+    russianfederation: 'russia',
+    cotedivoire: 'ivorycoast',
+    czechia: 'czechrepublic',
+    turkiye: 'turkey',
+    vietnam: 'vietnam',
+    southkorea: 'korea',
+    republicofkorea: 'korea',
+    unitedarabemirates: 'uae',
+    democraticrepublicofthecongo: 'drcongo',
+    congodrc: 'drcongo',
+    congo: 'drcongo',
+  };
+  return aliases[cleaned] || cleaned;
+}
+
+async function getGrizzlyServiceCode(serviceSlug: string): Promise<string | null> {
+  const normalized = normalizeServiceSlug(serviceSlug);
+  if (FIVESIM_TO_GRIZZLY_SERVICE[normalized]) {
+    return FIVESIM_TO_GRIZZLY_SERVICE[normalized];
+  }
+  const apiKey = getGrizzlyApiKey();
+  if (apiKey) {
+    if (!grizzlyServicesCache.data || Date.now() >= grizzlyServicesCache.expiresAt) {
+      try {
+        const res = await fetch(
+          `${GRIZZLY_API_URL}?action=getServicesList&api_key=${encodeURIComponent(apiKey)}`,
+          { headers: { 'User-Agent': USER_AGENT }, signal: AbortSignal.timeout(6000) }
+        );
+        if (res.ok) {
+          const json = (await res.json()) as {
+            services?: Array<{ code?: string; name?: string }>;
+          };
+          const map = new Map<string, string>();
+          for (const item of json.services || []) {
+            if (item.code && item.name) {
+              map.set(item.name.toLowerCase().replace(/[^a-z0-9]/g, ''), item.code);
+            }
+          }
+          if (map.size > 0) {
+            grizzlyServicesCache.data = map;
+            grizzlyServicesCache.expiresAt = Date.now() + 15 * 60 * 1000;
+          }
+        }
+      } catch {
+        // Non-blocking fallback
+      }
+    }
+    const lookupKey = normalized.replace(/[^a-z0-9]/g, '');
+    if (grizzlyServicesCache.data?.has(lookupKey)) {
+      return grizzlyServicesCache.data.get(lookupKey) || null;
+    }
+  }
+  return null;
+}
+
+async function getGrizzlyCountryDirectory(): Promise<Map<string, GrizzlyCountryMeta>> {
+  if (grizzlyCountriesCache.data && Date.now() < grizzlyCountriesCache.expiresAt) {
+    return grizzlyCountriesCache.data;
+  }
+
+  const result = new Map<string, GrizzlyCountryMeta>();
+  const apiKey = getGrizzlyApiKey();
+
+  if (apiKey) {
+    try {
+      const res = await fetch(
+        `${GRIZZLY_API_URL}?action=getCountries&api_key=${encodeURIComponent(apiKey)}`,
+        { headers: { 'User-Agent': USER_AGENT }, signal: AbortSignal.timeout(7000) }
+      );
+      if (res.ok) {
+        const txt = await res.text();
+        if (txt.startsWith('{')) {
+          const json = JSON.parse(txt) as Record<string, { id?: number; eng?: string }>;
+          for (const [key, val] of Object.entries(json)) {
+            const id = String(val?.id ?? key);
+            const name = String(val?.eng || '').trim();
+            if (id && name) {
+              result.set(id, { id, name, slug: name.toLowerCase().replace(/[^a-z0-9]+/g, '-') });
+            }
+          }
+        }
+      }
+    } catch {
+      // Fall back to public directory
+    }
+  }
+
+  if (result.size === 0) {
+    try {
+      const html = await fetch('https://grizzlysms.com/en', {
+        headers: { 'User-Agent': USER_AGENT },
+        signal: AbortSignal.timeout(8000),
+      }).then((r) => r.text());
+      const m = html.match(/window\.__NUXT__=([\s\S]*?)<\/script>/);
+      if (m?.[1]) {
+        const nuxt = vm.runInNewContext(m[1], {}, { timeout: 600 }) as {
+          state?: {
+            'languages-list'?: {
+              languages?: Array<{
+                country_external_id?: number;
+                name?: string;
+                country_slug?: string;
+              }>;
+            };
+          };
+        };
+        const list = nuxt?.state?.['languages-list']?.languages || [];
+        for (const item of list) {
+          if (item.country_external_id !== undefined && item.name) {
+            const id = String(item.country_external_id);
+            result.set(id, {
+              id,
+              name: item.name,
+              slug: item.country_slug || item.name.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
+            });
+          }
+        }
+      }
+    } catch {
+      // Fallback below if SSR changes
+    }
+  }
+
+  if (result.size > 0) {
+    grizzlyCountriesCache.data = result;
+    grizzlyCountriesCache.expiresAt = Date.now() + 6 * 60 * 60 * 1000;
+  }
+  return result;
+}
+
+async function getGrizzlyCountriesForPlatform(
+  platform: string,
+  bypassCache = false
+): Promise<GrizzlyCountryPriceOption[]> {
+  const grizzlyService = await getGrizzlyServiceCode(platform);
+  if (!grizzlyService) return [];
+
+  const cached = grizzlyPricesCache.get(grizzlyService);
+  if (!bypassCache && cached && Date.now() < cached.expiresAt) {
+    return cached.data;
+  }
+
+  const apiKey = getGrizzlyApiKey();
+  const pricesUrl = apiKey
+    ? `${GRIZZLY_API_URL}?action=getPrices&api_key=${encodeURIComponent(apiKey)}&service=${encodeURIComponent(grizzlyService)}`
+    : `${GRIZZLY_API_URL}?action=getPrices&service=${encodeURIComponent(grizzlyService)}`;
+
+  const [countryDir, fiveSimDir, pricesRes] = await Promise.all([
+    getGrizzlyCountryDirectory(),
+    getFiveSimGuestCountries().catch(() => ({} as Record<string, FiveSimGuestCountryRaw>)),
+    fetch(pricesUrl, { headers: { 'User-Agent': USER_AGENT }, signal: AbortSignal.timeout(8000) }),
+  ]);
+
+  if (!pricesRes.ok) {
+    if (cached && cached.data.length > 0) return cached.data;
+    return [];
+  }
+
+  const rawText = await pricesRes.text();
+  if (!rawText.trim().startsWith('{')) {
+    if (cached && cached.data.length > 0) return cached.data;
+    return [];
+  }
+
+  const pricesJson = JSON.parse(rawText) as Record<
+    string,
+    Record<string, { cost?: number | string; count?: number | string }>
+  >;
+
+  // Build quick ISO/dial lookup from 5sim directory + local definitions
+  const fiveSimLookup = new Map<string, { iso: string; dial: string }>();
+  for (const [slug, meta] of Object.entries(fiveSimDir)) {
+    const key = normalizeCountryMatchKey(meta.text_en || slug);
+    const iso = meta.iso ? Object.keys(meta.iso)[0]?.toUpperCase() || '' : '';
+    const dial = meta.prefix ? Object.keys(meta.prefix)[0] || '' : '';
+    if (key) fiveSimLookup.set(key, { iso, dial });
+  }
+  for (const def of COUNTRY_DEFINITIONS) {
+    const key = normalizeCountryMatchKey(def.country);
+    if (!fiveSimLookup.has(key)) {
+      fiveSimLookup.set(key, { iso: def.countryCode, dial: def.dialCode });
+    }
+  }
+
+  const list: GrizzlyCountryPriceOption[] = [];
+  for (const [countryId, svcMap] of Object.entries(pricesJson)) {
+    const stats = svcMap?.[grizzlyService];
+    const count = Number(stats?.count || 0);
+    const costUsd = Number(stats?.cost || 0);
+    if (count <= 0 || costUsd <= 0) continue;
+
+    const meta = countryDir.get(countryId);
+    if (!meta?.name) continue;
+
+    const canonicalKey = normalizeCountryMatchKey(meta.name);
+    const geo = fiveSimLookup.get(canonicalKey) ||
+      (canonicalKey === 'usavirtual' ? { iso: 'US', dial: '+1' } : { iso: '', dial: '' });
+
+    list.push({
+      countryId,
+      country: meta.name,
+      countryCode: geo.iso,
+      dialCode: geo.dial,
+      canonicalKey,
+      stockCount: count,
+      minPriceUsd: roundUnitPrice(costUsd),
+    });
+  }
+
+  list.sort((a, b) => a.country.localeCompare(b.country));
+  grizzlyPricesCache.set(grizzlyService, { data: list, expiresAt: Date.now() + 10_000 });
+  return list;
+}
+
+async function callGrizzlyApi(params: Record<string, string>, apiKey: string): Promise<string> {
+  const qs = new URLSearchParams({ ...params, api_key: apiKey });
+  const res = await fetch(`${GRIZZLY_API_URL}?${qs.toString()}`, {
+    headers: { 'User-Agent': USER_AGENT },
+    signal: AbortSignal.timeout(9000),
+  });
+  const text = (await res.text()).trim();
+  if (!res.ok) {
+    throw new Error(text || `Grizzly SMS error (${res.status})`);
+  }
+  return text;
+}
+
+function parseGrizzlyStatus(
+  statusText: string,
+  orderId: number,
+  serviceId: string,
+  serviceName?: string
+) {
+  let status = 'PENDING';
+  const sms: SmsMessageEntry[] = [];
+
+  if (statusText.startsWith('STATUS_OK:')) {
+    status = 'RECEIVED';
+    const payload = statusText.slice('STATUS_OK:'.length).trim();
+    const otp = extractOtpCode(payload) || payload;
+    sms.push({
+      id: `grz-${orderId}-1`,
+      sender: serviceName || formatServiceDisplayName(serviceId),
+      receivedAt: new Date().toISOString(),
+      text: payload === otp ? `Verification code: ${otp}` : payload,
+      otp,
+    });
+  } else if (statusText.startsWith('STATUS_CANCEL')) {
+    status = 'CANCELED';
+  } else if (statusText.startsWith('STATUS_WAIT_RETRY')) {
+    status = 'PENDING';
+  }
+
+  return { status, sms };
+}
+
+interface UnifiedProviderQuote {
+  provider: 'fivesim' | 'grizzly';
+  name: string;
+  configured: boolean;
+  countryId: string;
+  minPrice: number;
+  rawPriceUsd: number;
+  inStockMinPrice: number;
+  inStockPriceUsd: number;
+  stockCount: number;
+}
+
+interface UnifiedCountryRow {
+  slug: string;
+  country: string;
+  countryCode: string;
+  dialCode: string;
+  minPrice: number;
+  rawPriceUsd: number;
+  inStockMinPrice: number;
+  inStockPriceUsd: number;
+  currency: string;
+  stockCount: number;
+  providers: UnifiedProviderQuote[];
+}
+
+async function getUnifiedCountriesForPlatform(
+  service: string,
+  refresh = false,
+  ratesOverride?: ExchangeRates
+): Promise<{ countries: UnifiedCountryRow[]; exchangeRate: number }> {
+  const fiveSimConfigured = Boolean(getFiveSimApiKey());
+  const grizzlyConfigured = Boolean(getGrizzlyApiKey());
+  const [fiveSimRes, grizzlyRes, rates] = await Promise.all([
+    getFiveSimCountriesForPlatform(service, refresh).catch(() => []),
+    getGrizzlyCountriesForPlatform(service, refresh).catch(() => []),
+    ratesOverride ? Promise.resolve(ratesOverride) : getExchangeRates(),
+  ]);
+
+  const merged = new Map<string, UnifiedCountryRow>();
+
+  for (const c of fiveSimRes) {
+    const canonicalKey = normalizeCountryMatchKey(c.country || c.slug);
+    const minNgn = roundToNaira(c.minPrice, rates.NGN);
+    const inStockUsd = c.inStockMinPrice || c.minPrice;
+    const inStockNgn = roundToNaira(inStockUsd, rates.NGN);
+
+    const quote: UnifiedProviderQuote = {
+      provider: 'fivesim',
+      name: '5sim',
+      configured: fiveSimConfigured,
+      countryId: c.slug,
+      minPrice: minNgn,
+      rawPriceUsd: c.minPrice,
+      inStockMinPrice: inStockNgn,
+      inStockPriceUsd: inStockUsd,
+      stockCount: c.stockCount,
+    };
+
+    const existing = merged.get(canonicalKey);
+    if (!existing) {
+      merged.set(canonicalKey, {
+        slug: c.slug,
+        country: c.country === 'England' ? 'United Kingdom (England)' : c.country,
+        countryCode: c.countryCode,
+        dialCode: c.dialCode,
+        minPrice: minNgn,
+        rawPriceUsd: c.minPrice,
+        inStockMinPrice: inStockNgn,
+        inStockPriceUsd: inStockUsd,
+        currency: 'NGN',
+        stockCount: c.stockCount,
+        providers: [quote],
+      });
+    } else {
+      existing.providers.push(quote);
+      existing.stockCount += c.stockCount;
+      if (minNgn > 0 && (existing.minPrice <= 0 || minNgn < existing.minPrice)) {
+        existing.minPrice = minNgn;
+        existing.rawPriceUsd = c.minPrice;
+      }
+      if (inStockNgn > 0 && (existing.inStockMinPrice <= 0 || inStockNgn < existing.inStockMinPrice)) {
+        existing.inStockMinPrice = inStockNgn;
+        existing.inStockPriceUsd = inStockUsd;
+      }
+    }
+  }
+
+  for (const g of grizzlyRes) {
+    const minNgn = roundToNaira(g.minPriceUsd, rates.NGN);
+    const quote: UnifiedProviderQuote = {
+      provider: 'grizzly',
+      name: 'Grizzly SMS',
+      configured: grizzlyConfigured,
+      countryId: g.countryId,
+      minPrice: minNgn,
+      rawPriceUsd: g.minPriceUsd,
+      inStockMinPrice: minNgn,
+      inStockPriceUsd: g.minPriceUsd,
+      stockCount: g.stockCount,
+    };
+
+    const existing = merged.get(g.canonicalKey);
+    if (!existing) {
+      merged.set(g.canonicalKey, {
+        slug: g.canonicalKey,
+        country: g.country,
+        countryCode: g.countryCode,
+        dialCode: g.dialCode,
+        minPrice: minNgn,
+        rawPriceUsd: g.minPriceUsd,
+        inStockMinPrice: minNgn,
+        inStockPriceUsd: g.minPriceUsd,
+        currency: 'NGN',
+        stockCount: g.stockCount,
+        providers: [quote],
+      });
+    } else {
+      const alreadyHasGrizzly = existing.providers.some((p) => p.provider === 'grizzly');
+      if (!alreadyHasGrizzly) {
+        existing.providers.push(quote);
+        existing.stockCount += g.stockCount;
+        if (minNgn > 0 && (existing.minPrice <= 0 || minNgn < existing.minPrice)) {
+          existing.minPrice = minNgn;
+          existing.rawPriceUsd = g.minPriceUsd;
+        }
+        if (inStockNgnMore(existing.inStockMinPrice, minNgn)) {
+          existing.inStockMinPrice = minNgn;
+          existing.inStockPriceUsd = g.minPriceUsd;
+        }
+      }
+    }
+  }
+
+  const countries = Array.from(merged.values()).map((row) => ({
+    ...row,
+    providers: [...row.providers].sort((a, b) => a.inStockMinPrice - b.inStockMinPrice),
+  }));
+
+  // Sort ALL countries strictly alphabetically A to Z
+  countries.sort((a, b) => a.country.localeCompare(b.country));
+
+  return { countries, exchangeRate: rates.NGN };
+}
+
+function inStockNgnMore(existing: number, candidate: number): boolean {
+  return candidate > 0 && (existing <= 0 || candidate < existing);
 }
 
 export function createApiApp() {
@@ -2385,95 +2882,108 @@ export function createApiApp() {
   // Privacy-Safe Virtual Number & SMS Routes
   // ==========================================
   app.get('/api/numbers/services', async (_req, res) => {
-    const apiKey = getFiveSimApiKey();
+    const fivesimConfigured = Boolean(getFiveSimApiKey());
+    const grizzlyConfigured = Boolean(getGrizzlyApiKey());
+    const configured = fivesimConfigured || grizzlyConfigured;
     try {
       const services = await getAvailableNumberServices();
-      res.json({ configured: Boolean(apiKey), services });
+      res.json({ configured, fivesimConfigured, grizzlyConfigured, services });
     } catch {
       const fallbackServices = POPULAR_SERVICE_ORDER.map((id) => ({
         id,
         name: formatServiceDisplayName(id),
         popular: true,
       }));
-      res.json({ configured: Boolean(apiKey), services: fallbackServices });
+      res.json({ configured, fivesimConfigured, grizzlyConfigured, services: fallbackServices });
     }
   });
 
   app.get('/api/numbers/key-check', async (_req, res) => {
-    const apiKey = getFiveSimApiKey();
-    if (!apiKey) {
-      res.status(503).json({
-        configured: false,
-        authenticated: false,
-        error: 'FIVESIM_API_KEY is not configured in environment variables.',
-      });
-      return;
-    }
-    try {
-      const [profile, rates] = await Promise.all([
-        callFiveSimUserApi('profile', apiKey),
-        getExchangeRates(),
-      ]);
-      const rawCurrency = String(profile.currency || '').toUpperCase().trim();
-      const detectedCurrency = rawCurrency || (await detectFiveSimRatioCurrency(apiKey));
-      fiveSimCurrencyCache.currency = detectedCurrency;
-      fiveSimCurrencyCache.expiresAt = Date.now() + 10 * 60 * 1000;
+    const fiveSimKey = getFiveSimApiKey();
+    const grizzlyKey = getGrizzlyApiKey();
+    const rates = await getExchangeRates();
 
-      const rawBalance = Number(profile.balance || 0);
-      const balanceUsd = convertCurrencyAmountToUsd(rawBalance, detectedCurrency, rates);
-      const balanceNgn = roundToNaira(balanceUsd, rates.NGN);
+    const checkFiveSim = async () => {
+      if (!fiveSimKey) {
+        return { configured: false, authenticated: false, error: 'FIVESIM_API_KEY not configured' };
+      }
+      try {
+        const profile = await callFiveSimUserApi('profile', fiveSimKey);
+        const rawCurrency = String(profile.currency || '').toUpperCase().trim();
+        const detectedCurrency = rawCurrency || (await detectFiveSimRatioCurrency(fiveSimKey));
+        fiveSimCurrencyCache.currency = detectedCurrency;
+        fiveSimCurrencyCache.expiresAt = Date.now() + 10 * 60 * 1000;
+        const rawBalance = Number(profile.balance || 0);
+        const balanceUsd = convertCurrencyAmountToUsd(rawBalance, detectedCurrency, rates);
+        return {
+          configured: true,
+          authenticated: true,
+          accountCurrency: detectedCurrency,
+          rawBalance,
+          balanceUsd,
+          balanceNgn: roundToNaira(balanceUsd, rates.NGN),
+        };
+      } catch (err) {
+        const statusCode =
+          err && typeof err === 'object' && 'statusCode' in err
+            ? Number((err as { statusCode?: number }).statusCode)
+            : 502;
+        return {
+          configured: true,
+          authenticated: false,
+          upstreamStatus: statusCode || 502,
+          error: sanitizeNumberApiError(err instanceof Error ? err.message : '5sim verification failed'),
+        };
+      }
+    };
 
-      res.json({
-        configured: true,
-        authenticated: true,
-        accountCurrency: detectedCurrency,
-        rawBalance,
-        balanceUsd,
-        balanceNgn,
-        exchangeRateNgn: rates.NGN,
-        rating: Number(profile.rating || 0),
-      });
-    } catch (err) {
-      const statusCode =
-        err && typeof err === 'object' && 'statusCode' in err
-          ? Number((err as { statusCode?: number }).statusCode)
-          : 502;
-      res.status(502).json({
-        configured: true,
-        authenticated: false,
-        upstreamStatus: statusCode || 502,
-        error: sanitizeNumberApiError(err instanceof Error ? err.message : 'API key verification failed'),
-      });
-    }
+    const checkGrizzly = async () => {
+      if (!grizzlyKey) {
+        return { configured: false, authenticated: false, error: 'GRIZZLYSMS_API_KEY not configured' };
+      }
+      try {
+        const text = await callGrizzlyApi({ action: 'getBalance' }, grizzlyKey);
+        if (text.startsWith('ACCESS_BALANCE:')) {
+          const rawBalance = Number(text.slice('ACCESS_BALANCE:'.length).trim() || 0);
+          return {
+            configured: true,
+            authenticated: true,
+            accountCurrency: 'USD',
+            rawBalance,
+            balanceUsd: rawBalance,
+            balanceNgn: roundToNaira(rawBalance, rates.NGN),
+          };
+        }
+        return {
+          configured: true,
+          authenticated: false,
+          error: sanitizeNumberApiError(text),
+        };
+      } catch (err) {
+        return {
+          configured: true,
+          authenticated: false,
+          error: sanitizeNumberApiError(err instanceof Error ? err.message : 'Grizzly SMS verification failed'),
+        };
+      }
+    };
+
+    const [fivesim, grizzly] = await Promise.all([checkFiveSim(), checkGrizzly()]);
+    res.json({
+      configured: fivesim.configured || grizzly.configured,
+      authenticated: fivesim.authenticated || grizzly.authenticated,
+      exchangeRateNgn: rates.NGN,
+      fivesim,
+      grizzly,
+    });
   });
 
   app.get('/api/numbers/countries', async (req, res) => {
     const service = normalizeServiceSlug(String(req.query.service || 'whatsapp'));
     const refresh = req.query.refresh === '1' || req.query.refresh === 'true';
     try {
-      const [all, rates] = await Promise.all([
-        getFiveSimCountriesForPlatform(service, refresh),
-        getExchangeRates(),
-      ]);
-      const countries = all.map((c) => {
-        const rawUsd = c.minPrice;
-        const nairaAmount = roundToNaira(rawUsd, rates.NGN);
-        const inStockUsd = c.inStockMinPrice || rawUsd;
-        const inStockNaira = roundToNaira(inStockUsd, rates.NGN);
-        return {
-          slug: c.slug,
-          country: c.country,
-          countryCode: c.countryCode,
-          dialCode: c.dialCode,
-          minPrice: nairaAmount,
-          rawPriceUsd: rawUsd,
-          inStockMinPrice: inStockNaira,
-          inStockPriceUsd: inStockUsd,
-          currency: 'NGN',
-          stockCount: c.stockCount,
-        };
-      });
-      res.json({ service, currency: 'NGN', exchangeRate: rates.NGN, countries });
+      const { countries, exchangeRate } = await getUnifiedCountriesForPlatform(service, refresh);
+      res.json({ service, currency: 'NGN', exchangeRate, countries });
     } catch (err) {
       res.status(502).json({
         error: sanitizeNumberApiError(err instanceof Error ? err.message : 'Failed to load countries'),
@@ -2494,6 +3004,8 @@ export function createApiApp() {
       rawPriceUsd: number;
       currency: string;
       stockCount: number;
+      provider: 'fivesim' | 'grizzly';
+      providerName: string;
     }>;
     exchangeRate: number;
     expiresAt: number;
@@ -2512,23 +3024,33 @@ export function createApiApp() {
 
     const trackServices = ['tiktok', 'facebook', 'instagram', 'twitter', 'google', 'telegram', 'whatsapp', 'other'];
     try {
-      const apiKey = getFiveSimApiKey();
+      const fiveSimKey = getFiveSimApiKey();
       const [rates] = await Promise.all([
         getExchangeRates(),
-        getFiveSimAccountCurrency(apiKey),
+        fiveSimKey ? getFiveSimAccountCurrency(fiveSimKey) : Promise.resolve('USD'),
       ]);
 
       const fetchDeal = async (serviceId: string) => {
-        const list = await getFiveSimCountriesForPlatform(serviceId, refresh);
-        if (list.length === 0) return null;
-        const cheapest = [...list].sort(
-          (a, b) => a.minPrice - b.minPrice || b.stockCount - a.stockCount
+        const { countries } = await getUnifiedCountriesForPlatform(serviceId, refresh, rates);
+        if (countries.length === 0) return null;
+        const cheapest = [...countries].sort(
+          (a, b) => a.inStockMinPrice - b.inStockMinPrice || b.stockCount - a.stockCount
         )[0];
         if (!cheapest) return null;
+        const bestProv = cheapest.providers[0];
         return {
           serviceId,
           serviceName: formatServiceDisplayName(serviceId),
-          country: cheapest,
+          slug: cheapest.slug,
+          country: cheapest.country,
+          countryCode: cheapest.countryCode,
+          dialCode: cheapest.dialCode,
+          minPrice: bestProv ? bestProv.inStockMinPrice : cheapest.inStockMinPrice,
+          rawPriceUsd: bestProv ? bestProv.inStockPriceUsd : cheapest.inStockPriceUsd,
+          currency: 'NGN',
+          stockCount: cheapest.stockCount,
+          provider: bestProv?.provider || ('fivesim' as const),
+          providerName: bestProv?.name || '5sim',
         };
       };
 
@@ -2539,22 +3061,7 @@ export function createApiApp() {
 
       const deals = results
         .map((r) => (r.status === 'fulfilled' ? r.value : null))
-        .filter(
-          (item): item is { serviceId: string; serviceName: string; country: FiveSimCountryOption } =>
-            Boolean(item && item.country && item.country.minPrice > 0)
-        )
-        .map((item) => ({
-          serviceId: item.serviceId,
-          serviceName: item.serviceName,
-          slug: item.country.slug,
-          country: item.country.country,
-          countryCode: item.country.countryCode,
-          dialCode: item.country.dialCode,
-          minPrice: roundToNaira(item.country.minPrice, rates.NGN),
-          rawPriceUsd: item.country.minPrice,
-          currency: 'NGN',
-          stockCount: item.country.stockCount,
-        }))
+        .filter((item): item is NonNullable<typeof item> => Boolean(item && item.minPrice > 0))
         .sort((a, b) => a.minPrice - b.minPrice || b.stockCount - a.stockCount);
 
       if (deals.length > 0) {
@@ -2583,23 +3090,217 @@ export function createApiApp() {
   });
 
   app.post('/api/numbers/acquire', async (req, res) => {
-    const apiKey = getFiveSimApiKey();
-    if (!apiKey) {
-      res.status(503).json({ error: 'Number service key (FIVESIM_API_KEY) is not configured yet.' });
-      return;
-    }
+    const requestedProvider = String(req.body?.provider || 'fivesim').toLowerCase();
+    const provider: 'fivesim' | 'grizzly' =
+      requestedProvider === 'grizzly' ? 'grizzly' : 'fivesim';
 
-    const country = String(req.body?.country || 'england')
-      .toLowerCase()
-      .replace(/[^a-z0-9]/g, '');
     const service = normalizeServiceSlug(String(req.body?.service || 'whatsapp'));
     const serviceName =
       typeof req.body?.serviceName === 'string'
         ? req.body.serviceName
         : formatServiceDisplayName(service);
+    const countryNameHint =
+      typeof req.body?.countryName === 'string' ? req.body.countryName : '';
     const countryCodeHint =
       typeof req.body?.countryCode === 'string' ? req.body.countryCode.toUpperCase() : undefined;
     const quantity = Math.min(5, Math.max(1, Number(req.body?.quantity || 1) || 1));
+    const clientWalletBalance = Number(req.body?.walletBalance);
+
+    // STRICTLY ISOLATED GRIZZLY SMS FLOW
+    if (provider === 'grizzly') {
+      const grizzlyKey = getGrizzlyApiKey();
+      if (!grizzlyKey) {
+        res.status(503).json({
+          error: 'Grizzly SMS key (GRIZZLYSMS_API_KEY) is not configured yet.',
+        });
+        return;
+      }
+
+      const grizzlyCountryId = String(req.body?.countryId || req.body?.country || '').replace(
+        /[^0-9]/g,
+        ''
+      );
+      if (!grizzlyCountryId) {
+        res.status(400).json({ error: 'Invalid Grizzly SMS country selection.' });
+        return;
+      }
+
+      try {
+        const grizzlyService = await getGrizzlyServiceCode(service);
+        if (!grizzlyService) {
+          res.status(400).json({
+            error: `${serviceName} is not supported on Grizzly SMS right now.`,
+          });
+          return;
+        }
+
+        const [grizzlyCountries, rates] = await Promise.all([
+          getGrizzlyCountriesForPlatform(service, true).catch(() => []),
+          getExchangeRates(),
+        ]);
+        const countryMeta = grizzlyCountries.find((c) => c.countryId === grizzlyCountryId);
+        const liveUnitUsd = countryMeta?.minPriceUsd || 0;
+        const liveUnitNgn = liveUnitUsd > 0 ? roundToNaira(liveUnitUsd, rates.NGN) : 0;
+
+        if (
+          Number.isFinite(clientWalletBalance) &&
+          liveUnitNgn > 0 &&
+          clientWalletBalance < liveUnitNgn * quantity
+        ) {
+          res.status(402).json({
+            error: `Insufficient wallet balance for the current live Grizzly SMS price (₦${(liveUnitNgn * quantity).toLocaleString()} required, wallet has ₦${clientWalletBalance.toLocaleString()}). Please top up first.`,
+          });
+          return;
+        }
+
+        const orders = [];
+        let lastError = 'No numbers available on Grizzly SMS for this selection right now.';
+
+        for (let i = 0; i < quantity; i++) {
+          let acquiredOrder = null;
+          try {
+            const v2Raw = await callGrizzlyApi(
+              {
+                action: 'getNumberV2',
+                service: grizzlyService,
+                country: grizzlyCountryId,
+              },
+              grizzlyKey
+            );
+
+            if (v2Raw.startsWith('{')) {
+              const parsed = JSON.parse(v2Raw) as {
+                activationId?: number | string;
+                phoneNumber?: string;
+                activationCost?: number | string;
+                activationTime?: string;
+                activationEndTime?: string;
+              };
+              const actId = Number(parsed.activationId || 0);
+              const phoneRaw = String(parsed.phoneNumber || '');
+              const digits = phoneRaw.replace(/\D/g, '');
+              const phone = phoneRaw.startsWith('+') ? phoneRaw : digits ? `+${digits}` : phoneRaw;
+              const costUsd = Number(parsed.activationCost || liveUnitUsd || 0);
+              const costNgn = costUsd > 0 ? roundToNaira(costUsd, rates.NGN) : liveUnitNgn;
+
+              if (actId > 0 && digits) {
+                acquiredOrder = {
+                  id: actId,
+                  provider: 'grizzly' as const,
+                  phone,
+                  digits,
+                  country: countryMeta?.country || countryNameHint || 'Country',
+                  countryCode: countryCodeHint || countryMeta?.countryCode,
+                  service,
+                  serviceName,
+                  price: costNgn > 0 ? costNgn : undefined,
+                  rawPriceUsd: costUsd > 0 ? roundUnitPrice(costUsd) : undefined,
+                  currency: 'NGN',
+                  status: 'PENDING',
+                  expires: String(parsed.activationEndTime || ''),
+                  createdAt: new Date().toISOString(),
+                  sms: [],
+                };
+              }
+            } else if (v2Raw.startsWith('ACCESS_NUMBER:')) {
+              const parts = v2Raw.split(':');
+              const actId = Number(parts[1] || 0);
+              const phoneRaw = String(parts[2] || '');
+              const digits = phoneRaw.replace(/\D/g, '');
+              const phone = phoneRaw.startsWith('+') ? phoneRaw : digits ? `+${digits}` : phoneRaw;
+              if (actId > 0 && digits) {
+                acquiredOrder = {
+                  id: actId,
+                  provider: 'grizzly' as const,
+                  phone,
+                  digits,
+                  country: countryMeta?.country || countryNameHint || 'Country',
+                  countryCode: countryCodeHint || countryMeta?.countryCode,
+                  service,
+                  serviceName,
+                  price: liveUnitNgn > 0 ? liveUnitNgn : undefined,
+                  rawPriceUsd: liveUnitUsd > 0 ? roundUnitPrice(liveUnitUsd) : undefined,
+                  currency: 'NGN',
+                  status: 'PENDING',
+                  expires: '',
+                  createdAt: new Date().toISOString(),
+                  sms: [],
+                };
+              }
+            } else if (v2Raw === 'BAD_ACTION') {
+              const v1Raw = await callGrizzlyApi(
+                {
+                  action: 'getNumber',
+                  service: grizzlyService,
+                  country: grizzlyCountryId,
+                },
+                grizzlyKey
+              );
+              if (v1Raw.startsWith('ACCESS_NUMBER:')) {
+                const parts = v1Raw.split(':');
+                const actId = Number(parts[1] || 0);
+                const phoneRaw = String(parts[2] || '');
+                const digits = phoneRaw.replace(/\D/g, '');
+                const phone = phoneRaw.startsWith('+') ? phoneRaw : digits ? `+${digits}` : phoneRaw;
+                if (actId > 0 && digits) {
+                  acquiredOrder = {
+                    id: actId,
+                    provider: 'grizzly' as const,
+                    phone,
+                    digits,
+                    country: countryMeta?.country || countryNameHint || 'Country',
+                    countryCode: countryCodeHint || countryMeta?.countryCode,
+                    service,
+                    serviceName,
+                    price: liveUnitNgn > 0 ? liveUnitNgn : undefined,
+                    rawPriceUsd: liveUnitUsd > 0 ? roundUnitPrice(liveUnitUsd) : undefined,
+                    currency: 'NGN',
+                    status: 'PENDING',
+                    expires: '',
+                    createdAt: new Date().toISOString(),
+                    sms: [],
+                  };
+                }
+              } else {
+                lastError = sanitizeNumberApiError(v1Raw);
+              }
+            } else {
+              lastError = sanitizeNumberApiError(v2Raw);
+            }
+          } catch (err) {
+            lastError = sanitizeNumberApiError(
+              err instanceof Error ? err.message : 'Grizzly SMS purchase failed'
+            );
+          }
+
+          if (!acquiredOrder) {
+            if (orders.length > 0) break;
+            throw new Error(lastError);
+          }
+          orders.push(acquiredOrder);
+        }
+
+        res.json({ orders });
+        return;
+      } catch (err) {
+        const message = sanitizeNumberApiError(
+          err instanceof Error ? err.message : 'Unable to assign number on Grizzly SMS'
+        );
+        res.status(400).json({ error: message });
+        return;
+      }
+    }
+
+    // STRICTLY ISOLATED 5SIM FLOW
+    const apiKey = getFiveSimApiKey();
+    if (!apiKey) {
+      res.status(503).json({ error: '5sim API key (FIVESIM_API_KEY) is not configured yet.' });
+      return;
+    }
+
+    const country = String(req.body?.countryId || req.body?.country || 'england')
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, '');
 
     try {
       const [countriesList, accountCurrency, rates] = await Promise.all([
@@ -2613,7 +3314,6 @@ export function createApiApp() {
       // Strictly buy from the lowest in-stock operator first, falling back to next cheapest, then 'any'
       const operatorCandidates = Array.from(new Set([...sortedOps, 'any']));
 
-      const clientWalletBalance = Number(req.body?.walletBalance);
       const liveUnitNgn = countryMeta?.inStockMinPrice
         ? roundToNaira(countryMeta.inStockMinPrice, rates.NGN)
         : 0;
@@ -2669,14 +3369,41 @@ export function createApiApp() {
   });
 
   app.get('/api/numbers/check/:orderId', async (req, res) => {
-    const apiKey = getFiveSimApiKey();
-    if (!apiKey) {
-      res.status(503).json({ error: 'Number service unavailable' });
-      return;
-    }
+    const provider = String(req.query.provider || 'fivesim').toLowerCase();
     const orderId = req.params.orderId.replace(/[^0-9]/g, '');
     if (!orderId) {
       res.status(400).json({ error: 'Invalid number ID' });
+      return;
+    }
+
+    if (provider === 'grizzly') {
+      const grizzlyKey = getGrizzlyApiKey();
+      if (!grizzlyKey) {
+        res.status(503).json({ error: 'Grizzly SMS service unavailable' });
+        return;
+      }
+      try {
+        const statusText = await callGrizzlyApi({ action: 'getStatus', id: orderId }, grizzlyKey);
+        const parsed = parseGrizzlyStatus(statusText, Number(orderId), 'other');
+        res.json({
+          order: {
+            id: Number(orderId),
+            provider: 'grizzly',
+            status: parsed.status,
+            sms: parsed.sms,
+          },
+        });
+      } catch (err) {
+        res.status(502).json({
+          error: sanitizeNumberApiError(err instanceof Error ? err.message : 'Check failed'),
+        });
+      }
+      return;
+    }
+
+    const apiKey = getFiveSimApiKey();
+    if (!apiKey) {
+      res.status(503).json({ error: 'Number service unavailable' });
       return;
     }
 
@@ -2695,8 +3422,9 @@ export function createApiApp() {
   });
 
   app.get('/api/numbers/stream/:orderId', async (req, res) => {
-    const apiKey = getFiveSimApiKey();
+    const provider = String(req.query.provider || 'fivesim').toLowerCase();
     const orderId = req.params.orderId.replace(/[^0-9]/g, '');
+    const apiKey = provider === 'grizzly' ? getGrizzlyApiKey() : getFiveSimApiKey();
     if (!apiKey || !orderId) {
       res.status(400).end();
       return;
@@ -2712,14 +3440,32 @@ export function createApiApp() {
       closed = true;
     });
 
-    const [accountCurrency, rates] = await Promise.all([
-      getFiveSimAccountCurrency(apiKey),
-      getExchangeRates(),
-    ]);
+    const [accountCurrency, rates] =
+      provider === 'grizzly'
+        ? ['USD', await getExchangeRates()]
+        : await Promise.all([getFiveSimAccountCurrency(apiKey), getExchangeRates()]);
 
     const pushOrder = async () => {
       if (closed) return;
       try {
+        if (provider === 'grizzly') {
+          const statusText = await callGrizzlyApi({ action: 'getStatus', id: orderId }, apiKey);
+          const parsed = parseGrizzlyStatus(statusText, Number(orderId), 'other');
+          const order = {
+            id: Number(orderId),
+            provider: 'grizzly',
+            status: parsed.status,
+            sms: parsed.sms,
+          };
+          res.write(`data: ${JSON.stringify({ type: 'order', order })}\n\n`);
+          if (['FINISHED', 'CANCELED', 'TIMEOUT', 'BANNED'].includes(order.status)) {
+            closed = true;
+            clearInterval(interval);
+            res.end();
+          }
+          return;
+        }
+
         const raw = await callFiveSimUserApi(`check/${orderId}`, apiKey);
         const order = toPublicNumberOrder(raw, undefined, undefined, accountCurrency, rates);
         res.write(`data: ${JSON.stringify({ type: 'order', order })}\n\n`);
@@ -2747,15 +3493,41 @@ export function createApiApp() {
   });
 
   app.post('/api/numbers/:action(cancel|finish|ban)/:orderId', async (req, res) => {
-    const apiKey = getFiveSimApiKey();
-    if (!apiKey) {
-      res.status(503).json({ error: 'Number service unavailable' });
-      return;
-    }
+    const provider = String(req.query.provider || req.body?.provider || 'fivesim').toLowerCase();
     const action = req.params.action;
     const orderId = req.params.orderId.replace(/[^0-9]/g, '');
     if (!orderId) {
       res.status(400).json({ error: 'Invalid number ID' });
+      return;
+    }
+
+    if (provider === 'grizzly') {
+      const grizzlyKey = getGrizzlyApiKey();
+      if (!grizzlyKey) {
+        res.status(503).json({ error: 'Grizzly SMS service unavailable' });
+        return;
+      }
+      const statusCode = action === 'finish' ? '6' : '8';
+      try {
+        await callGrizzlyApi({ action: 'setStatus', status: statusCode, id: orderId }, grizzlyKey);
+        res.json({
+          order: {
+            id: Number(orderId),
+            provider: 'grizzly',
+            status: action === 'finish' ? 'FINISHED' : 'CANCELED',
+          },
+        });
+      } catch (err) {
+        res.status(502).json({
+          error: sanitizeNumberApiError(err instanceof Error ? err.message : 'Action failed'),
+        });
+      }
+      return;
+    }
+
+    const apiKey = getFiveSimApiKey();
+    if (!apiKey) {
+      res.status(503).json({ error: 'Number service unavailable' });
       return;
     }
 

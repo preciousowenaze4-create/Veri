@@ -5,11 +5,9 @@ import {
   ChevronDown,
   Copy,
   Inbox,
-  Loader2,
   MailPlus,
   Phone,
   RefreshCw,
-  Sparkles,
   Trash2,
 } from 'lucide-react';
 import type { EmailMessageDetail, EmailMessageSummary, TempEmailAccount } from '../types';
@@ -27,10 +25,6 @@ interface HomeEmailTabProps {
   autoRefresh: boolean;
   onGoToCreate: () => void;
   onGoToNumbers: () => void;
-  onGenerateEmail: () => void;
-  generatingEmail?: boolean;
-  freeRemainingToday?: number;
-  freeDailyLimit?: number;
   onSelectAccount: (account: TempEmailAccount) => void;
   onDeleteAccount: (address: string) => void;
   onRefreshInbox: () => void;
@@ -44,13 +38,10 @@ interface HomeEmailTabProps {
   ) => void;
 }
 
-function providerName(p?: string, mode?: string): string {
+function providerName(mode?: string): string {
   const modeTag =
-    mode === 'business' ? ' · Business' : mode === 'privacy' ? ' · Privacy' : '';
-  if (p === 'tempmailio') return `VeriBox Mail${modeTag}`;
-  if (p === 'tempmail') return `TempMail${modeTag}`;
-  if (p === 'guerrilla') return `GuerrillaMail${modeTag}`;
-  return `VeriBox Pro Mail${modeTag}`;
+    mode === 'business' ? ' · Business' : mode === 'privacy' ? ' · Privacy' : ' · Personal';
+  return `VeriBox Mail · @veribox.name.ng${modeTag}`;
 }
 
 export function HomeEmailTab({
@@ -65,10 +56,6 @@ export function HomeEmailTab({
   autoRefresh,
   onGoToCreate,
   onGoToNumbers,
-  onGenerateEmail,
-  generatingEmail = false,
-  freeRemainingToday = 5,
-  freeDailyLimit = 5,
   onSelectAccount,
   onDeleteAccount,
   onRefreshInbox,
@@ -93,22 +80,11 @@ export function HomeEmailTab({
       <section className="rounded-2xl border border-[#D4AF37]/30 bg-white p-4 sm:p-5 dark:bg-[#14120D]">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
-            <div className="flex flex-wrap items-center gap-2">
-              <p className="text-xs font-bold text-[#8A6208] dark:text-[#D4AF37]">
-                Home · Active Email Address
-              </p>
-              <span
-                className={`inline-flex items-center rounded-md border px-2 py-0.5 text-[10px] font-extrabold tabular-nums ${
-                  freeRemainingToday > 0
-                    ? 'border-[#D4AF37]/35 bg-[#D4AF37]/10 text-[#8A6208] dark:text-[#F5D77A]'
-                    : 'border-rose-500/35 bg-rose-500/10 text-rose-700 dark:text-rose-300'
-                }`}
-              >
-                {freeRemainingToday}/{freeDailyLimit} free today
-              </span>
-            </div>
+            <p className="text-xs font-bold text-[#8A6208] dark:text-[#D4AF37]">
+              Home · @veribox.name.ng Mail
+            </p>
             <h1 className="mt-0.5 font-display text-base sm:text-lg font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
-              Receive Codes & Emails Here
+              Receive Codes &amp; Emails Here
             </h1>
           </div>
 
@@ -116,7 +92,7 @@ export function HomeEmailTab({
             <button
               type="button"
               onClick={onGoToNumbers}
-              className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl border border-[#D4AF37]/30 px-3 py-1.5 text-xs font-bold text-[#4F4736] hover:bg-[#D4AF37]/10 whitespace-nowrap dark:text-[#F5D77A]"
+              className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl border border-[#D4AF37]/30 px-3 py-1.5 text-xs font-bold text-[#4F4736] hover:bg-[#D4AF37]/10 whitespace-nowrap cursor-pointer dark:text-[#F5D77A]"
             >
               <Phone className="h-3.5 w-3.5" />
               <span>Numbers</span>
@@ -124,65 +100,15 @@ export function HomeEmailTab({
             <button
               type="button"
               onClick={onGoToCreate}
-              className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl bg-[#D4AF37] px-3.5 py-1.5 text-xs font-bold text-[#0A0906] hover:bg-[#E5C150] whitespace-nowrap"
+              className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl bg-[#D4AF37] px-3.5 py-1.5 text-xs font-bold text-[#0A0906] hover:bg-[#E5C150] whitespace-nowrap cursor-pointer"
             >
               <MailPlus className="h-3.5 w-3.5" />
-              <span>Create</span>
-            </button>
-            <button
-              type="button"
-              onClick={onGenerateEmail}
-              disabled={generatingEmail}
-              className={`inline-flex min-h-[38px] items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-bold whitespace-nowrap disabled:opacity-60 cursor-pointer ${
-                freeRemainingToday > 0
-                  ? 'border-[#D4AF37]/60 bg-[#D4AF37]/15 text-[#8A6208] hover:bg-[#D4AF37]/25 dark:text-[#F5D77A]'
-                  : 'border-rose-500/40 bg-rose-500/10 text-rose-700 hover:bg-rose-500/15 dark:text-rose-300'
-              }`}
-            >
-              {generatingEmail ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <Sparkles className="h-3.5 w-3.5 text-[#D4AF37]" />
-              )}
-              <span>
-                {generatingEmail
-                  ? 'Generating...'
-                  : freeRemainingToday > 0
-                    ? `Generate (${freeRemainingToday})`
-                    : 'Limit 5/5'}
-              </span>
+              <span>Create Email</span>
             </button>
           </div>
         </div>
 
-        {freeRemainingToday <= 0 && (
-          <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-500/35 bg-amber-500/10 px-3.5 py-2.5 text-xs">
-            <span className="font-semibold text-amber-800 dark:text-amber-200">
-              Daily free limit reached ({freeDailyLimit}/{freeDailyLimit} used today). Your 5 free emails reset tomorrow.
-            </span>
-            <button
-              type="button"
-              onClick={onGoToCreate}
-              className="rounded-lg bg-[#D4AF37] px-2.5 py-1 text-[11px] font-extrabold text-[#0A0906] hover:bg-[#E5C150] cursor-pointer"
-            >
-              Create Custom (₦50)
-            </button>
-          </div>
-        )}
-
-        {generatingEmail ? (
-          <div className="mt-3.5 flex items-center gap-3 rounded-xl border border-[#D4AF37]/35 bg-[#FAF7F0] p-4 dark:bg-[#0B0A07]">
-            <Loader2 className="h-5 w-5 shrink-0 animate-spin text-[#D4AF37]" />
-            <div>
-              <p className="text-sm font-bold text-[#1A160D] dark:text-[#FAF6EC]">
-                Generating your instant email...
-              </p>
-              <p className="mt-0.5 text-xs text-[#6E6552] dark:text-[#A89F8C]">
-                Connecting to live inbox server
-              </p>
-            </div>
-          </div>
-        ) : activeEmail ? (
+        {activeEmail ? (
           <div className="mt-3.5 rounded-xl border border-[#D4AF37]/25 bg-[#FAF7F0] p-3.5 dark:bg-[#0B0A07]">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="min-w-0 flex-1">
@@ -190,7 +116,7 @@ export function HomeEmailTab({
                   {activeEmail.address}
                 </p>
                 <p className="mt-1 text-xs text-[#6E6552] dark:text-[#A89F8C]">
-                  {providerName(activeEmail.provider, activeEmail.accountMode)} · Created{' '}
+                  {providerName(activeEmail.accountMode)} · Created{' '}
                   {formatRelativeTime(activeEmail.createdAt)}
                 </p>
               </div>
@@ -272,7 +198,7 @@ export function HomeEmailTab({
                   onClick={() => setSwitcherOpen((prev) => !prev)}
                   className="flex w-full items-center justify-between text-xs font-bold text-[#8A6208] dark:text-[#F5D77A]"
                 >
-                  <span>Switch or Manage Created Emails ({savedEmails.length})</span>
+                  <span>Switch or Manage @veribox.name.ng Emails ({savedEmails.length})</span>
                   <ChevronDown
                     className={`h-4 w-4 transition-transform ${switcherOpen ? 'rotate-180' : ''}`}
                   />
@@ -329,7 +255,7 @@ export function HomeEmailTab({
         ) : (
           <div className="mt-3.5 rounded-xl border border-dashed border-[#D4AF37]/30 p-4 text-center">
             <p className="text-sm text-[#6E6552] dark:text-[#A89F8C]">
-              No email created yet. Tap <strong>Create</strong> or <strong>Generate</strong> above to make your email.
+              No @veribox.name.ng email active yet. Tap <strong>Create Email</strong> above to claim a custom address or sign into an existing one.
             </p>
           </div>
         )}

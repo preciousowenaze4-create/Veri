@@ -13,7 +13,6 @@ import {
   RotateCw,
   Shield,
   ShieldCheck,
-  Sparkles,
   User,
   Wallet,
   X,
@@ -21,8 +20,9 @@ import {
 import type { AccountMode, EmailSuggestionOption, TempEmailAccount } from '../types';
 import { parseJsonResponse } from '../utils/apiFetch';
 import {
-  createDirectGuerrillaAccount,
-  generateDirectEmailSuggestions,
+  CUSTOM_EMAIL_DOMAIN,
+  generateCustomDomainSuggestions,
+  normalizeCustomUsername,
 } from '../utils/directEmailFallback';
 
 const CREATE_EMAIL_FEE_NGN = 50;
@@ -121,6 +121,13 @@ export function CreateEmailTab({
   // Email Choices & ₦50 Fee Session Tracking
   const [options, setOptions] = useState<EmailSuggestionOption[]>([]);
   const [selectedOption, setSelectedOption] = useState<EmailSuggestionOption | null>(null);
+  const [customUsername, setCustomUsername] = useState('');
+  const [checkingCustom, setCheckingCustom] = useState(false);
+  const [customStatus, setCustomStatus] = useState<{
+    available: boolean;
+    address: string;
+    message: string;
+  } | null>(null);
   const [paidSessionRef, setPaidSessionRef] = useState<string | null>(null);
   const paidSessionRefCurrent = useRef<string | null>(null);
   const [chargingCreateFee, setChargingCreateFee] = useState(false);
@@ -271,25 +278,43 @@ export function CreateEmailTab({
     setError(null);
   };
 
-  // STEP 1A: Sign in Screen -> Next (ONLY for logging into / recovering an existing email)
+  // STEP 1A: Sign in Screen -> Next (ONLY for logging into / recovering an existing @veribox.name.ng email)
   const handleSignInNext = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
 
-    const query = usernameInput.trim().toLowerCase();
-    if (!query) return;
+    const rawQuery = usernameInput.trim().toLowerCase();
+    if (!rawQuery) return;
 
-    const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailPattern.test(query)) {
-      setError(
-        'Enter a valid VeriBox email address (e.g. name@domain.com) to sign in, or choose an option under Create account below.'
-      );
-      return;
+    let query = rawQuery;
+    if (!query.includes('@')) {
+      const norm = normalizeCustomUsername(query);
+      if (!norm || norm.length < 3) {
+        setError(
+          `Enter your @${CUSTOM_EMAIL_DOMAIN} email (e.g. name@${CUSTOM_EMAIL_DOMAIN}) to sign in, or choose an option under Create account below.`
+        );
+        return;
+      }
+      query = `${norm}@${CUSTOM_EMAIL_DOMAIN}`;
+    } else {
+      const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailPattern.test(query)) {
+        setError(
+          `Enter a valid @${CUSTOM_EMAIL_DOMAIN} email address to sign in, or choose an option under Create account below.`
+        );
+        return;
+      }
+      if (!query.endsWith(`@${CUSTOM_EMAIL_DOMAIN}`)) {
+        setError(
+          `Only @${CUSTOM_EMAIL_DOMAIN} mailboxes are supported here. Enter your @${CUSTOM_EMAIL_DOMAIN} address or create a new one below.`
+        );
+        return;
+      }
     }
 
     setIsBrowserLoading(true);
     setBrowserProgress(45);
-    setLoadingMessage('Checking VeriBox Mail directory...');
+    setLoadingMessage(`Checking ${CUSTOM_EMAIL_DOMAIN} directory...`);
 
     try {
       const localMatch =
@@ -315,7 +340,7 @@ export function CreateEmailTab({
 
       if (!localMatch && !existsOnServer) {
         setError(
-          'No VeriBox email account found for this address. Check the spelling or choose an option under Create account below.'
+          `No mailbox found for ${query}. Check the spelling or choose an option under Create account below.`
         );
         return;
       }
@@ -380,7 +405,7 @@ export function CreateEmailTab({
     setBrowserProgress(55);
 
     try {
-      // Check server login / Mail.tm / recovery registry
+      // Check server login / @veribox.name.ng mailbox registry
       try {
         const res = await fetch('/api/email/login', {
           method: 'POST',
@@ -393,7 +418,10 @@ export function CreateEmailTab({
           id?: string;
           address?: string;
           provider?: TempEmailAccount['provider'];
+          domain?: string;
           createdAt?: string;
+          accountMode?: AccountMode;
+          displayName?: string;
           error?: string;
         }>(res);
 
@@ -404,10 +432,11 @@ export function CreateEmailTab({
             address: data.address || localMatch?.address || cleanAddr,
             password: enteredPass,
             token: data.token,
-            provider: data.provider || localMatch?.provider || 'mailtm',
+            provider: 'veribox',
+            domain: data.domain || localMatch?.domain || CUSTOM_EMAIL_DOMAIN,
             createdAt: data.createdAt || localMatch?.createdAt || new Date().toISOString(),
-            accountMode: localMatch?.accountMode,
-            displayName: localMatch?.displayName,
+            accountMode: data.accountMode || localMatch?.accountMode,
+            displayName: data.displayName || localMatch?.displayName,
           };
           onShowToast(`Signed into ${restored.address}`);
           onSelectExisting(restored);
@@ -490,12 +519,16 @@ export function CreateEmailTab({
 
       setOptions(data.options);
       setSelectedOption(data.options[0]);
+      setCustomUsername('');
+      setCustomStatus(null);
       setBrowserProgress(100);
       setScreen('choose');
     } catch {
-      const fallbackOptions = generateDirectEmailSuggestions(cleanFirst, cleanSecond);
+      const fallbackOptions = generateCustomDomainSuggestions(cleanFirst, cleanSecond);
       setOptions(fallbackOptions);
       setSelectedOption(fallbackOptions[0]);
+      setCustomUsername('');
+      setCustomStatus(null);
       setBrowserProgress(100);
       setScreen('choose');
     } finally {
@@ -504,12 +537,107 @@ export function CreateEmailTab({
     }
   };
 
-  // STEP 3: Choose Email Address -> Next (Charges ₦50 from real wallet before advancing)
+  const handleCheckCustomUsername = async (): Promise<EmailSuggestionOption | null> => {
+    setError(null);
+    const norm = normalizeCustomUsername(customUsername);
+    if (norm.length < 3) {
+      const msg = 'Custom username must be at least 3 characters (letters, numbers, dot, _, -).';
+      setCustomStatus({ available: false, address: '', message: msg });
+      setError(msg);
+      return null;
+    }
+
+    setCheckingCustom(true);
+    try {
+      const res = await fetch('/api/email/check-availability', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: norm }),
+        signal: AbortSignal.timeout(6000),
+      });
+      const data = await parseJsonResponse<{
+        available?: boolean;
+        username?: string;
+        address?: string;
+        error?: string;
+      }>(res);
+
+      const resolvedAddr = data.address || `${norm}@${CUSTOM_EMAIL_DOMAIN}`;
+      if (!res.ok || !data.available) {
+        const msg = data.error || `${resolvedAddr} is already taken.`;
+        setCustomStatus({ available: false, address: resolvedAddr, message: msg });
+        setError(msg);
+        return null;
+      }
+
+      const customOpt: EmailSuggestionOption = {
+        id: 'custom',
+        address: resolvedAddr,
+        username: data.username || norm,
+        domain: CUSTOM_EMAIL_DOMAIN,
+        provider: 'veribox',
+        providerLabel: `@${CUSTOM_EMAIL_DOMAIN}`,
+      };
+      setSelectedOption(customOpt);
+      setCustomStatus({
+        available: true,
+        address: resolvedAddr,
+        message: `${resolvedAddr} is available!`,
+      });
+      return customOpt;
+    } catch {
+      const fallbackAddr = `${norm}@${CUSTOM_EMAIL_DOMAIN}`;
+      const customOpt: EmailSuggestionOption = {
+        id: 'custom',
+        address: fallbackAddr,
+        username: norm,
+        domain: CUSTOM_EMAIL_DOMAIN,
+        provider: 'veribox',
+        providerLabel: `@${CUSTOM_EMAIL_DOMAIN}`,
+      };
+      setSelectedOption(customOpt);
+      setCustomStatus({
+        available: true,
+        address: fallbackAddr,
+        message: `${fallbackAddr} ready`,
+      });
+      return customOpt;
+    } finally {
+      setCheckingCustom(false);
+    }
+  };
+
+  // STEP 3: Choose Email Address -> Next (Verifies availability & charges ₦50 from wallet before advancing)
   const handleChooseNext = async () => {
     setError(null);
-    if (!selectedOption) {
-      setError('Please select an email address');
+    let targetOption = selectedOption;
+
+    if (targetOption?.id === 'custom' || (!targetOption && customUsername.trim().length > 0)) {
+      const verifiedCustom = await handleCheckCustomUsername();
+      if (!verifiedCustom) return;
+      targetOption = verifiedCustom;
+    }
+
+    if (!targetOption) {
+      setError(`Please select or enter a @${CUSTOM_EMAIL_DOMAIN} address`);
       return;
+    }
+
+    // Re-check availability on server before charging ₦50
+    try {
+      const availRes = await fetch('/api/email/check-availability', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: targetOption.username }),
+        signal: AbortSignal.timeout(5000),
+      });
+      const availData = await parseJsonResponse<{ available?: boolean; error?: string }>(availRes);
+      if (availRes.ok && availData.available === false) {
+        setError(availData.error || `${targetOption.address} was just claimed. Pick another address.`);
+        return;
+      }
+    } catch {
+      // Non-blocking precheck; create-selected enforces uniqueness as well
     }
 
     if (paidSessionRefCurrent.current) {
@@ -543,7 +671,7 @@ export function CreateEmailTab({
         const serverBal = typeof data.balance === 'number' ? data.balance : effectiveBalance;
         setLiveServerBalance(serverBal);
         onWalletBalanceChange?.(serverBal);
-        const msg = `Insufficient wallet balance (₦${serverBal.toLocaleString()}). You need ₦${CREATE_EMAIL_FEE_NGN} to create a custom email.`;
+        const msg = `Insufficient wallet balance (₦${serverBal.toLocaleString()}). You need ₦${CREATE_EMAIL_FEE_NGN} to create a @${CUSTOM_EMAIL_DOMAIN} email.`;
         setError(msg);
         onShowToast(msg);
         onOpenDeposit?.();
@@ -562,7 +690,7 @@ export function CreateEmailTab({
       onWalletBalanceChange?.(nextBal);
       paidSessionRefCurrent.current = chargeRef;
       setPaidSessionRef(chargeRef);
-      onShowToast(`₦${CREATE_EMAIL_FEE_NGN} deducted for custom email`);
+      onShowToast(`₦${CREATE_EMAIL_FEE_NGN} deducted for @${CUSTOM_EMAIL_DOMAIN} email`);
       navigateBrowserTo('password', 320);
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Unable to verify wallet balance';
@@ -586,7 +714,7 @@ export function CreateEmailTab({
     navigateBrowserTo('terms');
   };
 
-  // STEP 5: Privacy & Terms Scroll -> Allow (Creates Live Account)
+  // STEP 5: Privacy & Terms Scroll -> Allow (Creates Live @veribox.name.ng Account)
   const handleAllowAndFinish = async () => {
     if (!selectedOption) return;
     setError(null);
@@ -595,58 +723,51 @@ export function CreateEmailTab({
     setBrowserProgress(60);
 
     try {
-      let data: (TempEmailAccount & { error?: string }) | null = null;
-      const finalPassword = password.trim() || 'VeriBox#2026';
+      const finalPassword = password.trim();
+      const fullName = [firstName.trim(), lastName.trim()].filter(Boolean).join(' ');
 
-      try {
-        const res = await fetch('/api/email/create-selected', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            provider: selectedOption.provider,
-            username: selectedOption.username,
-            domain: selectedOption.domain,
-            address: selectedOption.address,
-            precreatedToken: selectedOption.precreatedToken,
-            password: finalPassword,
-          }),
-          signal: AbortSignal.timeout(8000),
-        });
+      const res = await fetch('/api/email/create-selected', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider: 'veribox',
+          username: selectedOption.username,
+          domain: CUSTOM_EMAIL_DOMAIN,
+          address: selectedOption.address,
+          password: finalPassword,
+          displayName: fullName || undefined,
+          accountMode,
+          userId: walletUserId,
+        }),
+        signal: AbortSignal.timeout(9000),
+      });
 
-        const parsed = await parseJsonResponse<TempEmailAccount & { error?: string }>(res);
-        if (res.ok && parsed.address) {
-          data = parsed;
-        }
-      } catch {
-        // Fall through to direct browser CORS provider
-      }
-
-      if (!data) {
-        data = await createDirectGuerrillaAccount(selectedOption.username, finalPassword);
+      const parsed = await parseJsonResponse<TempEmailAccount & { error?: string }>(res);
+      if (!res.ok || !parsed.address) {
+        throw new Error(parsed.error || `Could not activate @${CUSTOM_EMAIL_DOMAIN} mailbox.`);
       }
 
       setBrowserProgress(100);
       paidSessionRefCurrent.current = null;
       setPaidSessionRef(null);
 
-      const fullName = [firstName.trim(), lastName.trim()].filter(Boolean).join(' ');
-
       const newAccount: TempEmailAccount = {
-        id: data.id,
-        address: data.address,
-        password: data.password || finalPassword,
-        token: data.token,
-        provider: data.provider || 'guerrilla',
-        createdAt: data.createdAt || new Date().toISOString(),
+        id: parsed.id,
+        address: parsed.address,
+        password: parsed.password || finalPassword,
+        token: parsed.token,
+        provider: 'veribox',
+        domain: parsed.domain || CUSTOM_EMAIL_DOMAIN,
+        createdAt: parsed.createdAt || new Date().toISOString(),
         accountMode,
-        displayName: fullName || usernameInput.trim() || undefined,
+        displayName: parsed.displayName || fullName || undefined,
       };
 
-      onShowToast(`Email live: ${newAccount.address}`);
+      onShowToast(`Mailbox active: ${newAccount.address}`);
       onComplete(newAccount);
     } catch (err) {
       await refundHeldCreateFee('Activation failed · ₦50 refunded to your wallet');
-      setError(err instanceof Error ? err.message : 'Could not finalize email account');
+      setError(err instanceof Error ? err.message : `Could not finalize @${CUSTOM_EMAIL_DOMAIN} account`);
       setCreatingFinal(false);
       setIsBrowserLoading(false);
     }
@@ -657,20 +778,20 @@ export function CreateEmailTab({
   // Browser Address Bar Label based on current screen
   const browserUrl =
     screen === 'signin'
-      ? 'https://accounts.veribox.net/v3/signin/identifier'
+      ? `https://mail.${CUSTOM_EMAIL_DOMAIN}/v3/signin/identifier`
       : screen === 'signin-password'
-        ? 'https://accounts.veribox.net/v3/signin/challenge/pwd'
+        ? `https://mail.${CUSTOM_EMAIL_DOMAIN}/v3/signin/challenge/pwd`
         : screen === 'name'
-          ? 'https://accounts.veribox.net/v3/signup/name'
+          ? `https://mail.${CUSTOM_EMAIL_DOMAIN}/v3/signup/name`
           : screen === 'birthdate'
-            ? 'https://accounts.veribox.net/v3/signup/basicinfo'
+            ? `https://mail.${CUSTOM_EMAIL_DOMAIN}/v3/signup/basicinfo`
             : screen === 'choose'
-              ? 'https://accounts.veribox.net/v3/signup/webaddress'
+              ? `https://mail.${CUSTOM_EMAIL_DOMAIN}/v3/signup/webaddress`
               : screen === 'password'
-                ? 'https://accounts.veribox.net/v3/signup/passwd'
-                : 'https://accounts.veribox.net/v3/signup/privacyterms';
+                ? `https://mail.${CUSTOM_EMAIL_DOMAIN}/v3/signup/passwd`
+                : `https://mail.${CUSTOM_EMAIL_DOMAIN}/v3/signup/privacyterms`;
 
-  // 1. INITIAL GOOGLE-STYLE SSO TRIGGER CARD
+  // 1. INITIAL TRIGGER CARD
   if (!inBrowser) {
     return (
       <div className="mx-auto flex w-full max-w-md flex-col justify-center py-4 sm:py-8">
@@ -690,7 +811,7 @@ export function CreateEmailTab({
                   VeriBox Mail
                 </h1>
                 <p className="text-xs text-[#6E6552] dark:text-[#A89F8C]">
-                  High-speed private disposable email
+                  Custom @{CUSTOM_EMAIL_DOMAIN} Email Hosting
                 </p>
               </div>
             </div>
@@ -706,14 +827,14 @@ export function CreateEmailTab({
 
           <div className="mt-6 text-center">
             <h2 className="font-display text-xl sm:text-2xl font-black tracking-tight text-[#1A160D] dark:text-[#FAF6EC]">
-              Create or Recover Email
+              Create or Recover @{CUSTOM_EMAIL_DOMAIN}
             </h2>
             <p className="mt-1.5 text-xs sm:text-sm text-[#6E6552] dark:text-[#A89F8C]">
-              Create a new password-protected mailbox or sign back into a previously created one
+              Claim a custom @{CUSTOM_EMAIL_DOMAIN} address with password protection or sign back into a saved mailbox
             </p>
           </div>
 
-          {/* Long curved Google-style button with our app logo */}
+          {/* Long curved button with our app logo */}
           <div className="mt-6 space-y-3">
             <button
               type="button"
@@ -730,10 +851,10 @@ export function CreateEmailTab({
                 </div>
                 <div className="text-left min-w-0">
                   <p className="font-display text-sm sm:text-base font-extrabold tracking-tight text-[#1A160D] truncate dark:text-[#FAF6EC]">
-                    Continue with VeriBox Mail
+                    Continue to @{CUSTOM_EMAIL_DOMAIN}
                   </p>
                   <p className="text-[11px] text-[#8A7F6A] truncate dark:text-[#A89F8C]">
-                    Sign in, recover, or create account
+                    Sign in, recover, or claim new mailbox
                   </p>
                 </div>
               </div>
@@ -749,7 +870,7 @@ export function CreateEmailTab({
               </div>
               <div className="flex items-center gap-2">
                 <Wallet className="h-3.5 w-3.5 text-[#D4AF37]" />
-                <span>₦{CREATE_EMAIL_FEE_NGN} / New Custom Email</span>
+                <span>₦{CREATE_EMAIL_FEE_NGN} / Custom Mailbox</span>
               </div>
             </div>
           </div>
@@ -831,7 +952,7 @@ export function CreateEmailTab({
                     VeriBox Mail
                   </p>
                   <p className="text-[10px] text-[#8A7F6A] dark:text-[#A89F8C]">
-                    accounts.veribox.net
+                    mail.{CUSTOM_EMAIL_DOMAIN}
                   </p>
                 </div>
               </div>
@@ -868,7 +989,7 @@ export function CreateEmailTab({
                     Sign in
                   </h2>
                   <p className="mt-0.5 text-xs text-[#6E6552] dark:text-[#A89F8C]">
-                    to continue to VeriBox Mail
+                    to continue to VeriBox Mail (@{CUSTOM_EMAIL_DOMAIN})
                   </p>
                 </div>
 
@@ -880,11 +1001,11 @@ export function CreateEmailTab({
                       setUsernameInput(e.target.value);
                       if (error) setError(null);
                     }}
-                    placeholder="Enter existing email to sign in"
+                    placeholder={`Enter username or name@${CUSTOM_EMAIL_DOMAIN}`}
                     className="h-12 w-full rounded-xl border border-[#D4AF37]/35 bg-[#FAF7F0] px-4 font-mono text-sm font-semibold text-[#1A160D] placeholder:text-[#8A7F6A] focus:border-[#D4AF37] focus:outline-none dark:bg-[#0A0906] dark:text-[#FAF6EC]"
                   />
                   <p className="px-1 text-[11px] text-[#8A7F6A] dark:text-[#A89F8C]">
-                    Already created or deleted an email? Enter it above and tap Next to sign in with your password.
+                    Already created or deleted an @{CUSTOM_EMAIL_DOMAIN} email? Enter it above and tap Next to sign in with your password.
                   </p>
                 </div>
 
@@ -1227,15 +1348,15 @@ export function CreateEmailTab({
               </form>
             )}
 
-            {/* SCREEN 3: CHOOSE EMAIL ADDRESS (₦50 fee on Next) */}
+            {/* SCREEN 3: CHOOSE OR CREATE CUSTOM @veribox.name.ng ADDRESS (₦50 fee on Next) */}
             {!loadingMessage && screen === 'choose' && (
               <div className="mt-6 space-y-4">
                 <div>
                   <h2 className="font-display text-2xl font-black tracking-tight text-[#1A160D] dark:text-[#FAF6EC]">
-                    Choose your email address
+                    Choose your @{CUSTOM_EMAIL_DOMAIN} address
                   </h2>
                   <p className="mt-0.5 text-xs text-[#6E6552] dark:text-[#A89F8C]">
-                    Select an address for your {accountMode} mailbox (₦{CREATE_EMAIL_FEE_NGN} creation fee)
+                    Pick a suggested address or type your own custom username (₦{CREATE_EMAIL_FEE_NGN} fee)
                   </p>
                 </div>
 
@@ -1283,7 +1404,10 @@ export function CreateEmailTab({
                       <button
                         key={opt.id}
                         type="button"
-                        onClick={() => setSelectedOption(opt)}
+                        onClick={() => {
+                          setSelectedOption(opt);
+                          setError(null);
+                        }}
                         className={`flex min-h-[50px] w-full items-center justify-between gap-3 px-3.5 py-2.5 text-left transition-colors cursor-pointer ${
                           isSelected ? 'bg-[#D4AF37]/15' : 'hover:bg-[#D4AF37]/10'
                         }`}
@@ -1308,6 +1432,62 @@ export function CreateEmailTab({
                       </button>
                     );
                   })}
+                </div>
+
+                {/* Custom Username Picker */}
+                <div className="rounded-2xl border border-[#D4AF37]/30 bg-[#FAF7F0]/70 p-3.5 space-y-2.5 dark:bg-[#0A0906]">
+                  <p className="text-xs font-bold text-[#1A160D] dark:text-[#FAF6EC]">
+                    Or create your own custom username
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <div className="flex flex-1 min-w-0 items-center rounded-xl border border-[#D4AF37]/35 bg-white px-3 dark:bg-[#14120D]">
+                      <input
+                        type="text"
+                        value={customUsername}
+                        onChange={(e) => {
+                          const raw = e.target.value;
+                          setCustomUsername(raw);
+                          setCustomStatus(null);
+                          setError(null);
+                          const norm = normalizeCustomUsername(raw);
+                          if (norm.length >= 3) {
+                            setSelectedOption({
+                              id: 'custom',
+                              address: `${norm}@${CUSTOM_EMAIL_DOMAIN}`,
+                              username: norm,
+                              domain: CUSTOM_EMAIL_DOMAIN,
+                              provider: 'veribox',
+                              providerLabel: `@${CUSTOM_EMAIL_DOMAIN}`,
+                            });
+                          }
+                        }}
+                        placeholder="yourname"
+                        className="h-10 min-w-0 flex-1 bg-transparent font-mono text-xs font-bold text-[#1A160D] placeholder:text-[#8A7F6A] focus:outline-none dark:text-[#FAF6EC]"
+                      />
+                      <span className="shrink-0 font-mono text-[11px] font-bold text-[#8A6208] dark:text-[#D4AF37]">
+                        @{CUSTOM_EMAIL_DOMAIN}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void handleCheckCustomUsername()}
+                      disabled={checkingCustom || customUsername.trim().length < 3}
+                      className="inline-flex h-10 shrink-0 items-center justify-center rounded-xl border border-[#D4AF37]/50 bg-[#D4AF37]/15 px-3 text-xs font-bold text-[#8A6208] hover:bg-[#D4AF37]/25 disabled:opacity-50 cursor-pointer dark:text-[#F5D77A]"
+                    >
+                      {checkingCustom ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : 'Check'}
+                    </button>
+                  </div>
+                  {customStatus && (
+                    <p
+                      className={`text-[11px] font-semibold ${
+                        customStatus.available
+                          ? 'text-emerald-700 dark:text-emerald-300'
+                          : 'text-rose-600 dark:text-rose-300'
+                      }`}
+                    >
+                      {customStatus.message}
+                    </p>
+                  )}
                 </div>
 
                 <div className="flex items-center justify-between pt-6">
@@ -1431,11 +1611,11 @@ export function CreateEmailTab({
                 {/* Scrollable Terms & Options Box */}
                 <div className="max-h-48 overflow-y-auto space-y-2 rounded-2xl border border-[#D4AF37]/25 bg-[#FAF7F0]/60 p-3.5 text-xs text-[#3E3522] dark:bg-[#0A0906]/80 dark:text-[#D5CCB8]">
                   <p className="font-bold text-[#1A160D] dark:text-[#FAF6EC]">
-                    Terms of VeriBox Ephemeral Mail:
+                    Terms of VeriBox Custom Domain Mail (@{CUSTOM_EMAIL_DOMAIN}):
                   </p>
                   <p className="leading-relaxed">
-                    By tapping Confirm, you agree to the VeriBox disposable mailbox protocols. Your
-                    inbox will receive incoming emails, verification codes, and signups in real time.
+                    By tapping Allow &amp; Confirm, you activate your dedicated @{CUSTOM_EMAIL_DOMAIN} mailbox. Your
+                    inbox receives incoming verification codes and emails routed to {CUSTOM_EMAIL_DOMAIN} in real time.
                   </p>
 
                   <div className="pt-2 space-y-2">

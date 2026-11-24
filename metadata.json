@@ -1,6 +1,6 @@
 {
   "name": "veri-box",
-  "description": "Access free SMS, temporary phone numbers, and disposable email services for secure account verification in one streamlined app.",
+  "description": "Create and manage custom @veribox.name.ng email addresses and access dedicated SMS phone numbers for secure account verification in one streamlined app.",
   "requestFramePermissions": [],
   "majorCapabilities": [
     "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"

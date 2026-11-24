@@ -77,7 +77,7 @@ export function CornerDrawer({
                 VeriBox
               </p>
               <p className="text-xs font-semibold text-[#8A6208] truncate dark:text-[#D5CCB8]">
-                Private SMS &amp; Disposable Email
+                Custom Mail &amp; Private SMS
               </p>
             </div>
           </div>
@@ -134,7 +134,7 @@ export function CornerDrawer({
                 Sign in to unlock all features
               </p>
               <p className="mt-0.5 text-[11px] text-[#6E6552] dark:text-[#A89F8C]">
-                Create temp emails, get private OTP numbers, and manage your wallet.
+                Create custom @veribox.name.ng emails, get private OTP numbers, and manage your wallet.
               </p>
               <button
                 type="button"
@@ -214,7 +214,7 @@ export function CornerDrawer({
                 }`}
               >
                 <Sparkles className="h-4 w-4 shrink-0" />
-                <span>Free Image Generator</span>
+                <span>VeriBox AI &amp; Images</span>
               </button>
 
               <button

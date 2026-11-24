@@ -72,8 +72,8 @@ const STARTER_CHIPS: Array<{ label: string; text: string; mode?: ChatMode }> = [
     mode: 'image',
   },
   {
-    label: 'How do free daily emails work?',
-    text: 'How do the 5 free daily emails and ₦50 custom emails work?',
+    label: 'How do @veribox.name.ng emails work?',
+    text: 'How do @veribox.name.ng custom emails work and how do I create or recover one?',
     mode: 'chat',
   },
   {

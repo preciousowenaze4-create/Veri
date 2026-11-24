@@ -296,7 +296,7 @@ export function DepositModal({
                 setEmailTouched(true);
                 setEmail(e.target.value);
               }}
-              placeholder="yourname@gmail.com"
+              placeholder="you@veribox.name.ng"
               className="h-11 w-full rounded-xl border border-[#D4AF37]/35 bg-[#FAF7F0] px-3.5 text-xs text-[#1A160D] focus:border-[#D4AF37] focus:outline-none dark:bg-[#0B0A07] dark:text-[#FAF6EC]"
             />
           </div>

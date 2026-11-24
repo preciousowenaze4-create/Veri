@@ -29,12 +29,7 @@ import type {
 } from './types';
 import { parseJsonResponse } from './utils/apiFetch';
 import { copyToClipboard } from './utils/clipboard';
-import {
-  createDirectGuerrillaAccount,
-  deleteDirectGuerrillaMessage,
-  fetchDirectGuerrillaMessageDetail,
-  fetchDirectGuerrillaMessages,
-} from './utils/directEmailFallback';
+import { CUSTOM_EMAIL_DOMAIN } from './utils/directEmailFallback';
 import { ensureSupabaseClient, getActiveSupabaseClient } from './utils/supabase';
 
 const STORAGE_KEYS = {
@@ -51,10 +46,7 @@ const STORAGE_KEYS = {
   walletUserId: 'veribox_wallet_user_id_v2',
   creditedRefs: 'veribox_credited_refs_v2',
   pendingRef: 'veribox_pending_paystack_ref',
-  dailyEmailQuota: 'veribox_daily_email_quota_v1',
 };
-
-const DAILY_FREE_EMAIL_LIMIT = 5;
 
 const DEFAULT_SERVICES: NumberServiceOption[] = [
   { id: 'whatsapp', name: 'WhatsApp', popular: true },
@@ -99,41 +91,12 @@ function markReferenceCredited(reference: string): boolean {
   }
 }
 
-function getLocalTodayKey(): string {
-  const now = new Date();
-  const y = now.getFullYear();
-  const m = String(now.getMonth() + 1).padStart(2, '0');
-  const d = String(now.getDate()).padStart(2, '0');
-  return `${y}-${m}-${d}`;
-}
-
-function readLocalDailyQuotaCount(userId: string, dateKey: string): number {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEYS.dailyEmailQuota);
-    if (!raw) return 0;
-    const map = JSON.parse(raw) as Record<string, number>;
-    const val = map[`${userId}:${dateKey}`];
-    return typeof val === 'number' && val > 0 ? Math.min(DAILY_FREE_EMAIL_LIMIT, val) : 0;
-  } catch {
-    return 0;
-  }
-}
-
-function writeLocalDailyQuotaCount(userId: string, dateKey: string, count: number): void {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEYS.dailyEmailQuota);
-    const map: Record<string, number> = raw ? (JSON.parse(raw) as Record<string, number>) : {};
-    const nextMap: Record<string, number> = {};
-    for (const [k, v] of Object.entries(map)) {
-      if (k.endsWith(`:${dateKey}`)) {
-        nextMap[k] = v;
-      }
-    }
-    nextMap[`${userId}:${dateKey}`] = Math.max(0, Math.min(DAILY_FREE_EMAIL_LIMIT, count));
-    localStorage.setItem(STORAGE_KEYS.dailyEmailQuota, JSON.stringify(nextMap));
-  } catch {
-    // Non-blocking
-  }
+function isCustomDomainMailbox(account: TempEmailAccount | null | undefined): account is TempEmailAccount {
+  return Boolean(
+    account &&
+      typeof account.address === 'string' &&
+      account.address.toLowerCase().endsWith(`@${CUSTOM_EMAIL_DOMAIN}`)
+  );
 }
 
 export default function App() {
@@ -198,26 +161,22 @@ export default function App() {
   const [acquireError, setAcquireError] = useState<string | null>(null);
   const [streamConnected, setStreamConnected] = useState<boolean>(false);
 
-  // Email state
+  // Email state (custom @veribox.name.ng mailboxes only)
   const [savedEmails, setSavedEmails] = useState<TempEmailAccount[]>(() =>
-    readStorage<TempEmailAccount[]>(STORAGE_KEYS.emails, [])
+    readStorage<TempEmailAccount[]>(STORAGE_KEYS.emails, []).filter(isCustomDomainMailbox)
   );
   const [deletedEmails, setDeletedEmails] = useState<TempEmailAccount[]>(() =>
-    readStorage<TempEmailAccount[]>(STORAGE_KEYS.deletedEmails, [])
+    readStorage<TempEmailAccount[]>(STORAGE_KEYS.deletedEmails, []).filter(isCustomDomainMailbox)
   );
-  const [activeEmail, setActiveEmail] = useState<TempEmailAccount | null>(() =>
-    readStorage<TempEmailAccount | null>(STORAGE_KEYS.activeEmail, null)
-  );
+  const [activeEmail, setActiveEmail] = useState<TempEmailAccount | null>(() => {
+    const stored = readStorage<TempEmailAccount | null>(STORAGE_KEYS.activeEmail, null);
+    return isCustomDomainMailbox(stored) ? stored : null;
+  });
   const [emailMessages, setEmailMessages] = useState<EmailMessageSummary[]>([]);
   const [selectedEmailDetail, setSelectedEmailDetail] = useState<EmailMessageDetail | null>(null);
   const [loadingEmailMessages, setLoadingEmailMessages] = useState<boolean>(false);
   const [loadingEmailDetail, setLoadingEmailDetail] = useState<boolean>(false);
   const [emailError, setEmailError] = useState<string | null>(null);
-  const [generatingEmail, setGeneratingEmail] = useState<boolean>(false);
-  const [dailyQuotaDate, setDailyQuotaDate] = useState<string>(() => getLocalTodayKey());
-  const [freeUsedToday, setFreeUsedToday] = useState<number>(() =>
-    readLocalDailyQuotaCount(walletUserId, getLocalTodayKey())
-  );
 
   // Profile / Vault state
   const [savedNumbers, setSavedNumbers] = useState<PhoneNumberEntry[]>(() =>
@@ -228,7 +187,6 @@ export default function App() {
   );
 
   const lastFetchedAddressRef = useRef<string | null>(null);
-  const hasAutoCreatedInitialEmailRef = useRef<boolean>(false);
   const notifiedSmsOrderIdsRef = useRef<Set<number>>(new Set());
   const autoRefundedOrderIdsRef = useRef<Set<number>>(new Set());
 
@@ -282,46 +240,7 @@ export default function App() {
     }, 2400);
   }, []);
 
-  // Automatically roll over daily 5-email quota at local midnight & sync with server
-  useEffect(() => {
-    const checkDate = () => {
-      const today = getLocalTodayKey();
-      setDailyQuotaDate((prev) => (prev === today ? prev : today));
-    };
-    const timer = window.setInterval(checkDate, 30000);
-    window.addEventListener('focus', checkDate);
-    return () => {
-      window.clearInterval(timer);
-      window.removeEventListener('focus', checkDate);
-    };
-  }, []);
 
-  useEffect(() => {
-    const localUsed = readLocalDailyQuotaCount(walletUserId, dailyQuotaDate);
-    setFreeUsedToday(localUsed);
-    let active = true;
-    void (async () => {
-      try {
-        const res = await fetch(
-          `/api/email/quota?userId=${encodeURIComponent(walletUserId)}&dateKey=${encodeURIComponent(
-            dailyQuotaDate
-          )}`
-        );
-        if (!res.ok || !active) return;
-        const data = await parseJsonResponse<{ usedToday?: number }>(res);
-        if (active && typeof data.usedToday === 'number') {
-          const merged = Math.min(DAILY_FREE_EMAIL_LIMIT, Math.max(localUsed, data.usedToday));
-          setFreeUsedToday(merged);
-          writeLocalDailyQuotaCount(walletUserId, dailyQuotaDate, merged);
-        }
-      } catch {
-        // Keep local daily count offline
-      }
-    })();
-    return () => {
-      active = false;
-    };
-  }, [walletUserId, dailyQuotaDate]);
 
   const openAuthModal = useCallback((reason?: string, pendingAction?: () => void) => {
     pendingAuthActionRef.current = pendingAction || null;
@@ -1164,43 +1083,14 @@ export default function App() {
       setLoadingEmailMessages(true);
       setEmailError(null);
       try {
-        let token = target.token;
-        const provider = target.provider || 'mailtm';
-        let res = await fetch('/api/email/messages', {
+        const res = await fetch('/api/email/messages', {
           headers: {
-            Authorization: `Bearer ${token}`,
-            'x-email-provider': provider,
+            Authorization: `Bearer ${target.token}`,
+            'x-email-provider': 'veribox',
             'x-email-address': target.address,
           },
           signal: AbortSignal.timeout(8000),
         });
-
-        if (res.status === 401 && provider === 'mailtm' && target.password) {
-          const loginRes = await fetch('/api/email/login', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ address: target.address, password: target.password }),
-            signal: AbortSignal.timeout(7000),
-          });
-          if (loginRes.ok) {
-            const loginJson = await parseJsonResponse<{ token: string }>(loginRes);
-            token = loginJson.token;
-            const refreshedAccount = { ...target, token };
-            lastFetchedAddressRef.current = refreshedAccount.address;
-            setActiveEmail(refreshedAccount);
-            setSavedEmails((prev) =>
-              prev.map((a) => (a.address === target.address ? refreshedAccount : a))
-            );
-            res = await fetch('/api/email/messages', {
-              headers: {
-                Authorization: `Bearer ${token}`,
-                'x-email-provider': provider,
-                'x-email-address': target.address,
-              },
-              signal: AbortSignal.timeout(8000),
-            });
-          }
-        }
 
         const data = await parseJsonResponse<{ messages?: EmailMessageSummary[]; error?: string }>(res);
         if (!res.ok) {
@@ -1208,15 +1098,6 @@ export default function App() {
         }
         setEmailMessages(data.messages || []);
       } catch (err) {
-        if ((target.provider || '').toLowerCase() === 'guerrilla' && target.token) {
-          try {
-            const directMsgs = await fetchDirectGuerrillaMessages(target.token);
-            setEmailMessages(directMsgs);
-            return;
-          } catch {
-            // Fall through to error message
-          }
-        }
         setEmailError(err instanceof Error ? err.message : 'Failed to load emails');
       } finally {
         setLoadingEmailMessages(false);
@@ -1225,123 +1106,25 @@ export default function App() {
     [activeEmail]
   );
 
-  const handleGenerateInstantEmail = useCallback(async () => {
-    const todayKey = getLocalTodayKey();
-    if (todayKey !== dailyQuotaDate) {
-      setDailyQuotaDate(todayKey);
-    }
-    const currentUsed = readLocalDailyQuotaCount(walletUserId, todayKey);
-    if (currentUsed >= DAILY_FREE_EMAIL_LIMIT || freeUsedToday >= DAILY_FREE_EMAIL_LIMIT) {
-      const limitMsg =
-        'Daily free limit reached (5/5 free emails generated today). Your 5 free emails reset tomorrow — or tap Create (₦50).';
-      setEmailError(limitMsg);
-      showToast(limitMsg);
-      return;
-    }
-
-    setGeneratingEmail(true);
-    setEmailError(null);
-    try {
-      let created: (TempEmailAccount & { quota?: { usedToday?: number } }) | null = null;
-      let hitLimit = false;
-      let limitError = '';
-
-      try {
-        const res = await fetch('/api/email/create', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            provider: 'auto',
-            consumeFreeQuota: true,
-            userId: walletUserId,
-            dateKey: todayKey,
-          }),
-          signal: AbortSignal.timeout(8000),
-        });
-        const data = await parseJsonResponse<
-          TempEmailAccount & { error?: string; quota?: { usedToday?: number } }
-        >(res);
-
-        if (res.status === 429) {
-          hitLimit = true;
-          limitError =
-            data.error ||
-            'Daily free limit reached (5/5 free emails generated today). Your 5 free emails reset tomorrow.';
-          setFreeUsedToday(DAILY_FREE_EMAIL_LIMIT);
-          writeLocalDailyQuotaCount(walletUserId, todayKey, DAILY_FREE_EMAIL_LIMIT);
-        } else if (res.ok && data.address) {
-          created = data;
-        }
-      } catch {
-        // Fall through to direct browser CORS provider
-      }
-
-      if (hitLimit) {
-        setEmailError(limitError);
-        showToast(limitError);
-        return;
-      }
-
-      if (!created) {
-        created = await createDirectGuerrillaAccount();
-      }
-
-      const nextUsed =
-        typeof created.quota?.usedToday === 'number'
-          ? Math.min(DAILY_FREE_EMAIL_LIMIT, created.quota.usedToday)
-          : Math.min(DAILY_FREE_EMAIL_LIMIT, currentUsed + 1);
-      setFreeUsedToday(nextUsed);
-      writeLocalDailyQuotaCount(walletUserId, todayKey, nextUsed);
-
-      setActiveEmail(created);
-      setSavedEmails((prev) =>
-        [created!, ...prev.filter((a) => a.address !== created!.address)].slice(0, 15)
-      );
-      setSelectedEmailDetail(null);
-      setEmailMessages([]);
-      const remainingAfter = Math.max(0, DAILY_FREE_EMAIL_LIMIT - nextUsed);
-      showToast(`Generated: ${created.address} (${remainingAfter}/5 free left today)`);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Could not generate email';
-      setEmailError(msg);
-      showToast(msg);
-    } finally {
-      setGeneratingEmail(false);
-    }
-  }, [dailyQuotaDate, freeUsedToday, walletUserId, showToast]);
-
   const handleOpenEmailDetail = useCallback(
     async (id: string) => {
       if (!activeEmail) return;
       setLoadingEmailDetail(true);
       try {
-        let detail: EmailMessageDetail | null = null;
-        try {
-          const res = await fetch(`/api/email/messages/${encodeURIComponent(id)}`, {
-            headers: {
-              Authorization: `Bearer ${activeEmail.token}`,
-              'x-email-provider': activeEmail.provider || 'mailtm',
-              'x-email-address': activeEmail.address,
-            },
-            signal: AbortSignal.timeout(8000),
-          });
-          const data = await parseJsonResponse<EmailMessageDetail & { error?: string }>(res);
-          if (res.ok && data.id) {
-            detail = data;
-          }
-        } catch {
-          // Try direct CORS fallback for GuerrillaMail below
+        const res = await fetch(`/api/email/messages/${encodeURIComponent(id)}`, {
+          headers: {
+            Authorization: `Bearer ${activeEmail.token}`,
+            'x-email-provider': 'veribox',
+            'x-email-address': activeEmail.address,
+          },
+          signal: AbortSignal.timeout(8000),
+        });
+        const data = await parseJsonResponse<EmailMessageDetail & { error?: string }>(res);
+        if (!res.ok || !data.id) {
+          throw new Error(data.error || 'Could not load email');
         }
 
-        if (!detail && (activeEmail.provider || '').toLowerCase() === 'guerrilla' && activeEmail.token) {
-          detail = await fetchDirectGuerrillaMessageDetail(activeEmail.token, id);
-        }
-
-        if (!detail) {
-          throw new Error('Could not load email');
-        }
-
-        setSelectedEmailDetail(detail);
+        setSelectedEmailDetail(data);
         setEmailMessages((prev) => prev.map((m) => (m.id === id ? { ...m, seen: true } : m)));
       } catch (err) {
         showToast(err instanceof Error ? err.message : 'Failed to open email');
@@ -1356,21 +1139,15 @@ export default function App() {
     async (id: string) => {
       if (!activeEmail) return;
       try {
-        try {
-          await fetch(`/api/email/messages/${encodeURIComponent(id)}`, {
-            method: 'DELETE',
-            headers: {
-              Authorization: `Bearer ${activeEmail.token}`,
-              'x-email-provider': activeEmail.provider || 'mailtm',
-              'x-email-address': activeEmail.address,
-            },
-            signal: AbortSignal.timeout(6000),
-          });
-        } catch {
-          if ((activeEmail.provider || '').toLowerCase() === 'guerrilla' && activeEmail.token) {
-            await deleteDirectGuerrillaMessage(activeEmail.token, id);
-          }
-        }
+        await fetch(`/api/email/messages/${encodeURIComponent(id)}`, {
+          method: 'DELETE',
+          headers: {
+            Authorization: `Bearer ${activeEmail.token}`,
+            'x-email-provider': 'veribox',
+            'x-email-address': activeEmail.address,
+          },
+          signal: AbortSignal.timeout(6000),
+        });
         setEmailMessages((prev) => prev.filter((m) => m.id !== id));
         setSelectedEmailDetail(null);
         showToast('Email deleted');
@@ -1398,6 +1175,11 @@ export default function App() {
         setDeletedEmails((prev) =>
           [target, ...prev.filter((d) => d.address.toLowerCase() !== lower)].slice(0, 25)
         );
+        void fetch('/api/email/manage/delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ address: target.address, token: target.token }),
+        }).catch(() => undefined);
       }
 
       const remaining = savedEmails.filter((e) => e.address.toLowerCase() !== lower);
@@ -1417,40 +1199,41 @@ export default function App() {
     [savedEmails, activeEmail, showToast]
   );
 
+  // Sync user's saved @veribox.name.ng mailboxes when signed in
   useEffect(() => {
     if (!authUser) return;
-    if (hasAutoCreatedInitialEmailRef.current) return;
-    if (!activeEmail && savedEmails.length === 0 && !pendingAuthActionRef.current) {
-      hasAutoCreatedInitialEmailRef.current = true;
-      void (async () => {
-        try {
-          const res = await fetch('/api/email/create', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ provider: 'auto' }),
-            signal: AbortSignal.timeout(7000),
-          });
-          if (res.ok) {
-            const data = await parseJsonResponse<TempEmailAccount>(res);
-            if (data.address) {
-              setActiveEmail(data);
-              setSavedEmails([data]);
-              return;
-            }
+    let active = true;
+    void (async () => {
+      try {
+        const res = await fetch(`/api/email/list?userId=${encodeURIComponent(authUser.id)}`, {
+          signal: AbortSignal.timeout(7000),
+        });
+        if (!res.ok || !active) return;
+        const data = await parseJsonResponse<{ accounts?: TempEmailAccount[] }>(res);
+        if (!active || !Array.isArray(data.accounts) || data.accounts.length === 0) return;
+        const serverList = data.accounts.filter(isCustomDomainMailbox);
+        if (serverList.length === 0) return;
+        setSavedEmails((prev) => {
+          const map = new Map<string, TempEmailAccount>();
+          for (const item of prev) map.set(item.address.toLowerCase(), item);
+          for (const srv of serverList) {
+            const existing = map.get(srv.address.toLowerCase());
+            map.set(srv.address.toLowerCase(), {
+              ...srv,
+              password: existing?.password || srv.password || '',
+            });
           }
-        } catch {
-          // Fall back cleanly to browser direct provider
-        }
-        try {
-          const directAcct = await createDirectGuerrillaAccount();
-          setActiveEmail(directAcct);
-          setSavedEmails([directAcct]);
-        } catch {
-          // User can tap Create or Generate manually
-        }
-      })();
-    }
-  }, [authUser, activeEmail, savedEmails.length]);
+          return Array.from(map.values()).slice(0, 20);
+        });
+        setActiveEmail((prev) => prev || serverList[0]);
+      } catch {
+        // Non-blocking
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [authUser]);
 
   // Only auto-fetch inbox when the active email address changes (prevents duplicate fetches)
   useEffect(() => {
@@ -1594,17 +1377,11 @@ export default function App() {
             countdown={countdown}
             autoRefresh={autoRefresh}
             onGoToCreate={() =>
-              requireAuth('Sign in to create a custom email address', () => setActiveTab('create'))
+              requireAuth(`Sign in to create an @${CUSTOM_EMAIL_DOMAIN} email`, () =>
+                setActiveTab('create')
+              )
             }
             onGoToNumbers={() => setActiveTab('numbers')}
-            onGenerateEmail={() =>
-              requireAuth('Sign in to generate a live temporary email', () => {
-                void handleGenerateInstantEmail();
-              })
-            }
-            generatingEmail={generatingEmail}
-            freeRemainingToday={Math.max(0, DAILY_FREE_EMAIL_LIMIT - freeUsedToday)}
-            freeDailyLimit={DAILY_FREE_EMAIL_LIMIT}
             onSelectAccount={(acct) =>
               requireAuth('Sign in to switch email accounts', () => {
                 setActiveEmail(acct);

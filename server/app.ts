@@ -588,213 +588,73 @@ async function fetchSmsMessagesForEntry(
 }
 
 // ==========================================
-// Multi-Provider Disposable Email Helpers
+// Custom Domain Email Configuration (veribox.name.ng)
 // ==========================================
-const mailTmDomainsCache: { data: string[]; expiresAt: number } = { data: [], expiresAt: 0 };
-const tempMailIoDomainsCache: { data: string[]; expiresAt: number } = { data: [], expiresAt: 0 };
-
-async function getMailTmDomains(): Promise<string[]> {
-  if (mailTmDomainsCache.data.length > 0 && Date.now() < mailTmDomainsCache.expiresAt) {
-    return mailTmDomainsCache.data;
-  }
-  const response = await fetch('https://api.mail.tm/domains?page=1', {
-    headers: { Accept: 'application/json', 'User-Agent': USER_AGENT },
-    signal: AbortSignal.timeout(4000),
-  });
-  if (!response.ok) {
-    return mailTmDomainsCache.data;
-  }
-  const json = (await response.json()) as
-    | { 'hydra:member'?: Array<{ domain: string; isActive: boolean }> }
-    | Array<{ domain: string; isActive: boolean }>;
-  const list = Array.isArray(json) ? json : json['hydra:member'] || [];
-  const domains = list.filter((d) => d.isActive !== false && d.domain).map((d) => d.domain);
-  if (domains.length > 0) {
-    mailTmDomainsCache.data = domains;
-    mailTmDomainsCache.expiresAt = Date.now() + 5 * 60 * 1000;
-  }
-  return domains;
-}
-
-function randomTokenString(len: number): string {
-  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
-  let out = '';
-  for (let i = 0; i < len; i++) {
-    out += chars[Math.floor(Math.random() * chars.length)];
-  }
-  return out;
-}
-
-async function createMailTmAccount(username?: string, requestedDomain?: string, customPassword?: string) {
-  const domains = await getMailTmDomains();
-  if (domains.length === 0) throw new Error('Mail.tm domains unavailable');
-
-  const domain = requestedDomain && domains.includes(requestedDomain) ? requestedDomain : domains[0];
-  const cleanPrefix = (username || '')
+const CUSTOM_EMAIL_DOMAIN =
+  (process.env.EMAIL_DOMAIN || 'veribox.name.ng')
+    .trim()
     .toLowerCase()
+    .replace(/^@+/, '') || 'veribox.name.ng';
+
+const RESERVED_EMAIL_USERNAMES = new Set(['postmaster', 'abuse', 'hostmaster', 'mailer-daemon']);
+
+function normalizeCustomEmailUsername(raw: string): string {
+  return raw
+    .trim()
+    .toLowerCase()
+    .split('@')[0]
     .replace(/[^a-z0-9._-]/g, '')
-    .slice(0, 24);
-  const prefix = cleanPrefix.length >= 3 ? cleanPrefix : `vbox.${randomTokenString(6)}`;
-  const password =
-    customPassword && customPassword.trim().length >= 6
-      ? customPassword.trim()
-      : `Vb!${randomTokenString(12)}9`;
-
-  let address = `${prefix}@${domain}`;
-  let createRes = await fetch('https://api.mail.tm/accounts', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': USER_AGENT },
-    body: JSON.stringify({ address, password }),
-    signal: AbortSignal.timeout(4000),
-  });
-
-  if (createRes.status === 422) {
-    address = `${prefix}.${randomTokenString(4)}@${domain}`;
-    createRes = await fetch('https://api.mail.tm/accounts', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': USER_AGENT },
-      body: JSON.stringify({ address, password }),
-      signal: AbortSignal.timeout(4000),
-    });
-  }
-
-  if (!createRes.ok) {
-    throw new Error(`Mail.tm error ${createRes.status}`);
-  }
-
-  const account = (await createRes.json()) as { id: string; address: string; createdAt?: string };
-  const tokenRes = await fetch('https://api.mail.tm/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': USER_AGENT },
-    body: JSON.stringify({ address: account.address, password }),
-    signal: AbortSignal.timeout(4000),
-  });
-  if (!tokenRes.ok) throw new Error('Mail.tm login failed');
-  const tokenJson = (await tokenRes.json()) as { token: string };
-
-  return {
-    id: account.id,
-    address: account.address,
-    password,
-    token: tokenJson.token,
-    provider: 'mailtm' as const,
-    createdAt: account.createdAt || new Date().toISOString(),
-  };
+    .replace(/\.{2,}/g, '.')
+    .replace(/^[._-]+|[._-]+$/g, '')
+    .slice(0, 30);
 }
 
-async function createTempMailLolAccount() {
-  const res = await fetch('https://api.tempmail.lol/v2/inbox/create', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': USER_AGENT },
-    body: JSON.stringify({}),
-    signal: AbortSignal.timeout(4000),
-  });
-  if (!res.ok) throw new Error(`TempMail.lol error ${res.status}`);
-  const data = (await res.json()) as { address: string; token: string };
-  if (!data.address || !data.token) throw new Error('TempMail.lol invalid response');
-  return {
-    id: data.token,
-    address: data.address,
-    password: '',
-    token: data.token,
-    provider: 'tempmail' as const,
-    createdAt: new Date().toISOString(),
-  };
+function isValidCustomEmailUsername(username: string): boolean {
+  if (!username || username.length < 3 || username.length > 30) return false;
+  if (username.includes('..')) return false;
+  if (!/^[a-z0-9][a-z0-9._-]{1,28}[a-z0-9]$/.test(username)) return false;
+  if (RESERVED_EMAIL_USERNAMES.has(username)) return false;
+  return true;
 }
 
-async function createGuerrillaAccount(username?: string) {
-  const res = await fetch('https://api.guerrillamail.com/ajax.php?f=get_email_address', {
-    headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' },
-    signal: AbortSignal.timeout(4000),
-  });
-  if (!res.ok) throw new Error(`GuerrillaMail error ${res.status}`);
-  const data = (await res.json()) as { email_addr: string; sid_token: string };
-  if (!data.email_addr || !data.sid_token) throw new Error('GuerrillaMail invalid response');
+function extractAddressFromHeader(raw: string): { name: string; address: string } {
+  const cleaned = (raw || '').trim();
+  const angleMatch = /^(.*?)<\s*([^<>\s]+@[^<>\s]+)\s*>/.exec(cleaned);
+  if (angleMatch) {
+    const name = angleMatch[1].replace(/^["']|["']$/g, '').trim();
+    const address = angleMatch[2].trim().toLowerCase();
+    return { name: name || address, address };
+  }
+  const emailMatch = /([a-zA-Z0-9._+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/.exec(cleaned);
+  const address = emailMatch ? emailMatch[1].toLowerCase() : cleaned.toLowerCase();
+  return { name: address || 'Unknown sender', address };
+}
 
-  let finalAddress = data.email_addr;
-  const cleanPrefix = (username || '').toLowerCase().replace(/[^a-z0-9._-]/g, '').slice(0, 20);
-  if (cleanPrefix.length >= 3) {
-    const setRes = await fetch(
-      `https://api.guerrillamail.com/ajax.php?f=set_email_user&email_user=${encodeURIComponent(cleanPrefix)}&sid_token=${encodeURIComponent(data.sid_token)}`,
-      { headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' }, signal: AbortSignal.timeout(3500) }
-    );
-    if (setRes.ok) {
-      const setJson = (await setRes.json()) as { email_addr?: string };
-      if (setJson.email_addr) finalAddress = setJson.email_addr;
+function extractTargetRecipients(rawTo: unknown): string[] {
+  const values: string[] = [];
+  if (Array.isArray(rawTo)) {
+    for (const item of rawTo) {
+      if (typeof item === 'string') values.push(item);
+      else if (item && typeof item === 'object' && typeof (item as { email?: string; address?: string }).email === 'string') {
+        values.push((item as { email: string }).email);
+      } else if (item && typeof item === 'object' && typeof (item as { address?: string }).address === 'string') {
+        values.push((item as { address: string }).address);
+      }
+    }
+  } else if (typeof rawTo === 'string') {
+    values.push(...rawTo.split(','));
+  }
+
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const val of values) {
+    const { address } = extractAddressFromHeader(val);
+    if (address && address.includes('@') && !seen.has(address)) {
+      seen.add(address);
+      out.push(address);
     }
   }
-
-  return {
-    id: data.sid_token,
-    address: finalAddress,
-    password: '',
-    token: data.sid_token,
-    provider: 'guerrilla' as const,
-    createdAt: new Date().toISOString(),
-  };
-}
-
-async function getTempMailIoDomains(): Promise<string[]> {
-  if (tempMailIoDomainsCache.data.length > 0 && Date.now() < tempMailIoDomainsCache.expiresAt) {
-    return tempMailIoDomainsCache.data;
-  }
-  const response = await fetch('https://api.internal.temp-mail.io/api/v3/domains', {
-    headers: { Accept: 'application/json', 'User-Agent': USER_AGENT },
-    signal: AbortSignal.timeout(3500),
-  });
-  if (!response.ok) {
-    return tempMailIoDomainsCache.data;
-  }
-  const json = (await response.json()) as {
-    domains?: Array<{ name: string; type?: string }>;
-  };
-  const domains = (json.domains || [])
-    .map((d) => d.name)
-    .filter((name) => Boolean(name) && name.length <= 18);
-  if (domains.length > 0) {
-    tempMailIoDomainsCache.data = domains;
-    tempMailIoDomainsCache.expiresAt = Date.now() + 5 * 60 * 1000;
-  }
-  return domains;
-}
-
-async function createTempMailIoAccount(
-  username?: string,
-  requestedDomain?: string,
-  customPassword?: string
-) {
-  const domains = await getTempMailIoDomains();
-  if (domains.length === 0) throw new Error('TempMail.io domains unavailable');
-
-  const domain = requestedDomain && domains.includes(requestedDomain) ? requestedDomain : domains[0];
-  const cleanPrefix = (username || '')
-    .toLowerCase()
-    .replace(/[^a-z0-9._-]/g, '')
-    .slice(0, 22);
-  const name = cleanPrefix.length >= 3 ? cleanPrefix : `vb${randomTokenString(6)}`;
-
-  const res = await fetch('https://api.internal.temp-mail.io/api/v3/email/new', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-      'User-Agent': USER_AGENT,
-    },
-    body: JSON.stringify({ name, domain }),
-    signal: AbortSignal.timeout(4000),
-  });
-  if (!res.ok) throw new Error(`TempMail.io error ${res.status}`);
-  const data = (await res.json()) as { email?: string; token?: string };
-  if (!data.email || !data.token) throw new Error('TempMail.io invalid response');
-
-  return {
-    id: data.token,
-    address: data.email,
-    password: customPassword || '',
-    token: data.token,
-    provider: 'tempmailio' as const,
-    createdAt: new Date().toISOString(),
-  };
+  return out;
 }
 
 // ==========================================
@@ -2386,68 +2246,315 @@ export function createApiApp() {
   });
 
   // ==========================================
-  // Multi-provider Email Domains, Daily Quota & Recovery
+  // Custom Domain Email Engine (veribox.name.ng) & Number Holds
   // ==========================================
-  const DAILY_FREE_EMAIL_LIMIT = 5;
-  const dailyEmailQuotaMap = new Map<string, number>();
   const numberOrderHoldMap = new Map<
     number,
     { userId?: string; amountNgn: number; provider: string; refunded?: boolean }
   >();
   const walletAdjustmentRefs = new Map<string, { balance: number; delta: number }>();
 
-  function getTodayDateKey(clientDateKey?: unknown): string {
-    if (typeof clientDateKey === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(clientDateKey.trim())) {
-      return clientDateKey.trim();
+  interface CustomMailboxRecord {
+    id: string;
+    address: string;
+    username: string;
+    domain: string;
+    displayName?: string;
+    accountMode?: string;
+    ownerUserId?: string;
+    provider: 'veribox';
+    token: string;
+    passwordHash: string;
+    salt: string;
+    isDeleted: boolean;
+    createdAt: string;
+  }
+
+  interface CustomInboxMessageRecord {
+    id: string;
+    recipientAddress: string;
+    fromName: string;
+    fromAddress: string;
+    subject: string;
+    text: string;
+    html: string;
+    otp: string | null;
+    seen: boolean;
+    createdAt: string;
+  }
+
+  const mailboxRegistry = new Map<string, CustomMailboxRecord>();
+  const mailboxMessagesMap = new Map<string, CustomInboxMessageRecord[]>();
+
+  function hashEmailPassword(password: string, salt?: string): { salt: string; hash: string } {
+    const useSalt = salt || crypto.randomBytes(16).toString('hex');
+    const derived = crypto.scryptSync(password, useSalt, 32).toString('hex');
+    return { salt: useSalt, hash: derived };
+  }
+
+  function verifyEmailPassword(password: string, record: CustomMailboxRecord): boolean {
+    try {
+      const { hash } = hashEmailPassword(password, record.salt);
+      const a = Buffer.from(hash, 'hex');
+      const b = Buffer.from(record.passwordHash, 'hex');
+      return a.length === b.length && crypto.timingSafeEqual(a, b);
+    } catch {
+      return false;
     }
-    return new Date().toISOString().slice(0, 10);
   }
 
-  function getDailyEmailQuota(userId: string, clientDateKey?: unknown) {
-    const safeUser = normalizeWalletUserId(userId);
-    const dateKey = getTodayDateKey(clientDateKey);
-    const key = `${safeUser}:${dateKey}`;
-    const usedToday = Math.min(DAILY_FREE_EMAIL_LIMIT, dailyEmailQuotaMap.get(key) ?? 0);
-    return {
-      dailyLimit: DAILY_FREE_EMAIL_LIMIT,
-      usedToday,
-      remainingToday: Math.max(0, DAILY_FREE_EMAIL_LIMIT - usedToday),
-      dateKey,
-    };
+  async function findMailboxRecord(rawAddress: string): Promise<CustomMailboxRecord | null> {
+    const addr = rawAddress.trim().toLowerCase();
+    if (!addr) return null;
+
+    const sb = getSupabaseServerClient();
+    if (sb) {
+      try {
+        const { data, error } = await sb
+          .from('mailboxes')
+          .select('*')
+          .eq('address', addr)
+          .maybeSingle();
+        if (!error && data) {
+          const rec: CustomMailboxRecord = {
+            id: String(data.id),
+            address: String(data.address),
+            username: String(data.username),
+            domain: String(data.domain || CUSTOM_EMAIL_DOMAIN),
+            displayName: data.display_name ? String(data.display_name) : undefined,
+            accountMode: data.account_mode ? String(data.account_mode) : 'personal',
+            ownerUserId: data.owner_user_id ? String(data.owner_user_id) : undefined,
+            provider: 'veribox',
+            token: String(data.token),
+            passwordHash: String(data.password_hash),
+            salt: String(data.salt),
+            isDeleted: Boolean(data.is_deleted),
+            createdAt: String(data.created_at || new Date().toISOString()),
+          };
+          mailboxRegistry.set(addr, rec);
+          return rec;
+        }
+      } catch {
+        // Fallback to in-memory map if schema not yet applied
+      }
+    }
+
+    return mailboxRegistry.get(addr) || null;
   }
 
-  function incrementDailyEmailQuota(userId: string, clientDateKey?: unknown) {
-    const safeUser = normalizeWalletUserId(userId);
-    const dateKey = getTodayDateKey(clientDateKey);
-    const key = `${safeUser}:${dateKey}`;
-    const next = Math.min(DAILY_FREE_EMAIL_LIMIT, (dailyEmailQuotaMap.get(key) ?? 0) + 1);
-    dailyEmailQuotaMap.set(key, next);
-    return {
-      dailyLimit: DAILY_FREE_EMAIL_LIMIT,
-      usedToday: next,
-      remainingToday: Math.max(0, DAILY_FREE_EMAIL_LIMIT - next),
-      dateKey,
-    };
+  async function saveMailboxRecord(record: CustomMailboxRecord): Promise<void> {
+    const addr = record.address.trim().toLowerCase();
+    mailboxRegistry.set(addr, record);
+
+    const sb = getSupabaseServerClient();
+    if (sb) {
+      try {
+        await sb.from('mailboxes').upsert(
+          {
+            address: addr,
+            id: record.id,
+            username: record.username,
+            domain: record.domain,
+            display_name: record.displayName || null,
+            account_mode: record.accountMode || 'personal',
+            owner_user_id: record.ownerUserId || null,
+            password_hash: record.passwordHash,
+            salt: record.salt,
+            token: record.token,
+            is_deleted: record.isDeleted,
+            created_at: record.createdAt,
+          },
+          { onConflict: 'address' }
+        );
+      } catch {
+        // In-memory store remains active
+      }
+    }
   }
 
-  app.get('/api/email/quota', (req, res) => {
-    const userId = normalizeWalletUserId(req.query.userId);
-    const quota = getDailyEmailQuota(userId, req.query.dateKey);
-    res.json(quota);
-  });
+  async function listMailboxesForOwner(ownerUserId: string): Promise<CustomMailboxRecord[]> {
+    const cleanOwner = normalizeWalletUserId(ownerUserId);
+    const sb = getSupabaseServerClient();
+    if (sb && cleanOwner !== 'default-wallet') {
+      try {
+        const { data, error } = await sb
+          .from('mailboxes')
+          .select('*')
+          .eq('owner_user_id', cleanOwner)
+          .eq('is_deleted', false)
+          .order('created_at', { ascending: false })
+          .limit(20);
+        if (!error && Array.isArray(data)) {
+          const list: CustomMailboxRecord[] = data.map((row) => ({
+            id: String(row.id),
+            address: String(row.address),
+            username: String(row.username),
+            domain: String(row.domain || CUSTOM_EMAIL_DOMAIN),
+            displayName: row.display_name ? String(row.display_name) : undefined,
+            accountMode: row.account_mode ? String(row.account_mode) : 'personal',
+            ownerUserId: row.owner_user_id ? String(row.owner_user_id) : undefined,
+            provider: 'veribox',
+            token: String(row.token),
+            passwordHash: String(row.password_hash),
+            salt: String(row.salt),
+            isDeleted: Boolean(row.is_deleted),
+            createdAt: String(row.created_at || new Date().toISOString()),
+          }));
+          for (const rec of list) {
+            mailboxRegistry.set(rec.address, rec);
+          }
+          return list;
+        }
+      } catch {
+        // Fallback to memory
+      }
+    }
 
-  app.get('/api/email/domains', async (_req, res) => {
-    const [ioDomains, tmDomains] = await Promise.all([
-      getTempMailIoDomains().catch(() => []),
-      getMailTmDomains().catch(() => []),
-    ]);
+    return Array.from(mailboxRegistry.values())
+      .filter((m) => m.ownerUserId === cleanOwner && !m.isDeleted)
+      .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
+      .slice(0, 20);
+  }
+
+  async function saveInboxMessage(msg: CustomInboxMessageRecord): Promise<void> {
+    const recipient = msg.recipientAddress.trim().toLowerCase();
+    const existing = mailboxMessagesMap.get(recipient) || [];
+    const next = [msg, ...existing.filter((m) => m.id !== msg.id)].slice(0, 100);
+    mailboxMessagesMap.set(recipient, next);
+
+    const sb = getSupabaseServerClient();
+    if (sb) {
+      try {
+        await sb.from('mailbox_messages').upsert(
+          {
+            id: msg.id,
+            recipient_address: recipient,
+            from_name: msg.fromName,
+            from_address: msg.fromAddress,
+            subject: msg.subject,
+            body_text: msg.text,
+            body_html: msg.html,
+            otp: msg.otp,
+            seen: msg.seen,
+            created_at: msg.createdAt,
+          },
+          { onConflict: 'id' }
+        );
+      } catch {
+        // In-memory store remains active
+      }
+    }
+  }
+
+  async function listInboxMessages(recipientAddress: string): Promise<CustomInboxMessageRecord[]> {
+    const recipient = recipientAddress.trim().toLowerCase();
+    const sb = getSupabaseServerClient();
+    if (sb) {
+      try {
+        const { data, error } = await sb
+          .from('mailbox_messages')
+          .select('*')
+          .eq('recipient_address', recipient)
+          .order('created_at', { ascending: false })
+          .limit(50);
+        if (!error && Array.isArray(data)) {
+          const rows: CustomInboxMessageRecord[] = data.map((row) => ({
+            id: String(row.id),
+            recipientAddress: recipient,
+            fromName: String(row.from_name || row.from_address || 'Unknown sender'),
+            fromAddress: String(row.from_address || ''),
+            subject: String(row.subject || '(No subject)'),
+            text: String(row.body_text || ''),
+            html: String(row.body_html || ''),
+            otp: row.otp ? String(row.otp) : null,
+            seen: Boolean(row.seen),
+            createdAt: String(row.created_at || new Date().toISOString()),
+          }));
+          mailboxMessagesMap.set(recipient, rows);
+          return rows;
+        }
+      } catch {
+        // Fallback to memory
+      }
+    }
+
+    return mailboxMessagesMap.get(recipient) || [];
+  }
+
+  async function findInboxMessage(
+    recipientAddress: string,
+    messageId: string
+  ): Promise<CustomInboxMessageRecord | null> {
+    const recipient = recipientAddress.trim().toLowerCase();
+    const sb = getSupabaseServerClient();
+    if (sb) {
+      try {
+        const { data, error } = await sb
+          .from('mailbox_messages')
+          .select('*')
+          .eq('id', messageId)
+          .eq('recipient_address', recipient)
+          .maybeSingle();
+        if (!error && data) {
+          await sb
+            .from('mailbox_messages')
+            .update({ seen: true })
+            .eq('id', messageId)
+            .eq('recipient_address', recipient);
+
+          return {
+            id: String(data.id),
+            recipientAddress: recipient,
+            fromName: String(data.from_name || data.from_address || 'Unknown sender'),
+            fromAddress: String(data.from_address || ''),
+            subject: String(data.subject || '(No subject)'),
+            text: String(data.body_text || ''),
+            html: String(data.body_html || ''),
+            otp: data.otp ? String(data.otp) : null,
+            seen: true,
+            createdAt: String(data.created_at || new Date().toISOString()),
+          };
+        }
+      } catch {
+        // Fallback to memory
+      }
+    }
+
+    const memList = mailboxMessagesMap.get(recipient) || [];
+    const found = memList.find((m) => m.id === messageId) || null;
+    if (found) found.seen = true;
+    return found;
+  }
+
+  async function deleteInboxMessageById(recipientAddress: string, messageId: string): Promise<boolean> {
+    const recipient = recipientAddress.trim().toLowerCase();
+    const memList = mailboxMessagesMap.get(recipient) || [];
+    mailboxMessagesMap.set(
+      recipient,
+      memList.filter((m) => m.id !== messageId)
+    );
+
+    const sb = getSupabaseServerClient();
+    if (sb) {
+      try {
+        await sb
+          .from('mailbox_messages')
+          .delete()
+          .eq('id', messageId)
+          .eq('recipient_address', recipient);
+      } catch {
+        // Ignore if table not applied
+      }
+    }
+    return true;
+  }
+
+  app.get('/api/email/domains', (_req, res) => {
     res.json({
-      domains: [...ioDomains, ...tmDomains],
+      domain: CUSTOM_EMAIL_DOMAIN,
+      domains: [CUSTOM_EMAIL_DOMAIN],
       providers: [
-        { id: 'auto', name: 'Auto (Fastest Clean Domain)' },
-        { id: 'tempmailio', name: 'VeriBox Instant Mail (.com)' },
-        { id: 'mailtm', name: 'Mail.tm (Custom Password)' },
-        { id: 'tempmail', name: 'TempMail.lol' },
+        { id: 'veribox', name: `VeriBox Custom Domain (@${CUSTOM_EMAIL_DOMAIN})` },
       ],
     });
   });
@@ -2463,304 +2570,220 @@ export function createApiApp() {
       .slice(0, 12);
 
     const firstFinal = first || 'user';
-    const secondFinal = second || 'box';
+    const secondFinal = second || 'mail';
 
-    const base1 = `${firstFinal}${secondFinal}`;
-    const base2 = `${firstFinal}.${secondFinal}`;
-    const base3 = `${firstFinal.slice(0, 1)}${secondFinal}`;
-    const base4 = firstFinal;
-    const num1 = Math.floor(12 + Math.random() * 87);
-    const num2 = Math.floor(101 + Math.random() * 890);
-    const num3 = Math.floor(14 + Math.random() * 85);
-    const num4 = Math.floor(201 + Math.random() * 789);
+    const seedCandidates = [
+      `${firstFinal}${secondFinal}`,
+      `${firstFinal}.${secondFinal}`,
+      `${firstFinal.slice(0, 1)}${secondFinal}${Math.floor(12 + Math.random() * 87)}`,
+      `${firstFinal}${Math.floor(101 + Math.random() * 890)}`,
+      `${firstFinal}.${secondFinal}${Math.floor(14 + Math.random() * 85)}`,
+      `${secondFinal}.${firstFinal}${Math.floor(10 + Math.random() * 89)}`,
+    ];
 
-    try {
-      const [ioDomains, mailTmDomains] = await Promise.all([
-        getTempMailIoDomains().catch((): string[] => []),
-        getMailTmDomains().catch((): string[] => []),
-      ]);
+    const available: Array<{
+      id: string;
+      address: string;
+      username: string;
+      domain: string;
+      provider: 'veribox';
+      providerLabel: string;
+    }> = [];
+    const seen = new Set<string>();
 
-      const d1 = ioDomains[0] || mailTmDomains[0] || 'lnovic.com';
-      const d2 = ioDomains[1] || ioDomains[0] || mailTmDomains[0] || 'tanpony.com';
-      const d3 = mailTmDomains[0] || ioDomains[2] || d1;
-      const d4 = ioDomains[2] || ioDomains[0] || mailTmDomains[0] || 'bwmyga.com';
+    for (const rawCand of seedCandidates) {
+      let username = normalizeCustomEmailUsername(rawCand);
+      if (!isValidCustomEmailUsername(username) || seen.has(username)) continue;
 
-      const useIoFor1 = ioDomains.includes(d1);
-      const useIoFor2 = ioDomains.includes(d2);
-      const useMailTmFor3 = mailTmDomains.includes(d3);
-      const useIoFor4 = ioDomains.includes(d4);
+      const existing = await findMailboxRecord(`${username}@${CUSTOM_EMAIL_DOMAIN}`);
+      if (existing) {
+        username = normalizeCustomEmailUsername(`${username}${Math.floor(10 + Math.random() * 89)}`);
+        if (!isValidCustomEmailUsername(username) || seen.has(username)) continue;
+        const retryExisting = await findMailboxRecord(`${username}@${CUSTOM_EMAIL_DOMAIN}`);
+        if (retryExisting) continue;
+      }
 
-      const options: Array<{
-        id: string;
-        address: string;
-        username: string;
-        domain: string;
-        provider: 'tempmailio' | 'mailtm';
-        providerLabel: string;
-      }> = [
-        {
-          id: 'opt-1',
-          address: `${base1}${num1}@${d1}`,
-          username: `${base1}${num1}`,
-          domain: d1,
-          provider: useIoFor1 ? 'tempmailio' : 'mailtm',
-          providerLabel: 'Instant Inbox',
-        },
-        {
-          id: 'opt-2',
-          address: `${base2}${num2}@${d2}`,
-          username: `${base2}${num2}`,
-          domain: d2,
-          provider: useIoFor2 ? 'tempmailio' : 'mailtm',
-          providerLabel: 'Instant Inbox',
-        },
-        {
-          id: 'opt-3',
-          address: `${base3}${num3}@${d3}`,
-          username: `${base3}${num3}`,
-          domain: d3,
-          provider: useMailTmFor3 ? 'mailtm' : 'tempmailio',
-          providerLabel: 'Protected Inbox',
-        },
-        {
-          id: 'opt-4',
-          address: `${base4}${num4}@${d4}`,
-          username: `${base4}${num4}`,
-          domain: d4,
-          provider: useIoFor4 ? 'tempmailio' : 'mailtm',
-          providerLabel: 'Fast Verify',
-        },
-      ];
-
-      res.json({ options });
-    } catch (error) {
-      res.status(502).json({
-        error: error instanceof Error ? error.message : 'Failed to generate email options',
+      seen.add(username);
+      available.push({
+        id: `opt-${available.length + 1}`,
+        address: `${username}@${CUSTOM_EMAIL_DOMAIN}`,
+        username,
+        domain: CUSTOM_EMAIL_DOMAIN,
+        provider: 'veribox',
+        providerLabel: `@${CUSTOM_EMAIL_DOMAIN}`,
       });
+      if (available.length >= 4) break;
     }
+
+    res.json({ domain: CUSTOM_EMAIL_DOMAIN, options: available });
   });
 
-  interface EmailRegistryRecord {
-    id: string;
-    address: string;
-    provider: 'mailtm' | 'tempmailio' | 'tempmail' | 'guerrilla';
-    token: string;
-    passwordHash: string;
-    salt: string;
-    createdAt: string;
-  }
+  app.post('/api/email/check-availability', async (req, res) => {
+    const rawInput = typeof req.body?.username === 'string'
+      ? req.body.username
+      : typeof req.body?.address === 'string'
+        ? req.body.address
+        : '';
+    const username = normalizeCustomEmailUsername(rawInput);
 
-  const emailRecoveryRegistry = new Map<string, EmailRegistryRecord>();
-
-  function hashEmailPassword(password: string, salt?: string): { salt: string; hash: string } {
-    const useSalt = salt || crypto.randomBytes(16).toString('hex');
-    const derived = crypto.scryptSync(password, useSalt, 32).toString('hex');
-    return { salt: useSalt, hash: derived };
-  }
-
-  function verifyEmailPassword(password: string, record: EmailRegistryRecord): boolean {
-    try {
-      const { hash } = hashEmailPassword(password, record.salt);
-      const a = Buffer.from(hash, 'hex');
-      const b = Buffer.from(record.passwordHash, 'hex');
-      return a.length === b.length && crypto.timingSafeEqual(a, b);
-    } catch {
-      return false;
+    if (!isValidCustomEmailUsername(username)) {
+      res.status(400).json({
+        available: false,
+        username,
+        address: username ? `${username}@${CUSTOM_EMAIL_DOMAIN}` : '',
+        error: 'Username must be 3–30 characters using letters, numbers, dots, underscores, or hyphens.',
+      });
+      return;
     }
-  }
 
-  function registerCreatedEmail(
-    acct: { id: string; address: string; token: string; provider: EmailRegistryRecord['provider']; createdAt: string },
-    rawPassword?: string
-  ) {
-    const cleanAddr = (acct.address || '').trim().toLowerCase();
-    const cleanPass = (rawPassword || '').trim();
-    if (!cleanAddr || cleanPass.length < 4) return;
-    const { salt, hash } = hashEmailPassword(cleanPass);
-    emailRecoveryRegistry.set(cleanAddr, {
-      id: acct.id,
-      address: acct.address,
-      provider: acct.provider,
-      token: acct.token,
+    const address = `${username}@${CUSTOM_EMAIL_DOMAIN}`;
+    const existing = await findMailboxRecord(address);
+    res.json({
+      available: !existing,
+      username,
+      address,
+      domain: CUSTOM_EMAIL_DOMAIN,
+      error: existing ? `${address} is already taken. Choose a different username.` : undefined,
+    });
+  });
+
+  async function createCustomDomainMailbox(params: {
+    usernameInput?: string;
+    addressInput?: string;
+    password?: string;
+    displayName?: string;
+    accountMode?: string;
+    ownerUserId?: string;
+  }) {
+    const rawUser = params.usernameInput || params.addressInput || '';
+    const username = normalizeCustomEmailUsername(rawUser);
+    if (!isValidCustomEmailUsername(username)) {
+      throw new Error(
+        `Invalid username. Use 3–30 characters (letters, numbers, dots, underscores, or hyphens) for @${CUSTOM_EMAIL_DOMAIN}.`
+      );
+    }
+
+    const cleanPassword = (params.password || '').trim();
+    if (cleanPassword.length < 6) {
+      throw new Error('Password must be at least 6 characters.');
+    }
+
+    const address = `${username}@${CUSTOM_EMAIL_DOMAIN}`;
+    const existing = await findMailboxRecord(address);
+    if (existing) {
+      const err = new Error(`${address} is already registered. Sign in with its password or pick another username.`);
+      (err as Error & { statusCode?: number }).statusCode = 409;
+      throw err;
+    }
+
+    const { salt, hash } = hashEmailPassword(cleanPassword);
+    const token = crypto.randomBytes(24).toString('hex');
+    const id = `vbox_${crypto.randomBytes(8).toString('hex')}`;
+    const createdAt = new Date().toISOString();
+
+    const record: CustomMailboxRecord = {
+      id,
+      address,
+      username,
+      domain: CUSTOM_EMAIL_DOMAIN,
+      displayName: params.displayName?.trim() || undefined,
+      accountMode: params.accountMode || 'personal',
+      ownerUserId: params.ownerUserId ? normalizeWalletUserId(params.ownerUserId) : undefined,
+      provider: 'veribox',
+      token,
       passwordHash: hash,
       salt,
-      createdAt: acct.createdAt,
+      isDeleted: false,
+      createdAt,
+    };
+
+    await saveMailboxRecord(record);
+
+    // Deliver an instant welcome message into the new @veribox.name.ng inbox
+    await saveInboxMessage({
+      id: `welcome_${id}`,
+      recipientAddress: address,
+      fromName: 'VeriBox Mail',
+      fromAddress: `welcome@${CUSTOM_EMAIL_DOMAIN}`,
+      subject: `Welcome to ${address}`,
+      text: `Your custom @${CUSTOM_EMAIL_DOMAIN} mailbox (${address}) is active and ready to receive verification codes and incoming emails.\n\nKeep your password safe — you can manage or recover this address anytime under Create -> Sign in.`,
+      html: '',
+      otp: null,
+      seen: false,
+      createdAt,
     });
+
+    return {
+      id: record.id,
+      address: record.address,
+      password: cleanPassword,
+      token: record.token,
+      provider: 'veribox' as const,
+      domain: record.domain,
+      createdAt: record.createdAt,
+      accountMode: record.accountMode,
+      displayName: record.displayName,
+    };
   }
 
   app.post('/api/email/create-selected', async (req, res) => {
-    const provider = String(req.body?.provider || 'tempmailio').toLowerCase();
-    const username = typeof req.body?.username === 'string' ? req.body.username : undefined;
-    const domain = typeof req.body?.domain === 'string' ? req.body.domain : undefined;
-    const password = typeof req.body?.password === 'string' ? req.body.password : undefined;
-    const address = typeof req.body?.address === 'string' ? req.body.address : undefined;
-    const precreatedToken =
-      typeof req.body?.precreatedToken === 'string' ? req.body.precreatedToken : undefined;
-
     try {
-      if (provider === 'tempmailio') {
-        const acct = await createTempMailIoAccount(username, domain, password);
-        registerCreatedEmail(acct, password);
-        res.json(acct);
-        return;
-      }
-
-      if (provider === 'mailtm') {
-        const acct = await createMailTmAccount(username, domain, password);
-        registerCreatedEmail(acct, acct.password || password);
-        res.json(acct);
-        return;
-      }
-
-      if (provider === 'tempmail' && precreatedToken && address) {
-        const acct = {
-          id: precreatedToken,
-          address,
-          password: password || '',
-          token: precreatedToken,
-          provider: 'tempmail' as const,
-          createdAt: new Date().toISOString(),
-        };
-        registerCreatedEmail(acct, password);
-        res.json(acct);
-        return;
-      }
-
-      if (provider === 'guerrilla') {
-        const acct = await createGuerrillaAccount(username);
-        const fullAcct = { ...acct, password: password || '' };
-        registerCreatedEmail(fullAcct, password);
-        res.json(fullAcct);
-        return;
-      }
-
-      const acct = await createTempMailIoAccount(username, domain, password);
-      registerCreatedEmail(acct, password);
+      const acct = await createCustomDomainMailbox({
+        usernameInput: typeof req.body?.username === 'string' ? req.body.username : undefined,
+        addressInput: typeof req.body?.address === 'string' ? req.body.address : undefined,
+        password: typeof req.body?.password === 'string' ? req.body.password : undefined,
+        displayName: typeof req.body?.displayName === 'string' ? req.body.displayName : undefined,
+        accountMode: typeof req.body?.accountMode === 'string' ? req.body.accountMode : 'personal',
+        ownerUserId: typeof req.body?.userId === 'string' ? req.body.userId : undefined,
+      });
       res.json(acct);
     } catch (err) {
-      const fallbacks: Array<'mailtm' | 'tempmailio' | 'tempmail' | 'guerrilla'> =
-        provider === 'tempmailio'
-          ? ['mailtm', 'tempmail', 'guerrilla']
-          : ['mailtm', 'tempmailio', 'tempmail', 'guerrilla'];
-
-      for (const fb of fallbacks) {
-        if (fb === provider) continue;
-        try {
-          const fallback =
-            fb === 'mailtm'
-              ? await createMailTmAccount(username, undefined, password)
-              : fb === 'tempmailio'
-                ? await createTempMailIoAccount(username, undefined, password)
-                : fb === 'tempmail'
-                  ? await createTempMailLolAccount()
-                  : await createGuerrillaAccount(username);
-          const withPass = { ...fallback, password: fallback.password || password || '' };
-          registerCreatedEmail(withPass, withPass.password);
-          res.json(withPass);
-          return;
-        } catch {
-          // Try next fallback
-        }
-      }
-      res.status(502).json({
-        error: err instanceof Error ? err.message : 'Could not create selected email',
+      const status = (err as { statusCode?: number }).statusCode || 400;
+      res.status(status).json({
+        error: err instanceof Error ? err.message : `Could not create @${CUSTOM_EMAIL_DOMAIN} mailbox`,
       });
     }
   });
 
   app.post('/api/email/create', async (req, res) => {
-    const provider = String(req.body?.provider || 'auto').toLowerCase();
-    const username = typeof req.body?.username === 'string' ? req.body.username : undefined;
-    const domain = typeof req.body?.domain === 'string' ? req.body.domain : undefined;
-    const password = typeof req.body?.password === 'string' ? req.body.password : undefined;
-    const consumeFreeQuota = Boolean(req.body?.consumeFreeQuota);
-    const userId = normalizeWalletUserId(req.body?.userId);
-    const dateKey = req.body?.dateKey;
-
-    if (consumeFreeQuota) {
-      const currentQuota = getDailyEmailQuota(userId, dateKey);
-      if (currentQuota.remainingToday <= 0) {
-        res.status(429).json({
-          error:
-            'Daily free limit reached (5/5 free emails generated today). Your 5 free emails reset tomorrow — or tap Create (₦50) for custom email.',
-          quota: currentQuota,
-        });
-        return;
-      }
+    try {
+      const acct = await createCustomDomainMailbox({
+        usernameInput: typeof req.body?.username === 'string' ? req.body.username : undefined,
+        addressInput: typeof req.body?.address === 'string' ? req.body.address : undefined,
+        password: typeof req.body?.password === 'string' ? req.body.password : undefined,
+        displayName: typeof req.body?.displayName === 'string' ? req.body.displayName : undefined,
+        accountMode: typeof req.body?.accountMode === 'string' ? req.body.accountMode : 'personal',
+        ownerUserId: typeof req.body?.userId === 'string' ? req.body.userId : undefined,
+      });
+      res.json(acct);
+    } catch (err) {
+      const status = (err as { statusCode?: number }).statusCode || 400;
+      res.status(status).json({
+        error: err instanceof Error ? err.message : `Could not create @${CUSTOM_EMAIL_DOMAIN} mailbox`,
+      });
     }
-
-    const order: Array<'mailtm' | 'tempmail' | 'tempmailio' | 'guerrilla'> =
-      provider === 'mailtm'
-        ? ['mailtm', 'tempmail', 'tempmailio', 'guerrilla']
-        : provider === 'tempmail'
-          ? ['tempmail', 'mailtm', 'tempmailio', 'guerrilla']
-          : provider === 'guerrilla'
-            ? ['guerrilla', 'mailtm', 'tempmail']
-            : provider === 'tempmailio'
-              ? ['tempmailio', 'mailtm', 'tempmail', 'guerrilla']
-              : ['mailtm', 'tempmail', 'tempmailio', 'guerrilla'];
-
-    let lastError = 'All email providers are busy';
-    for (const candidate of order) {
-      try {
-        if (candidate === 'tempmailio') {
-          const acct = await createTempMailIoAccount(username, domain, password);
-          registerCreatedEmail(acct, password);
-          const quota = consumeFreeQuota ? incrementDailyEmailQuota(userId, dateKey) : undefined;
-          res.json(quota ? { ...acct, quota } : acct);
-          return;
-        }
-        if (candidate === 'mailtm') {
-          const acct = await createMailTmAccount(username, domain, password);
-          registerCreatedEmail(acct, acct.password || password);
-          const quota = consumeFreeQuota ? incrementDailyEmailQuota(userId, dateKey) : undefined;
-          res.json(quota ? { ...acct, quota } : acct);
-          return;
-        }
-        if (candidate === 'tempmail') {
-          const acct = await createTempMailLolAccount();
-          registerCreatedEmail(acct, password);
-          const quota = consumeFreeQuota ? incrementDailyEmailQuota(userId, dateKey) : undefined;
-          res.json(quota ? { ...acct, quota } : acct);
-          return;
-        }
-        if (candidate === 'guerrilla') {
-          const acct = await createGuerrillaAccount(username);
-          registerCreatedEmail(acct, password);
-          const quota = consumeFreeQuota ? incrementDailyEmailQuota(userId, dateKey) : undefined;
-          res.json(quota ? { ...acct, quota } : acct);
-          return;
-        }
-      } catch (err) {
-        lastError = err instanceof Error ? err.message : lastError;
-      }
-    }
-
-    res.status(502).json({ error: lastError });
   });
 
   app.post('/api/email/check-exists', async (req, res) => {
     const rawAddress = typeof req.body?.address === 'string' ? req.body.address.trim().toLowerCase() : '';
     if (!rawAddress || !rawAddress.includes('@')) {
-      res.status(400).json({ exists: false, error: 'Enter a valid email address' });
+      res.status(400).json({ exists: false, error: `Enter a valid @${CUSTOM_EMAIL_DOMAIN} address` });
       return;
     }
 
-    const reg = emailRecoveryRegistry.get(rawAddress);
+    const domainPart = rawAddress.split('@')[1] || '';
+    if (domainPart !== CUSTOM_EMAIL_DOMAIN) {
+      res.json({
+        exists: false,
+        error: `Only @${CUSTOM_EMAIL_DOMAIN} addresses are managed here.`,
+      });
+      return;
+    }
+
+    const reg = await findMailboxRecord(rawAddress);
     if (reg) {
-      res.json({ exists: true, provider: reg.provider });
+      res.json({ exists: true, provider: 'veribox', domain: CUSTOM_EMAIL_DOMAIN });
       return;
-    }
-
-    const domain = rawAddress.split('@')[1] || '';
-    try {
-      const mailTmDomains = await getMailTmDomains().catch((): string[] => []);
-      if (domain && mailTmDomains.includes(domain)) {
-        res.json({ exists: true, provider: 'mailtm', verifyViaPassword: true });
-        return;
-      }
-    } catch {
-      // Non-blocking
     }
 
     res.json({ exists: false });
@@ -2768,226 +2791,231 @@ export function createApiApp() {
 
   app.post('/api/email/login', async (req, res) => {
     try {
-      const address = typeof req.body?.address === 'string' ? req.body.address.trim() : '';
+      const address = typeof req.body?.address === 'string' ? req.body.address.trim().toLowerCase() : '';
       const password = typeof req.body?.password === 'string' ? req.body.password.trim() : '';
       if (!address || !password) {
         res.status(400).json({ error: 'Email address and password are required' });
         return;
       }
 
-      const reg = emailRecoveryRegistry.get(address.toLowerCase());
-      if (reg) {
-        if (!verifyEmailPassword(password, reg)) {
-          res.status(401).json({ error: 'Incorrect password for this email address' });
-          return;
-        }
-        if (reg.provider === 'mailtm') {
-          try {
-            const tokenRes = await fetch('https://api.mail.tm/token', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-              body: JSON.stringify({ address: reg.address, password }),
-              signal: AbortSignal.timeout(5000),
-            });
-            if (tokenRes.ok) {
-              const tokenJson = (await tokenRes.json()) as { token: string; id: string };
-              reg.token = tokenJson.token;
-              res.json({
-                token: tokenJson.token,
-                id: tokenJson.id,
-                address: reg.address,
-                provider: 'mailtm',
-                createdAt: reg.createdAt,
-              });
-              return;
-            }
-          } catch {
-            // Fall back to cached token below
-          }
-        }
-        res.json({
-          token: reg.token,
-          id: reg.id,
-          address: reg.address,
-          provider: reg.provider,
-          createdAt: reg.createdAt,
-        });
+      const reg = await findMailboxRecord(address);
+      if (!reg) {
+        res.status(404).json({ error: `No @${CUSTOM_EMAIL_DOMAIN} mailbox found for this address` });
         return;
       }
 
-      const tokenRes = await fetch('https://api.mail.tm/token', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify({ address, password }),
-        signal: AbortSignal.timeout(5000),
-      });
-      if (!tokenRes.ok) {
-        res.status(tokenRes.status === 401 ? 401 : 404).json({
-          error:
-            tokenRes.status === 401
-              ? 'Incorrect password or email not found on VeriBox'
-              : 'No active VeriBox inbox found for this email and password',
-        });
+      if (!verifyEmailPassword(password, reg)) {
+        res.status(401).json({ error: 'Incorrect password for this email address' });
         return;
       }
-      const tokenJson = (await tokenRes.json()) as { token: string; id: string };
+
+      if (reg.isDeleted) {
+        reg.isDeleted = false;
+        await saveMailboxRecord(reg);
+      }
+
       res.json({
-        token: tokenJson.token,
-        id: tokenJson.id,
-        address,
-        provider: 'mailtm',
-        createdAt: new Date().toISOString(),
+        token: reg.token,
+        id: reg.id,
+        address: reg.address,
+        provider: 'veribox',
+        domain: reg.domain,
+        createdAt: reg.createdAt,
+        accountMode: reg.accountMode,
+        displayName: reg.displayName,
       });
     } catch (error) {
       res.status(500).json({ error: error instanceof Error ? error.message : 'Login failed' });
     }
   });
 
-  app.get('/api/email/messages', async (req, res) => {
+  app.get('/api/email/list', async (req, res) => {
+    const userId = normalizeWalletUserId(req.query.userId);
+    if (!userId || userId === 'default-wallet') {
+      res.json({ accounts: [] });
+      return;
+    }
+    const list = await listMailboxesForOwner(userId);
+    res.json({
+      accounts: list.map((m) => ({
+        id: m.id,
+        address: m.address,
+        password: '',
+        token: m.token,
+        provider: 'veribox' as const,
+        domain: m.domain,
+        createdAt: m.createdAt,
+        accountMode: m.accountMode || 'personal',
+        displayName: m.displayName,
+      })),
+    });
+  });
+
+  app.post('/api/email/manage/delete', async (req, res) => {
+    const address = typeof req.body?.address === 'string' ? req.body.address.trim().toLowerCase() : '';
+    const token = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
+    if (!address) {
+      res.status(400).json({ error: 'Missing email address' });
+      return;
+    }
+    const rec = await findMailboxRecord(address);
+    if (rec && (!token || rec.token === token)) {
+      rec.isDeleted = true;
+      await saveMailboxRecord(rec);
+    }
+    res.json({ deleted: true, recoverable: true });
+  });
+
+  async function handleInboundEmailWebhook(req: express.Request, res: express.Response) {
+    const configuredSecret = (process.env.INBOUND_EMAIL_SECRET || '').trim();
+    if (configuredSecret && !configuredSecret.startsWith('MY_')) {
+      const provided = String(
+        req.params.secret ||
+          req.headers['x-inbound-secret'] ||
+          req.headers['x-webhook-secret'] ||
+          (req.headers.authorization || '').replace(/^Bearer\s+/i, '') ||
+          req.query.secret ||
+          ''
+      ).trim();
+
+      if (provided !== configuredSecret) {
+        res.status(401).json({ error: 'Unauthorized inbound email webhook' });
+        return;
+      }
+    }
+
+    const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, unknown>;
+    const payload =
+      body.data && typeof body.data === 'object' && !Array.isArray(body.data)
+        ? (body.data as Record<string, unknown>)
+        : body;
+
+    const rawTo =
+      payload.to ??
+      payload.recipient ??
+      payload.rcpt ??
+      payload.ToFull ??
+      payload.To ??
+      body.to;
+
+    const recipients = extractTargetRecipients(rawTo).filter((addr) =>
+      addr.endsWith(`@${CUSTOM_EMAIL_DOMAIN}`)
+    );
+
+    if (recipients.length === 0) {
+      res.status(400).json({
+        error: `No recipient matching @${CUSTOM_EMAIL_DOMAIN} found in payload`,
+      });
+      return;
+    }
+
+    const rawFrom = String(
+      payload.from ||
+        payload.sender ||
+        payload.From ||
+        payload.FromFull ||
+        'sender@external.mail'
+    );
+    const parsedFrom = extractAddressFromHeader(rawFrom);
+    const fromName =
+      typeof payload.fromName === 'string' && payload.fromName.trim()
+        ? payload.fromName.trim()
+        : parsedFrom.name;
+    const subject = String(payload.subject || payload.Subject || '(No subject)').slice(0, 300);
+    const html = String(
+      payload.html ||
+        payload['body-html'] ||
+        payload['stripped-html'] ||
+        payload.HtmlBody ||
+        ''
+    ).slice(0, 120000);
+    const rawText = String(
+      payload.text ||
+        payload['body-plain'] ||
+        payload['stripped-text'] ||
+        payload.TextBody ||
+        ''
+    );
+    const plainText = (rawText || stripTags(html)).slice(0, 40000);
+    const otp = extractOtpCode(`${subject} ${plainText}`);
+    const createdAt = new Date().toISOString();
+
+    const storedIds: string[] = [];
+    for (const recipient of recipients) {
+      const msgId = `in_${Date.now().toString(36)}_${crypto.randomBytes(6).toString('hex')}`;
+      await saveInboxMessage({
+        id: msgId,
+        recipientAddress: recipient,
+        fromName,
+        fromAddress: parsedFrom.address,
+        subject,
+        text: plainText,
+        html,
+        otp,
+        seen: false,
+        createdAt,
+      });
+      storedIds.push(msgId);
+    }
+
+    res.status(200).json({
+      received: true,
+      domain: CUSTOM_EMAIL_DOMAIN,
+      recipients,
+      messageIds: storedIds,
+    });
+  }
+
+  app.post('/api/email/inbound', (req, res) => {
+    void handleInboundEmailWebhook(req, res);
+  });
+
+  app.post('/api/email/inbound/:secret', (req, res) => {
+    void handleInboundEmailWebhook(req, res);
+  });
+
+  async function verifyMailboxRequest(req: express.Request): Promise<string | null> {
     const auth = req.headers.authorization || '';
     const token = auth.replace(/^Bearer\s+/i, '').trim();
-    const provider = String(req.headers['x-email-provider'] || 'mailtm').toLowerCase();
-    const emailAddress = String(req.headers['x-email-address'] || '').trim();
+    const emailAddress = String(req.headers['x-email-address'] || '')
+      .trim()
+      .toLowerCase();
 
-    if (!token && !emailAddress) {
-      res.status(401).json({ error: 'Missing email token' });
+    if (!emailAddress || !emailAddress.endsWith(`@${CUSTOM_EMAIL_DOMAIN}`)) {
+      return null;
+    }
+
+    const reg = await findMailboxRecord(emailAddress);
+    if (reg) {
+      if (!token || reg.token !== token) {
+        return null;
+      }
+      return reg.address;
+    }
+
+    // Require non-empty token when checking an inbox
+    return token ? emailAddress : null;
+  }
+
+  app.get('/api/email/messages', async (req, res) => {
+    const verifiedAddress = await verifyMailboxRequest(req);
+    if (!verifiedAddress) {
+      res.status(401).json({ error: `Sign in or create an @${CUSTOM_EMAIL_DOMAIN} mailbox to read emails.` });
       return;
     }
 
     try {
-      if (provider === 'tempmailio') {
-        if (!emailAddress) throw new Error('Missing email address');
-        const response = await fetch(
-          `https://api.internal.temp-mail.io/api/v3/email/${encodeURIComponent(emailAddress)}/messages`,
-          { headers: { Accept: 'application/json', 'User-Agent': USER_AGENT }, signal: AbortSignal.timeout(5000) }
-        );
-        if (response.status === 400 || response.status === 404) {
-          res.json({ messages: [] });
-          return;
-        }
-        if (!response.ok) throw new Error(`Inbox error (${response.status})`);
-        const rawList = (await response.json()) as Array<{
-          id: string;
-          from: string;
-          to: string;
-          subject: string;
-          body_text?: string;
-          body_html?: string;
-          created_at?: string;
-        }>;
-        const list = (Array.isArray(rawList) ? rawList : []).map((msg) => {
-          const subject = msg.subject || '(No subject)';
-          const body = msg.body_text || stripTags(msg.body_html || '');
-          return {
-            id: String(msg.id),
-            fromName: msg.from || 'Unknown sender',
-            fromAddress: msg.from || '',
-            subject,
-            intro: body.slice(0, 180),
-            seen: false,
-            createdAt: msg.created_at || new Date().toISOString(),
-            otp: extractOtpCode(`${subject} ${body}`),
-          };
-        });
-        res.json({ messages: list });
-        return;
-      }
-
-      if (provider === 'tempmail') {
-        const response = await fetch(
-          `https://api.tempmail.lol/v2/inbox?token=${encodeURIComponent(token)}`,
-          { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(7000) }
-        );
-        if (!response.ok) throw new Error('TempMail inbox error');
-        const json = (await response.json()) as {
-          emails?: Array<{ from: string; to: string; subject: string; body: string; html?: string; date: number }>;
-        };
-        const list = (json.emails || []).map((msg, idx) => {
-          const subject = msg.subject || '(No subject)';
-          const body = msg.body || stripTags(msg.html || '');
-          return {
-            id: `tm-${idx}-${msg.date}`,
-            fromName: msg.from || 'Unknown sender',
-            fromAddress: msg.from || '',
-            subject,
-            intro: body.slice(0, 160),
-            body,
-            html: msg.html || '',
-            seen: false,
-            createdAt: msg.date ? new Date(msg.date).toISOString() : new Date().toISOString(),
-            otp: extractOtpCode(`${subject} ${body}`),
-          };
-        });
-        res.json({ messages: list });
-        return;
-      }
-
-      if (provider === 'guerrilla') {
-        const response = await fetch(
-          `https://api.guerrillamail.com/ajax.php?f=get_email_list&offset=0&sid_token=${encodeURIComponent(token)}`,
-          { headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' }, signal: AbortSignal.timeout(7000) }
-        );
-        if (!response.ok) throw new Error('GuerrillaMail inbox error');
-        const json = (await response.json()) as {
-          list?: Array<{
-            mail_id: string;
-            mail_from: string;
-            mail_subject: string;
-            mail_excerpt: string;
-            mail_timestamp: string;
-            mail_read: string;
-          }>;
-        };
-        const list = (json.list || []).map((msg) => {
-          const subject = msg.mail_subject || '(No subject)';
-          const intro = stripTags(msg.mail_excerpt || '');
-          const ts = Number(msg.mail_timestamp)
-            ? new Date(Number(msg.mail_timestamp) * 1000).toISOString()
-            : new Date().toISOString();
-          return {
-            id: String(msg.mail_id),
-            fromName: msg.mail_from || 'Unknown sender',
-            fromAddress: msg.mail_from || '',
-            subject,
-            intro,
-            seen: msg.mail_read === '1',
-            createdAt: ts,
-            otp: extractOtpCode(`${subject} ${intro}`),
-          };
-        });
-        res.json({ messages: list });
-        return;
-      }
-
-      const response = await fetch('https://api.mail.tm/messages?page=1', {
-        headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
-        signal: AbortSignal.timeout(7000),
-      });
-      if (!response.ok) {
-        res.status(response.status).json({ error: 'Could not read inbox' });
-        return;
-      }
-      const json = (await response.json()) as
-        | { 'hydra:member'?: Array<Record<string, unknown>> }
-        | Array<Record<string, unknown>>;
-      const rawList = Array.isArray(json) ? json : json['hydra:member'] || [];
-
-      const messages = rawList.map((msg) => {
-        const subject = String(msg.subject || '(No subject)');
-        const intro = String(msg.intro || '');
-        const fromObj = msg.from as { address?: string; name?: string } | undefined;
-        return {
-          id: String(msg.id || ''),
-          fromName: fromObj?.name || fromObj?.address || 'Unknown sender',
-          fromAddress: fromObj?.address || '',
-          subject,
-          intro,
-          seen: Boolean(msg.seen),
-          createdAt: String(msg.createdAt || new Date().toISOString()),
-          otp: extractOtpCode(`${subject} ${intro}`),
-        };
-      });
-
+      const rows = await listInboxMessages(verifiedAddress);
+      const messages = rows.map((m) => ({
+        id: m.id,
+        fromName: m.fromName,
+        fromAddress: m.fromAddress,
+        subject: m.subject,
+        intro: m.text.slice(0, 180),
+        seen: m.seen,
+        createdAt: m.createdAt,
+        otp: m.otp,
+      }));
       res.json({ messages });
     } catch (error) {
       res.status(502).json({
@@ -2998,178 +3026,49 @@ export function createApiApp() {
   });
 
   app.get('/api/email/messages/:id', async (req, res) => {
-    const auth = req.headers.authorization || '';
-    const token = auth.replace(/^Bearer\s+/i, '').trim();
-    const provider = String(req.headers['x-email-provider'] || 'mailtm').toLowerCase();
-    const emailAddress = String(req.headers['x-email-address'] || '').trim();
-
-    if (!token && !emailAddress) {
-      res.status(401).json({ error: 'Missing email token' });
+    const verifiedAddress = await verifyMailboxRequest(req);
+    if (!verifiedAddress) {
+      res.status(401).json({ error: 'Unauthorized mailbox request' });
       return;
     }
 
     try {
-      if (provider === 'tempmailio') {
-        if (!emailAddress) throw new Error('Missing email address');
-        const response = await fetch(
-          `https://api.internal.temp-mail.io/api/v3/email/${encodeURIComponent(emailAddress)}/messages`,
-          { headers: { Accept: 'application/json', 'User-Agent': USER_AGENT }, signal: AbortSignal.timeout(6000) }
-        );
-        if (!response.ok) throw new Error('Could not load message');
-        const rawList = (await response.json()) as Array<{
-          id: string;
-          from: string;
-          subject: string;
-          body_text?: string;
-          body_html?: string;
-          created_at?: string;
-        }>;
-        const found = (Array.isArray(rawList) ? rawList : []).find(
-          (m) => String(m.id) === req.params.id
-        );
-        if (!found) {
-          res.status(404).json({ error: 'Email not found' });
-          return;
-        }
-        const plain = found.body_text || stripTags(found.body_html || '');
-        res.json({
-          id: String(found.id),
-          fromName: found.from || 'Unknown sender',
-          fromAddress: found.from || '',
-          subject: found.subject || '(No subject)',
-          text: plain,
-          html: found.body_html || '',
-          createdAt: found.created_at || new Date().toISOString(),
-          otp: extractOtpCode(`${found.subject || ''} ${plain}`),
-        });
+      const found = await findInboxMessage(verifiedAddress, req.params.id);
+      if (!found) {
+        res.status(404).json({ error: 'Email not found' });
         return;
       }
-
-      if (provider === 'guerrilla') {
-        const response = await fetch(
-          `https://api.guerrillamail.com/ajax.php?f=fetch_email&email_id=${encodeURIComponent(req.params.id)}&sid_token=${encodeURIComponent(token)}`,
-          { headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' }, signal: AbortSignal.timeout(7000) }
-        );
-        if (!response.ok) throw new Error('Could not load GuerrillaMail message');
-        const msg = (await response.json()) as {
-          mail_id: string;
-          mail_from: string;
-          mail_subject: string;
-          mail_body: string;
-          mail_timestamp: string;
-        };
-        const plain = stripTags(msg.mail_body || '');
-        res.json({
-          id: String(msg.mail_id),
-          fromName: msg.mail_from || 'Unknown sender',
-          fromAddress: msg.mail_from || '',
-          subject: msg.mail_subject || '(No subject)',
-          text: plain,
-          html: msg.mail_body || '',
-          createdAt: Number(msg.mail_timestamp)
-            ? new Date(Number(msg.mail_timestamp) * 1000).toISOString()
-            : new Date().toISOString(),
-          otp: extractOtpCode(`${msg.mail_subject || ''} ${plain}`),
-        });
-        return;
-      }
-
-      if (provider === 'tempmail') {
-        const response = await fetch(
-          `https://api.tempmail.lol/v2/inbox?token=${encodeURIComponent(token)}`,
-          { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(7000) }
-        );
-        const json = (await response.json()) as {
-          emails?: Array<{ from: string; subject: string; body: string; html?: string; date: number }>;
-        };
-        const found = (json.emails || []).find((m, idx) => `tm-${idx}-${m.date}` === req.params.id);
-        if (!found) {
-          res.status(404).json({ error: 'Email not found' });
-          return;
-        }
-        const plain = found.body || stripTags(found.html || '');
-        res.json({
-          id: req.params.id,
-          fromName: found.from || 'Unknown sender',
-          fromAddress: found.from || '',
-          subject: found.subject || '(No subject)',
-          text: plain,
-          html: found.html || '',
-          createdAt: found.date ? new Date(found.date).toISOString() : new Date().toISOString(),
-          otp: extractOtpCode(`${found.subject || ''} ${plain}`),
-        });
-        return;
-      }
-
-      const response = await fetch(`https://api.mail.tm/messages/${encodeURIComponent(req.params.id)}`, {
-        headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
-        signal: AbortSignal.timeout(7000),
-      });
-      if (!response.ok) {
-        res.status(response.status).json({ error: 'Could not load message' });
-        return;
-      }
-      const msg = (await response.json()) as Record<string, unknown>;
-      const fromObj = msg.from as { address?: string; name?: string } | undefined;
-      const text = String(msg.text || '');
-      const htmlArr = Array.isArray(msg.html) ? msg.html : [];
-      const htmlString = htmlArr.join('\n');
-      const subject = String(msg.subject || '(No subject)');
-      const plainFallback = text || stripTags(htmlString);
-
       res.json({
-        id: String(msg.id || ''),
-        fromName: fromObj?.name || fromObj?.address || 'Unknown sender',
-        fromAddress: fromObj?.address || '',
-        subject,
-        text: plainFallback,
-        html: htmlString,
-        createdAt: String(msg.createdAt || new Date().toISOString()),
-        otp: extractOtpCode(`${subject} ${plainFallback}`),
+        id: found.id,
+        fromName: found.fromName,
+        fromAddress: found.fromAddress,
+        subject: found.subject,
+        text: found.text,
+        html: found.html,
+        createdAt: found.createdAt,
+        otp: found.otp,
       });
     } catch (error) {
-      res.status(502).json({ error: error instanceof Error ? error.message : 'Failed to load message' });
+      res.status(502).json({
+        error: error instanceof Error ? error.message : 'Failed to load message',
+      });
     }
   });
 
   app.delete('/api/email/messages/:id', async (req, res) => {
-    const auth = req.headers.authorization || '';
-    const token = auth.replace(/^Bearer\s+/i, '').trim();
-    const provider = String(req.headers['x-email-provider'] || 'mailtm').toLowerCase();
-    const emailAddress = String(req.headers['x-email-address'] || '').trim();
-
-    if (!token && !(provider === 'tempmailio' && emailAddress)) {
-      res.status(401).json({ error: 'Missing email token' });
-      return;
-    }
-
-    if (provider === 'tempmailio') {
-      try {
-        await fetch(
-          `https://api.internal.temp-mail.io/api/v3/message/${encodeURIComponent(req.params.id)}`,
-          { method: 'DELETE', headers: { 'User-Agent': USER_AGENT }, signal: AbortSignal.timeout(5000) }
-        );
-      } catch {
-        // Ignore if already expired
-      }
-      res.json({ deleted: true });
-      return;
-    }
-
-    if (provider !== 'mailtm') {
-      res.json({ deleted: true });
+    const verifiedAddress = await verifyMailboxRequest(req);
+    if (!verifiedAddress) {
+      res.status(401).json({ error: 'Unauthorized mailbox request' });
       return;
     }
 
     try {
-      const response = await fetch(`https://api.mail.tm/messages/${encodeURIComponent(req.params.id)}`, {
-        method: 'DELETE',
-        headers: { Authorization: `Bearer ${token}` },
-        signal: AbortSignal.timeout(7000),
-      });
-      res.status(response.ok ? 200 : response.status).json({ deleted: response.ok });
+      await deleteInboxMessageById(verifiedAddress, req.params.id);
+      res.json({ deleted: true });
     } catch (error) {
-      res.status(502).json({ error: error instanceof Error ? error.message : 'Delete failed' });
+      res.status(502).json({
+        error: error instanceof Error ? error.message : 'Delete failed',
+      });
     }
   });
 
@@ -4910,8 +4809,8 @@ export function createApiApp() {
 You help users with both general questions/conversation, analyzing uploaded photos, AND knowing when they want to generate an image.
 
 About the VeriBox app (answer accurately when asked):
-- Home tab: Instant disposable temporary emails with live auto-refresh inbox and 1-click verification code copy. Users get 5 free generated emails every day (resets automatically tomorrow). Deleting an email from Home moves it safely so users can recover it later with its password.
-- Create tab: Create a custom password-protected VeriBox Mail account (Personal use, Work/business, or High-privacy stealth) by entering First & Second Name, Birthday, choosing a personalized email address (₦50 fee from Naira wallet), setting a password, and confirming terms. Returning users can also sign in with an existing or deleted email + password for free.
+- Home tab: Active custom @${CUSTOM_EMAIL_DOMAIN} inbox with live auto-refresh, 1-click verification code copy, switching between created addresses, and safe removal from Home (recoverable anytime with its password).
+- Create tab: Create a custom password-protected @${CUSTOM_EMAIL_DOMAIN} email address (Personal use, Work/business, or High-privacy stealth) by entering First & Second Name, Birthday, choosing a suggested or custom username@${CUSTOM_EMAIL_DOMAIN} (₦50 fee from Naira wallet), setting a password, and confirming terms. Returning users can also sign in with an existing or deleted @${CUSTOM_EMAIL_DOMAIN} email + password for free.
 - Numbers tab: Dedicated verification phone numbers powered by Grizzly SMS and 5sim across 200+ countries (A–Z and Lowest Price views) for WhatsApp, Telegram, TikTok, Instagram, Google, Facebook, X/Twitter, PayPal, and more. Receives OTPs in real time and automatically refunds the full Naira amount if cancelled or expired before an SMS arrives.
 - VeriBox AI (Images tab): Normal AI chat assistant, uploaded photo analyzer, and unlimited 100% free AI image generator.
 - Wallet & Profile: Real Naira wallet funded via Paystack, saved numbers, OTP clipboard history, and theme settings.

@@ -11,16 +11,15 @@ export type PlatformFilter =
 
 export type AccountMode = 'personal' | 'business' | 'privacy';
 
-export type EmailProviderId = 'auto' | 'tempmailio' | 'mailtm' | 'tempmail' | 'guerrilla';
+export type EmailProviderId = 'veribox';
 
 export interface EmailSuggestionOption {
   id: string;
   address: string;
   username: string;
   domain: string;
-  provider: 'tempmailio' | 'mailtm' | 'guerrilla' | 'tempmail';
+  provider: 'veribox';
   providerLabel: string;
-  precreatedToken?: string;
 }
 
 export interface PhoneNumberEntry {
@@ -76,7 +75,8 @@ export interface TempEmailAccount {
   address: string;
   password: string;
   token: string;
-  provider: 'tempmailio' | 'mailtm' | 'tempmail' | 'guerrilla';
+  provider: 'veribox';
+  domain?: string;
   createdAt: string;
   accountMode?: AccountMode;
   displayName?: string;

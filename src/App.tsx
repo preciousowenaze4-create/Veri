@@ -581,6 +581,8 @@ export default function App() {
         return [...data.orders!, ...prev.filter((o) => !existingIds.has(o.id))].slice(0, 50);
       });
       setNumbersViewMode('receiver');
+      // Immediately kick off a check on acquired numbers so incoming codes show with zero delay
+      void handleCheckOrder(data.orders[0].id, data.orders[0].provider || 'fivesim');
       showToast(
         data.orders.length === 1
           ? `Assigned ${data.orders[0].phone} (₦${actualChargedNgn.toLocaleString()} deducted)`
@@ -769,30 +771,45 @@ export default function App() {
     syncOrderIntoState,
   ]);
 
-  // Automatic polling fallback when SSE disconnects (e.g. serverless deployments)
+  // Fast, zero-lag 2-second polling for active number codes (works seamlessly on Vercel & mobile)
   useEffect(() => {
     if (
       activeTab !== 'numbers' ||
       numbersViewMode !== 'receiver' ||
       !selectedOrder ||
-      streamConnected ||
       ['FINISHED', 'CANCELED', 'TIMEOUT', 'BANNED'].includes(selectedOrder.status)
     ) {
       return;
     }
 
-    const timer = window.setInterval(() => {
-      void handleCheckOrder(selectedOrder.id, selectedOrder.provider || 'fivesim');
-    }, 3500);
+    let cancelled = false;
+    let inFlight = false;
 
-    return () => window.clearInterval(timer);
+    const pollNow = async () => {
+      if (cancelled || inFlight) return;
+      inFlight = true;
+      try {
+        await handleCheckOrder(selectedOrder.id, selectedOrder.provider || 'fivesim');
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    void pollNow();
+    const timer = window.setInterval(() => {
+      void pollNow();
+    }, 2000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
   }, [
     activeTab,
     numbersViewMode,
     selectedOrder?.id,
     selectedOrder?.provider,
     selectedOrder?.status,
-    streamConnected,
     handleCheckOrder,
   ]);
 

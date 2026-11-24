@@ -72,7 +72,7 @@ interface SmsTabProps {
   ) => void;
 }
 
-const QUANTITY_OPTIONS = [1, 2, 3, 4, 5];
+const QUANTITY_OPTIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
 const CURRENCY_SYMBOLS: Record<string, string> = {
   USD: '$',
@@ -91,6 +91,17 @@ function formatPrice(amount?: number, currency = 'NGN'): string {
   }
   const formatted = amount >= 0.01 ? amount.toFixed(2) : amount.toFixed(3);
   return `${symbol}${formatted}`;
+}
+
+function formatUsdCompact(amount?: number): string {
+  if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) return '';
+  if (amount >= 1) return `$${amount.toFixed(2)}`;
+  const three = Number(amount.toFixed(3));
+  const two = Number(amount.toFixed(2));
+  if (Math.abs(three - two) >= 0.0009 && three > 0) {
+    return `$${three.toFixed(3)}`;
+  }
+  return `$${amount >= 0.01 ? amount.toFixed(2) : amount.toFixed(3)}`;
 }
 
 function formatStock(count?: number): string {
@@ -184,7 +195,7 @@ export function SmsTab({
 
   const lowestCountryPrice = useMemo(() => {
     const prices = countries
-      .map((c) => c.minPrice || 0)
+      .map((c) => c.inStockMinPrice || c.minPrice || 0)
       .filter((p) => p > 0);
     return prices.length > 0 ? Math.min(...prices) : 0;
   }, [countries]);
@@ -482,15 +493,18 @@ export function SmsTab({
                     )}
                   </div>
 
-                  <div className="flex items-center gap-2 shrink-0">
-                    {!countriesLoading && selectedCountry?.minPrice ? (
-                      <div className="flex flex-col items-end">
-                        <span className="font-mono text-xs font-extrabold text-[#8A6208] tabular-nums dark:text-[#F5D77A]">
-                          {formatPrice(selectedCountry.minPrice, selectedCountry.currency)}
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    {!countriesLoading && (selectedCountry?.inStockMinPrice || selectedCountry?.minPrice) ? (
+                      <div className="flex flex-col items-end leading-tight">
+                        <span className="font-mono text-[11px] font-extrabold text-[#8A6208] tabular-nums dark:text-[#F5D77A]">
+                          {formatPrice(
+                            selectedCountry.inStockMinPrice || selectedCountry.minPrice,
+                            selectedCountry.currency
+                          )}
                         </span>
-                        {selectedCountry.rawPriceUsd ? (
-                          <span className="text-[10px] text-[#8A7F6A] tabular-nums dark:text-[#A89F8C]">
-                            ≈ ${selectedCountry.rawPriceUsd.toFixed(2)}
+                        {(selectedCountry.inStockPriceUsd || selectedCountry.rawPriceUsd) ? (
+                          <span className="text-[9px] text-[#8A7F6A] tabular-nums dark:text-[#A89F8C]">
+                            ≈ {formatUsdCompact(selectedCountry.inStockPriceUsd || selectedCountry.rawPriceUsd)}
                           </span>
                         ) : null}
                       </div>
@@ -525,7 +539,9 @@ export function SmsTab({
                       ) : (
                         filteredCountries.map((c) => {
                           const isSelected = selectedCountry?.slug === c.slug;
-                          const isLowest = lowestCountryPrice > 0 && c.minPrice === lowestCountryPrice;
+                          const countryDisplayPrice = c.inStockMinPrice || c.minPrice || 0;
+                          const isLowest =
+                            lowestCountryPrice > 0 && countryDisplayPrice === lowestCountryPrice;
                           return (
                             <button
                               key={c.slug}
@@ -558,16 +574,16 @@ export function SmsTab({
                                   </p>
                                 </div>
                               </div>
-                              <div className="flex flex-col items-end shrink-0">
-                                <div className="flex items-center gap-1.5">
-                                  <span className="font-mono text-xs font-extrabold text-[#8A6208] tabular-nums dark:text-[#F5D77A]">
-                                    {formatPrice(c.minPrice, c.currency)}
+                              <div className="flex flex-col items-end shrink-0 leading-tight">
+                                <div className="flex items-center gap-1">
+                                  <span className="font-mono text-[11px] font-extrabold text-[#8A6208] tabular-nums dark:text-[#F5D77A]">
+                                    {formatPrice(c.inStockMinPrice || c.minPrice, c.currency)}
                                   </span>
                                   {isSelected && <Check className="h-3.5 w-3.5 text-[#D4AF37]" />}
                                 </div>
-                                {c.rawPriceUsd ? (
-                                  <span className="text-[10px] text-[#8A7F6A] tabular-nums dark:text-[#A89F8C]">
-                                    ≈ ${c.rawPriceUsd.toFixed(2)}
+                                {(c.inStockPriceUsd || c.rawPriceUsd) ? (
+                                  <span className="text-[9px] text-[#8A7F6A] tabular-nums dark:text-[#A89F8C]">
+                                    ≈ {formatUsdCompact(c.inStockPriceUsd || c.rawPriceUsd)}
                                   </span>
                                 ) : null}
                               </div>
@@ -657,7 +673,7 @@ export function SmsTab({
                       </span>
                     </div>
 
-                    <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+                    <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
                       {twoOptions.map((opt) => {
                         const q = opt.quote;
                         const isSelected = Boolean(
@@ -677,7 +693,7 @@ export function SmsTab({
                             onClick={() => {
                               if (q) onSelectProviderQuote(q);
                             }}
-                            className={`flex flex-col justify-between gap-2 rounded-2xl border p-3.5 text-left transition-all ${
+                            className={`flex flex-col justify-between gap-2 rounded-2xl border p-3 text-left transition-all ${
                               !q
                                 ? 'cursor-not-allowed border-[#D4AF37]/15 bg-[#FAF7F0]/50 opacity-60 dark:bg-[#0B0A07]/60'
                                 : isSelected
@@ -688,42 +704,42 @@ export function SmsTab({
                             <div className="flex items-start justify-between gap-2">
                               <div className="min-w-0">
                                 <div className="flex flex-wrap items-center gap-1.5">
-                                  <span className="text-sm font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
+                                  <span className="text-xs font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
                                     {opt.label}
                                   </span>
                                   {isCheapest && (
-                                    <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-extrabold text-emerald-700 dark:text-emerald-300">
+                                    <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[9.5px] font-extrabold text-emerald-700 dark:text-emerald-300">
                                       Lowest
                                     </span>
                                   )}
                                 </div>
-                                <p className="mt-0.5 text-[11px] text-[#6E6552] dark:text-[#A89F8C]">
+                                <p className="mt-0.5 text-[10.5px] text-[#6E6552] dark:text-[#A89F8C]">
                                   {opt.subtitle}
                                 </p>
                               </div>
                               {isSelected && (
-                                <Check className="h-4 w-4 shrink-0 text-[#D4AF37]" />
+                                <Check className="h-3.5 w-3.5 shrink-0 text-[#D4AF37]" />
                               )}
                             </div>
 
                             {q ? (
-                              <div className="flex items-end justify-between gap-2 border-t border-[#D4AF37]/15 pt-2">
-                                <div>
-                                  <p className="font-mono text-base font-extrabold text-[#8A6208] tabular-nums dark:text-[#F5D77A]">
+                              <div className="flex items-center justify-between gap-2 border-t border-[#D4AF37]/15 pt-2">
+                                <div className="flex items-baseline gap-1.5">
+                                  <span className="font-mono text-xs font-extrabold text-[#8A6208] tabular-nums dark:text-[#F5D77A]">
                                     {formatPrice(q.inStockMinPrice || q.minPrice, 'NGN')}
-                                  </p>
+                                  </span>
                                   {unitUsd > 0 && (
-                                    <p className="text-[10px] text-[#8A7F6A] tabular-nums dark:text-[#A89F8C]">
-                                      ≈ ${unitUsd >= 0.01 ? unitUsd.toFixed(2) : unitUsd.toFixed(3)}
-                                    </p>
+                                    <span className="text-[10px] text-[#8A7F6A] tabular-nums dark:text-[#A89F8C]">
+                                      ({formatUsdCompact(unitUsd)})
+                                    </span>
                                   )}
                                 </div>
                                 <div className="text-right">
-                                  <p className="font-mono text-[11px] font-semibold text-[#6E6552] tabular-nums dark:text-[#A89F8C]">
+                                  <p className="font-mono text-[10px] font-semibold text-[#6E6552] tabular-nums dark:text-[#A89F8C]">
                                     {formatStock(q.stockCount)} avail
                                   </p>
                                   {!q.configured && (
-                                    <p className="text-[10px] font-bold text-amber-600 dark:text-amber-300">
+                                    <p className="text-[9.5px] font-bold text-amber-600 dark:text-amber-300">
                                       Add {opt.envVar}
                                     </p>
                                   )}
@@ -754,20 +770,20 @@ export function SmsTab({
                         setAppDropdownOpen(false);
                         setCountryDropdownOpen(false);
                       }}
-                      className="flex h-12 w-full items-center justify-between gap-3 rounded-xl border border-[#D4AF37]/35 bg-[#FAF7F0] px-4 text-left text-sm font-bold text-[#1A160D] transition-colors hover:border-[#D4AF37] dark:bg-[#0B0A07] dark:text-[#FAF6EC]"
+                      className="flex h-11 w-full items-center justify-between gap-3 rounded-xl border border-[#D4AF37]/35 bg-[#FAF7F0] px-3.5 text-left text-xs font-bold text-[#1A160D] transition-colors hover:border-[#D4AF37] dark:bg-[#0B0A07] dark:text-[#FAF6EC]"
                     >
                       <span>
                         {quantity} {quantity === 1 ? 'Number' : 'Numbers'}
                       </span>
-                      <div className="flex items-center gap-2 shrink-0">
+                      <div className="flex items-center gap-1.5 shrink-0">
                         {checkoutUnitNgn ? (
-                          <div className="flex flex-col items-end">
-                            <span className="font-mono text-xs font-extrabold text-[#8A6208] tabular-nums dark:text-[#F5D77A]">
+                          <div className="flex items-baseline gap-1.5">
+                            <span className="font-mono text-[11px] font-extrabold text-[#8A6208] tabular-nums dark:text-[#F5D77A]">
                               {formatPrice(checkoutUnitNgn * quantity, selectedCountry.currency)}
                             </span>
                             {checkoutUnitUsd ? (
-                              <span className="text-[10px] text-[#8A7F6A] tabular-nums dark:text-[#A89F8C]">
-                                ≈ ${(checkoutUnitUsd * quantity).toFixed(2)}
+                              <span className="text-[9.5px] text-[#8A7F6A] tabular-nums dark:text-[#A89F8C]">
+                                ({formatUsdCompact(checkoutUnitUsd * quantity)})
                               </span>
                             ) : null}
                           </div>
@@ -781,41 +797,46 @@ export function SmsTab({
                     </button>
 
                     {qtyDropdownOpen && (
-                      <div className="absolute left-0 right-0 z-40 mt-1.5 overflow-hidden rounded-2xl border border-[#D4AF37]/35 bg-white p-1.5 shadow-2xl dark:bg-[#14120D]">
-                        {QUANTITY_OPTIONS.map((num) => (
-                          <button
-                            key={num}
-                            type="button"
-                            onClick={() => {
-                              onChangeQuantity(num);
-                              setQtyDropdownOpen(false);
-                            }}
-                            className={`flex min-h-[44px] w-full items-center justify-between rounded-xl px-3.5 py-2 text-left text-xs font-bold transition-colors ${
-                              quantity === num
-                                ? 'bg-[#D4AF37]/20 text-[#1A160D] dark:text-[#F5D77A]'
-                                : 'text-[#3E3522] hover:bg-[#D4AF37]/10 dark:text-[#EAE2CF]'
-                            }`}
-                          >
-                            <span>
-                              {num} {num === 1 ? 'Number' : 'Numbers'}
-                            </span>
-                            <div className="flex items-center gap-2">
-                              {checkoutUnitNgn ? (
-                                <div className="flex flex-col items-end">
-                                  <span className="font-mono text-xs font-bold text-[#8A6208] tabular-nums dark:text-[#F5D77A]">
-                                    {formatPrice(checkoutUnitNgn * num, selectedCountry.currency)}
-                                  </span>
-                                  {checkoutUnitUsd ? (
-                                    <span className="text-[10px] text-[#8A7F6A] tabular-nums dark:text-[#A89F8C]">
-                                      ≈ ${(checkoutUnitUsd * num).toFixed(2)}
+                      <div className="absolute bottom-full left-0 right-0 z-50 mb-1.5 overflow-hidden rounded-2xl border border-[#D4AF37]/40 bg-white shadow-2xl dark:bg-[#14120D]">
+                        <div className="border-b border-[#D4AF37]/15 px-3 py-1.5 text-[10px] font-bold text-[#8A7F6A] dark:text-[#A89F8C]">
+                          Scroll to select 1–10 numbers
+                        </div>
+                        <div className="max-h-60 overflow-y-auto overscroll-contain p-1.5 space-y-0.5">
+                          {QUANTITY_OPTIONS.map((num) => (
+                            <button
+                              key={num}
+                              type="button"
+                              onClick={() => {
+                                onChangeQuantity(num);
+                                setQtyDropdownOpen(false);
+                              }}
+                              className={`flex min-h-[40px] w-full items-center justify-between rounded-xl px-3 py-1.5 text-left text-xs font-bold transition-colors ${
+                                quantity === num
+                                  ? 'bg-[#D4AF37]/20 text-[#1A160D] dark:text-[#F5D77A]'
+                                  : 'text-[#3E3522] hover:bg-[#D4AF37]/10 dark:text-[#EAE2CF]'
+                              }`}
+                            >
+                              <span>
+                                {num} {num === 1 ? 'Number' : 'Numbers'}
+                              </span>
+                              <div className="flex items-center gap-1.5">
+                                {checkoutUnitNgn ? (
+                                  <div className="flex items-baseline gap-1">
+                                    <span className="font-mono text-[11px] font-bold text-[#8A6208] tabular-nums dark:text-[#F5D77A]">
+                                      {formatPrice(checkoutUnitNgn * num, selectedCountry.currency)}
                                     </span>
-                                  ) : null}
-                                </div>
-                              ) : null}
-                              {quantity === num && <Check className="h-3.5 w-3.5 text-[#D4AF37]" />}
-                            </div>
-                          </button>
-                        ))}
+                                    {checkoutUnitUsd ? (
+                                      <span className="text-[9.5px] text-[#8A7F6A] tabular-nums dark:text-[#A89F8C]">
+                                        ({formatUsdCompact(checkoutUnitUsd * num)})
+                                      </span>
+                                    ) : null}
+                                  </div>
+                                ) : null}
+                                {quantity === num && <Check className="h-3.5 w-3.5 text-[#D4AF37]" />}
+                              </div>
+                            </button>
+                          ))}
+                        </div>
                       </div>
                     )}
                   </div>
@@ -929,7 +950,7 @@ export function SmsTab({
                               </span>
                               {order.rawPriceUsd ? (
                                 <span className="text-[10px] text-[#8A7F6A] tabular-nums dark:text-[#A89F8C]">
-                                  (${order.rawPriceUsd.toFixed(2)})
+                                  ({formatUsdCompact(order.rawPriceUsd)})
                                 </span>
                               ) : null}
                             </>

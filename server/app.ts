@@ -956,8 +956,9 @@ function normalizeServiceSlug(platform: string): string {
 
 function roundUnitPrice(amount: number): number {
   if (!Number.isFinite(amount) || amount <= 0) return 0;
-  if (amount >= 0.01) return Math.round(amount * 100) / 100;
-  return Math.round(amount * 1000) / 1000;
+  if (amount >= 1) return Math.round(amount * 100) / 100;
+  if (amount >= 0.01) return Math.round(amount * 1000) / 1000;
+  return Math.round(amount * 10000) / 10000;
 }
 
 interface ExchangeRates {
@@ -1183,6 +1184,12 @@ async function getFiveSimCountriesForPlatform(
       `https://5sim.net/v1/guest/prices?product=${encodeURIComponent(product)}`,
       { headers: priceHeaders, signal: AbortSignal.timeout(8000) }
     );
+    if ((first.status === 401 || first.status === 403) && priceHeaders.Authorization) {
+      return fetch(`https://5sim.net/v1/guest/prices?product=${encodeURIComponent(product)}`, {
+        headers: { Accept: 'application/json', 'User-Agent': USER_AGENT },
+        signal: AbortSignal.timeout(8000),
+      });
+    }
     if (first.status === 429) {
       await new Promise((r) => setTimeout(r, 700));
       return fetch(`https://5sim.net/v1/guest/prices?product=${encodeURIComponent(product)}`, {
@@ -1935,8 +1942,8 @@ async function getUnifiedCountriesForPlatform(
         country: c.country === 'England' ? 'United Kingdom (England)' : c.country,
         countryCode: c.countryCode,
         dialCode: c.dialCode,
-        minPrice: minNgn,
-        rawPriceUsd: c.minPrice,
+        minPrice: inStockNgn,
+        rawPriceUsd: inStockUsd,
         inStockMinPrice: inStockNgn,
         inStockPriceUsd: inStockUsd,
         currency: 'NGN',
@@ -1946,11 +1953,9 @@ async function getUnifiedCountriesForPlatform(
     } else {
       existing.providers.push(quote);
       existing.stockCount += c.stockCount;
-      if (minNgn > 0 && (existing.minPrice <= 0 || minNgn < existing.minPrice)) {
-        existing.minPrice = minNgn;
-        existing.rawPriceUsd = c.minPrice;
-      }
       if (inStockNgn > 0 && (existing.inStockMinPrice <= 0 || inStockNgn < existing.inStockMinPrice)) {
+        existing.minPrice = inStockNgn;
+        existing.rawPriceUsd = inStockUsd;
         existing.inStockMinPrice = inStockNgn;
         existing.inStockPriceUsd = inStockUsd;
       }
@@ -1991,11 +1996,9 @@ async function getUnifiedCountriesForPlatform(
       if (!alreadyHasGrizzly) {
         existing.providers.push(quote);
         existing.stockCount += g.stockCount;
-        if (minNgn > 0 && (existing.minPrice <= 0 || minNgn < existing.minPrice)) {
+        if (inStockNgnMore(existing.inStockMinPrice, minNgn)) {
           existing.minPrice = minNgn;
           existing.rawPriceUsd = g.minPriceUsd;
-        }
-        if (inStockNgnMore(existing.inStockMinPrice, minNgn)) {
           existing.inStockMinPrice = minNgn;
           existing.inStockPriceUsd = g.minPriceUsd;
         }
@@ -3142,7 +3145,7 @@ export function createApiApp() {
       typeof req.body?.countryName === 'string' ? req.body.countryName : '';
     const countryCodeHint =
       typeof req.body?.countryCode === 'string' ? req.body.countryCode.toUpperCase() : undefined;
-    const quantity = Math.min(5, Math.max(1, Number(req.body?.quantity || 1) || 1));
+    const quantity = Math.min(10, Math.max(1, Number(req.body?.quantity || 1) || 1));
     const clientWalletBalance = Number(req.body?.walletBalance);
 
     // STRICTLY ISOLATED GRIZZLY SMS FLOW

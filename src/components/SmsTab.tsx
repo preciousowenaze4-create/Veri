@@ -15,7 +15,11 @@ import {
   RotateCcw,
   Search,
   Smartphone,
+  Sparkles,
   Trash2,
+  Volume2,
+  VolumeX,
+  Wallet,
   XCircle,
 } from 'lucide-react';
 import type {
@@ -43,6 +47,7 @@ interface SmsTabProps {
   lowestDeals: LowestNumberDeal[];
   lowestDealsLoading: boolean;
   quantity: number;
+  walletBalance?: number;
   activeOrders: PrivateNumberOrder[];
   selectedOrder: PrivateNumberOrder | null;
   acquiring: boolean;
@@ -58,6 +63,7 @@ interface SmsTabProps {
   onRefreshLowestDeals: () => void;
   onRefreshCountries: () => void;
   onChangeQuantity: (qty: number) => void;
+  onOpenDeposit?: () => void;
   onAcquireNumbers: () => void;
   onSelectOrder: (order: PrivateNumberOrder) => void;
   onCheckOrder: (orderId: number) => void;
@@ -111,6 +117,69 @@ function formatStock(count?: number): string {
   return count.toLocaleString();
 }
 
+const POPULAR_QUICK_APPS = [
+  { id: 'whatsapp', label: 'WhatsApp', aliases: ['whatsapp', 'wa'] },
+  { id: 'telegram', label: 'Telegram', aliases: ['telegram', 'tg'] },
+  { id: 'tiktok', label: 'TikTok', aliases: ['tiktok', 'lf'] },
+  { id: 'instagram', label: 'Instagram', aliases: ['instagram', 'ig'] },
+  { id: 'google', label: 'Google', aliases: ['google', 'go', 'gmail'] },
+  { id: 'facebook', label: 'Facebook', aliases: ['facebook', 'fb'] },
+  { id: 'twitter', label: 'X / Twitter', aliases: ['twitter', 'tw', 'x / twitter'] },
+  { id: 'paypal', label: 'PayPal', aliases: ['paypal', 'ts'] },
+];
+
+const SMS_SOUND_PREF_KEY = 'veribox_sms_sound_v1';
+
+function formatExpiryCountdown(
+  expires: string | undefined,
+  nowMs: number
+): { label: string; expired: boolean } | null {
+  if (!expires) return null;
+  const target = Date.parse(expires);
+  if (!Number.isFinite(target)) return null;
+  const diffSec = Math.floor((target - nowMs) / 1000);
+  if (diffSec <= 0) return { label: 'Expired', expired: true };
+  const mins = Math.floor(diffSec / 60);
+  const secs = diffSec % 60;
+  return {
+    label: `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')} left`,
+    expired: false,
+  };
+}
+
+function playSmsArrivalChime(): void {
+  try {
+    const AudioCtx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    const now = ctx.currentTime;
+
+    const playTone = (freq: number, startOffset: number, duration: number) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, now + startOffset);
+      gain.gain.setValueAtTime(0.001, now + startOffset);
+      gain.gain.exponentialRampToValueAtTime(0.14, now + startOffset + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + startOffset + duration);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now + startOffset);
+      osc.stop(now + startOffset + duration + 0.02);
+    };
+
+    playTone(587.33, 0, 0.16); // D5
+    playTone(880.0, 0.14, 0.24); // A5
+    window.setTimeout(() => {
+      void ctx.close().catch(() => {});
+    }, 600);
+  } catch {
+    // Ignore browser autoplay restrictions
+  }
+}
+
 function getProviderLabel(provider?: NumberProviderId): string {
   return provider === 'grizzly' ? 'Grizzly SMS' : '5sim';
 }
@@ -128,6 +197,7 @@ export function SmsTab({
   lowestDeals,
   lowestDealsLoading,
   quantity,
+  walletBalance,
   activeOrders,
   selectedOrder,
   acquiring,
@@ -143,6 +213,7 @@ export function SmsTab({
   onRefreshLowestDeals,
   onRefreshCountries,
   onChangeQuantity,
+  onOpenDeposit,
   onAcquireNumbers,
   onSelectOrder,
   onCheckOrder,
@@ -156,12 +227,26 @@ export function SmsTab({
   const [appSearch, setAppSearch] = useState('');
   const [countryDropdownOpen, setCountryDropdownOpen] = useState(false);
   const [countrySearch, setCountrySearch] = useState('');
+  const [countrySort, setCountrySort] = useState<'az' | 'lowest' | 'instock'>('az');
+  const [showAllDeals, setShowAllDeals] = useState(false);
   const [qtyDropdownOpen, setQtyDropdownOpen] = useState(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [soundEnabled, setSoundEnabled] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(SMS_SOUND_PREF_KEY) !== 'false';
+    } catch {
+      return true;
+    }
+  });
+  const [nowMs, setNowMs] = useState<number>(() => Date.now());
 
   const appRef = useRef<HTMLDivElement | null>(null);
   const countryRef = useRef<HTMLDivElement | null>(null);
   const qtyRef = useRef<HTMLDivElement | null>(null);
+  const prevSmsTrackerRef = useRef<{ orderId: number | null; count: number }>({
+    orderId: null,
+    count: 0,
+  });
 
   useEffect(() => {
     const handleOutside = (e: MouseEvent) => {
@@ -174,6 +259,58 @@ export function SmsTab({
     return () => document.removeEventListener('mousedown', handleOutside);
   }, []);
 
+  useEffect(() => {
+    if (viewMode !== 'receiver' || !selectedOrder?.expires) return;
+    setNowMs(Date.now());
+    const id = window.setInterval(() => {
+      setNowMs(Date.now());
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [viewMode, selectedOrder?.id, selectedOrder?.expires]);
+
+  useEffect(() => {
+    if (!selectedOrder) {
+      prevSmsTrackerRef.current = { orderId: null, count: 0 };
+      return;
+    }
+    const prev = prevSmsTrackerRef.current;
+    const nextCount = selectedOrder.sms.length;
+    if (prev.orderId === selectedOrder.id && nextCount > prev.count && soundEnabled) {
+      playSmsArrivalChime();
+    }
+    prevSmsTrackerRef.current = { orderId: selectedOrder.id, count: nextCount };
+  }, [selectedOrder?.id, selectedOrder?.sms.length, soundEnabled, selectedOrder]);
+
+  const toggleSound = () => {
+    setSoundEnabled((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem(SMS_SOUND_PREF_KEY, String(next));
+      } catch {
+        // Ignore storage error
+      }
+      return next;
+    });
+  };
+
+  const quickPopularApps = useMemo(() => {
+    if (services.length === 0) return [];
+    const matched: NumberServiceOption[] = [];
+    const seen = new Set<string>();
+    for (const preset of POPULAR_QUICK_APPS) {
+      const found = services.find((s) => {
+        const sid = s.id.toLowerCase();
+        const sname = s.name.toLowerCase();
+        return preset.aliases.some((alias) => sid === alias || sname.includes(alias));
+      });
+      if (found && !seen.has(found.id)) {
+        seen.add(found.id);
+        matched.push(found);
+      }
+    }
+    return matched;
+  }, [services]);
+
   const filteredServices = useMemo(() => {
     const q = appSearch.trim().toLowerCase();
     if (!q) return services.slice(0, 120);
@@ -184,14 +321,41 @@ export function SmsTab({
 
   const filteredCountries = useMemo(() => {
     const q = countrySearch.trim().toLowerCase();
-    if (!q) return countries;
-    return countries.filter(
-      (c) =>
-        c.country.toLowerCase().includes(q) ||
-        c.countryCode.toLowerCase().includes(q) ||
-        c.dialCode.includes(q)
+    let list = q
+      ? countries.filter(
+          (c) =>
+            c.country.toLowerCase().includes(q) ||
+            c.countryCode.toLowerCase().includes(q) ||
+            c.dialCode.includes(q)
+        )
+      : [...countries];
+
+    if (countrySort === 'instock') {
+      list = list.filter((c) => (c.stockCount || 0) > 0);
+      list.sort((a, b) => (b.stockCount || 0) - (a.stockCount || 0));
+    } else if (countrySort === 'lowest') {
+      list.sort((a, b) => {
+        const pa = a.minPrice && a.minPrice > 0 ? a.minPrice : Number.MAX_SAFE_INTEGER;
+        const pb = b.minPrice && b.minPrice > 0 ? b.minPrice : Number.MAX_SAFE_INTEGER;
+        return pa - pb || a.country.localeCompare(b.country);
+      });
+    } else {
+      list.sort((a, b) => a.country.localeCompare(b.country));
+    }
+    return list;
+  }, [countries, countrySearch, countrySort]);
+
+  const cheapestCountryOption = useMemo(() => {
+    const priced = countries.filter((c) => (c.minPrice || 0) > 0);
+    if (priced.length === 0) return null;
+    const inStock = priced.filter((c) => (c.stockCount || 0) > 0);
+    const pool = inStock.length > 0 ? inStock : priced;
+    return pool.reduce((best, cur) =>
+      (cur.minPrice || Number.MAX_SAFE_INTEGER) < (best.minPrice || Number.MAX_SAFE_INTEGER)
+        ? cur
+        : best
     );
-  }, [countries, countrySearch]);
+  }, [countries]);
 
   const lowestCountryPrice = useMemo(() => {
     const prices = countries
@@ -319,31 +483,44 @@ export function SmsTab({
                   <span>Scanning lowest country prices...</span>
                 </div>
               ) : (
-                <div className="grid grid-cols-2 gap-2">
-                  {lowestDeals.slice(0, 4).map((deal) => (
-                    <button
-                      key={`${deal.serviceId}-${deal.slug}`}
-                      type="button"
-                      onClick={() => onSelectLowestDeal(deal)}
-                      className="flex items-center justify-between gap-2 rounded-xl border border-[#D4AF37]/25 bg-white px-2.5 py-2 text-left transition-colors hover:border-[#D4AF37] dark:bg-[#14120D]"
-                    >
-                      <div className="flex min-w-0 items-center gap-2">
-                        <AppLogo id={deal.serviceId} name={deal.serviceName} size="sm" />
-                        <div className="min-w-0">
-                          <p className="truncate text-[11px] font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
-                            {deal.serviceName}
-                          </p>
-                          <p className="truncate text-[10px] text-[#6E6552] dark:text-[#A89F8C]">
-                            {deal.country} · {deal.providerName || getProviderLabel(deal.provider)}
-                          </p>
+                <>
+                  <div className="grid grid-cols-2 gap-2">
+                    {lowestDeals.slice(0, showAllDeals ? 8 : 4).map((deal) => (
+                      <button
+                        key={`${deal.serviceId}-${deal.slug}`}
+                        type="button"
+                        onClick={() => onSelectLowestDeal(deal)}
+                        className="flex items-center justify-between gap-2 rounded-xl border border-[#D4AF37]/25 bg-white px-2.5 py-2 text-left transition-colors hover:border-[#D4AF37] dark:bg-[#14120D]"
+                      >
+                        <div className="flex min-w-0 items-center gap-2">
+                          <AppLogo id={deal.serviceId} name={deal.serviceName} size="sm" />
+                          <div className="min-w-0">
+                            <p className="truncate text-[11px] font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
+                              {deal.serviceName}
+                            </p>
+                            <p className="truncate text-[10px] text-[#6E6552] dark:text-[#A89F8C]">
+                              {deal.country} · {deal.providerName || getProviderLabel(deal.provider)}
+                            </p>
+                          </div>
                         </div>
-                      </div>
-                      <span className="shrink-0 font-mono text-xs font-extrabold text-emerald-700 tabular-nums dark:text-emerald-300">
-                        {formatPrice(deal.minPrice, deal.currency)}
-                      </span>
+                        <span className="shrink-0 font-mono text-xs font-extrabold text-emerald-700 tabular-nums dark:text-emerald-300">
+                          {formatPrice(deal.minPrice, deal.currency)}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                  {lowestDeals.length > 4 && (
+                    <button
+                      type="button"
+                      onClick={() => setShowAllDeals((prev) => !prev)}
+                      className="mt-2.5 inline-flex w-full items-center justify-center rounded-xl border border-[#D4AF37]/25 py-1.5 text-[11px] font-bold text-[#8A6208] hover:bg-[#D4AF37]/10 dark:text-[#F5D77A]"
+                    >
+                      {showAllDeals
+                        ? 'Show less'
+                        : `Show more (${Math.min(lowestDeals.length, 8) - 4} more deals)`}
                     </button>
-                  ))}
-                </div>
+                  )}
+                </>
               )}
             </div>
           )}
@@ -431,20 +608,65 @@ export function SmsTab({
                   </div>
                 </div>
               )}
+
+              {/* Quick 1-Tap Popular Apps */}
+              {quickPopularApps.length > 0 && !appDropdownOpen && (
+                <div className="mt-2.5">
+                  <p className="mb-1.5 text-[10.5px] font-bold uppercase tracking-wider text-[#8A7F6A] dark:text-[#A89F8C]">
+                    Popular 1-Tap Apps
+                  </p>
+                  <div className="flex flex-wrap gap-1.5">
+                    {quickPopularApps.map((svc) => {
+                      const active = selectedService?.id === svc.id;
+                      return (
+                        <button
+                          key={`quick-${svc.id}`}
+                          type="button"
+                          onClick={() => {
+                            onSelectService(svc);
+                            setAppDropdownOpen(false);
+                          }}
+                          className={`inline-flex items-center gap-1.5 rounded-xl border px-2.5 py-1.5 text-[11px] font-bold transition-colors ${
+                            active
+                              ? 'border-[#D4AF37] bg-[#D4AF37]/20 text-[#1A160D] dark:text-[#F5D77A]'
+                              : 'border-[#D4AF37]/25 bg-[#FAF7F0] text-[#4F4736] hover:border-[#D4AF37] dark:bg-[#0B0A07] dark:text-[#EAE2CF]'
+                          }`}
+                        >
+                          <AppLogo id={svc.id} name={svc.name} size="sm" />
+                          <span>{svc.name}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* STEP 2: Select Country Dropdown — Sorted strictly A to Z */}
             {selectedService && (
               <div className="relative" ref={countryRef}>
-                <div className="mb-1.5 flex items-center justify-between gap-2">
+                <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2">
                   <label className="block text-xs font-bold text-[#6E6552] dark:text-[#A89F8C]">
                     2. Select Country ({selectedService.name})
                   </label>
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-1.5">
                     {!countriesLoading && countries.length > 0 && (
                       <span className="text-[11px] font-bold text-emerald-700 tabular-nums dark:text-emerald-300">
-                        A–Z · {countries.length} countries
+                        {countries.length} countries
                       </span>
+                    )}
+                    {!countriesLoading && cheapestCountryOption && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          onSelectCountry(cheapestCountryOption);
+                          setCountryDropdownOpen(false);
+                        }}
+                        className="inline-flex items-center gap-1 rounded-lg border border-emerald-500/35 bg-emerald-500/10 px-2 py-0.5 text-[11px] font-extrabold text-emerald-700 hover:bg-emerald-500/20 dark:text-emerald-300"
+                      >
+                        <Sparkles className="h-3 w-3" />
+                        <span>Pick Cheapest</span>
+                      </button>
                     )}
                     <button
                       type="button"
@@ -516,16 +738,38 @@ export function SmsTab({
 
                 {countryDropdownOpen && !countriesLoading && (
                   <div className="absolute left-0 right-0 z-40 mt-1.5 overflow-hidden rounded-2xl border border-[#D4AF37]/35 bg-white shadow-2xl dark:bg-[#14120D]">
-                    <div className="border-b border-[#D4AF37]/15 p-2">
+                    <div className="space-y-2 border-b border-[#D4AF37]/15 p-2">
                       <div className="relative">
                         <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[#8A7F6A]" />
                         <input
                           type="search"
                           value={countrySearch}
                           onChange={(e) => setCountrySearch(e.target.value)}
-                          placeholder={`Search ${countries.length} countries (A to Z)`}
+                          placeholder={`Search ${countries.length} countries`}
                           className="h-9 w-full rounded-lg border border-[#D4AF37]/20 bg-[#FAF7F0] pl-8 pr-3 text-xs text-[#1A160D] placeholder:text-[#8A7F6A] focus:border-[#D4AF37] focus:outline-none dark:bg-[#0B0A07] dark:text-[#FAF6EC]"
                         />
+                      </div>
+                      <div className="flex items-center gap-1">
+                        {(
+                          [
+                            { id: 'az', label: 'A–Z' },
+                            { id: 'lowest', label: 'Lowest ₦' },
+                            { id: 'instock', label: 'In Stock' },
+                          ] as const
+                        ).map((opt) => (
+                          <button
+                            key={opt.id}
+                            type="button"
+                            onClick={() => setCountrySort(opt.id)}
+                            className={`rounded-lg px-2.5 py-1 text-[10.5px] font-extrabold transition-colors ${
+                              countrySort === opt.id
+                                ? 'bg-[#D4AF37] text-[#0A0906]'
+                                : 'bg-[#FAF7F0] text-[#6E6552] hover:bg-[#D4AF37]/15 dark:bg-[#0B0A07] dark:text-[#A89F8C]'
+                            }`}
+                          >
+                            {opt.label}
+                          </button>
+                        ))}
                       </div>
                     </div>
                     <div className="max-h-72 overflow-y-auto p-1.5 space-y-1">
@@ -833,6 +1077,47 @@ export function SmsTab({
                     )}
                   </div>
 
+                  {/* Wallet Balance Affordability Check */}
+                  {typeof walletBalance === 'number' && checkoutUnitNgn ? (() => {
+                    const orderTotalNgn = Math.round(checkoutUnitNgn * quantity);
+                    const hasEnough = walletBalance >= orderTotalNgn;
+                    const deficit = Math.max(0, orderTotalNgn - Math.floor(walletBalance));
+                    return (
+                      <div
+                        className={`flex flex-wrap items-center justify-between gap-2 rounded-xl border px-3.5 py-2.5 text-xs ${
+                          hasEnough
+                            ? 'border-emerald-500/25 bg-emerald-500/5 text-emerald-800 dark:text-emerald-300'
+                            : 'border-amber-500/35 bg-amber-500/10 text-amber-800 dark:text-amber-200'
+                        }`}
+                      >
+                        <div className="flex items-center gap-2 min-w-0">
+                          <Wallet className="h-3.5 w-3.5 shrink-0" />
+                          <span className="truncate font-semibold">
+                            Wallet: <strong className="font-mono">{formatPrice(walletBalance, 'NGN')}</strong>
+                            {' · '}
+                            Order: <strong className="font-mono">{formatPrice(orderTotalNgn, 'NGN')}</strong>
+                          </span>
+                        </div>
+                        {!hasEnough && (
+                          <div className="flex items-center gap-2 shrink-0">
+                            <span className="font-mono text-[11px] font-bold">
+                              Need {formatPrice(deficit, 'NGN')} more
+                            </span>
+                            {onOpenDeposit && (
+                              <button
+                                type="button"
+                                onClick={onOpenDeposit}
+                                className="rounded-lg bg-[#D4AF37] px-2.5 py-1 text-[11px] font-extrabold text-[#0A0906] hover:bg-[#E5C150]"
+                              >
+                                Top Up
+                              </button>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })() : null}
+
                   {/* Buy Button */}
                   <button
                     type="button"
@@ -969,13 +1254,29 @@ export function SmsTab({
             </section>
           )}
 
-          {selectedOrder && (
+          {selectedOrder && (() => {
+            const expiryInfo = formatExpiryCountdown(selectedOrder.expires, nowMs);
+            return (
             <section className="rounded-3xl border border-[#D4AF37]/30 bg-white p-5 dark:bg-[#14120D]">
               <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#D4AF37]/15 pb-3.5">
                 <div>
-                  <h2 className="font-display text-base font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
-                    {selectedOrder.serviceName} Code Inbox
-                  </h2>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h2 className="font-display text-base font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
+                      {selectedOrder.serviceName} Code Inbox
+                    </h2>
+                    {expiryInfo && (
+                      <span
+                        className={`inline-flex items-center gap-1 rounded-lg px-2 py-0.5 font-mono text-[11px] font-extrabold tabular-nums ${
+                          expiryInfo.expired
+                            ? 'bg-rose-500/15 text-rose-600 dark:text-rose-300'
+                            : 'bg-[#D4AF37]/15 text-[#8A6208] dark:text-[#F5D77A]'
+                        }`}
+                      >
+                        <Clock className="h-3 w-3" />
+                        <span>{expiryInfo.label}</span>
+                      </span>
+                    )}
+                  </div>
                   <p className="mt-0.5 inline-flex items-center gap-1.5 text-xs text-[#8A6208] dark:text-[#F5D77A]">
                     <Radio className="h-3.5 w-3.5" />
                     <span>
@@ -988,7 +1289,25 @@ export function SmsTab({
                   </p>
                 </div>
 
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={toggleSound}
+                    aria-label={soundEnabled ? 'Mute SMS arrival sound' : 'Enable SMS arrival sound'}
+                    className={`inline-flex min-h-[40px] items-center gap-1.5 rounded-xl border px-3 py-2 text-xs font-bold transition-colors ${
+                      soundEnabled
+                        ? 'border-[#D4AF37]/35 bg-[#FAF7F0] text-[#8A6208] dark:bg-[#0B0A07] dark:text-[#F5D77A]'
+                        : 'border-[#D4AF37]/20 text-[#8A7F6A] dark:text-[#A89F8C]'
+                    }`}
+                  >
+                    {soundEnabled ? (
+                      <Volume2 className="h-3.5 w-3.5" />
+                    ) : (
+                      <VolumeX className="h-3.5 w-3.5" />
+                    )}
+                    <span className="hidden sm:inline">{soundEnabled ? 'Sound On' : 'Muted'}</span>
+                  </button>
+
                   <button
                     type="button"
                     onClick={() => onCheckOrder(selectedOrder.id)}
@@ -1021,6 +1340,23 @@ export function SmsTab({
                     </button>
                   )}
                 </div>
+              </div>
+
+              <div className="mt-3">
+                {selectedOrder.sms.length === 0 &&
+                ['PENDING', 'RECEIVED'].includes(selectedOrder.status) ? (
+                  <p className="rounded-xl border border-[#D4AF37]/20 bg-[#FAF7F0] px-3 py-2 text-[11px] font-semibold text-[#6E6552] dark:bg-[#0B0A07] dark:text-[#A89F8C]">
+                    No SMS yet · Tap Cancel anytime for a full{' '}
+                    {selectedOrder.price
+                      ? formatPrice(selectedOrder.price, selectedOrder.currency)
+                      : ''}{' '}
+                    wallet refund.
+                  </p>
+                ) : selectedOrder.sms.length > 0 ? (
+                  <p className="rounded-xl border border-emerald-500/25 bg-emerald-500/10 px-3 py-2 text-[11px] font-semibold text-emerald-700 dark:text-emerald-300">
+                    Code received · Charge finalized. Tap any code below to copy.
+                  </p>
+                ) : null}
               </div>
 
               <div className="mt-4">
@@ -1081,7 +1417,8 @@ export function SmsTab({
                 )}
               </div>
             </section>
-          )}
+            );
+          })()}
         </div>
       )}
 

@@ -1696,6 +1696,7 @@ export default function App() {
             lowestDeals={lowestDeals}
             lowestDealsLoading={lowestDealsLoading}
             quantity={quantity}
+            walletBalance={walletBalance}
             activeOrders={activeOrders}
             selectedOrder={selectedOrder}
             acquiring={acquiring}
@@ -1742,6 +1743,9 @@ export default function App() {
               }
             }}
             onChangeQuantity={(qty) => setQuantity(qty)}
+            onOpenDeposit={() =>
+              requireAuth('Sign in to fund your Naira wallet', () => setDepositModalOpen(true))
+            }
             onAcquireNumbers={() =>
               requireAuth('Sign in to acquire dedicated phone numbers', () => {
                 void handleAcquireNumbers();

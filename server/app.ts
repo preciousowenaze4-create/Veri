@@ -2,6 +2,7 @@ import 'dotenv/config';
 import crypto from 'node:crypto';
 import vm from 'node:vm';
 import express from 'express';
+import { GoogleGenAI, Type, type GenerateContentResponse } from '@google/genai';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 
 const USER_AGENT =
@@ -4898,6 +4899,318 @@ export function createApiApp() {
     } catch (err) {
       res.status(502).json({
         error: err instanceof Error ? err.message : 'Unable to check image status',
+      });
+    }
+  });
+
+  // ==========================================
+  // VeriBox AI Assistant Chat + Photo Vision + Image Intent Router
+  // ==========================================
+  const VERIBOX_AI_SYSTEM_PROMPT = `You are VeriBox AI, the friendly smart assistant inside the VeriBox web app.
+You help users with both general questions/conversation, analyzing uploaded photos, AND knowing when they want to generate an image.
+
+About the VeriBox app (answer accurately when asked):
+- Home tab: Instant disposable temporary emails with live auto-refresh inbox and 1-click verification code copy. Users get 5 free generated emails every day (resets automatically tomorrow). Deleting an email from Home moves it safely so users can recover it later with its password.
+- Create tab: Create a custom password-protected VeriBox Mail account (Personal use, Work/business, or High-privacy stealth) by entering First & Second Name, Birthday, choosing a personalized email address (₦50 fee from Naira wallet), setting a password, and confirming terms. Returning users can also sign in with an existing or deleted email + password for free.
+- Numbers tab: Dedicated verification phone numbers powered by Grizzly SMS and 5sim across 200+ countries (A–Z and Lowest Price views) for WhatsApp, Telegram, TikTok, Instagram, Google, Facebook, X/Twitter, PayPal, and more. Receives OTPs in real time and automatically refunds the full Naira amount if cancelled or expired before an SMS arrives.
+- VeriBox AI (Images tab): Normal AI chat assistant, uploaded photo analyzer, and unlimited 100% free AI image generator.
+- Wallet & Profile: Real Naira wallet funded via Paystack, saved numbers, OTP clipboard history, and theme settings.
+
+Classification & Output rules:
+You MUST return strict JSON with keys: "intent", "reply", and "imagePrompt".
+- Set "intent" to "generate_image" ONLY when the user is explicitly asking you to create, generate, draw, paint, design, render, or make an image/picture/logo/wallpaper/avatar/artwork (for example: "draw a lion", "generate a gold logo", "make an anime picture of Lagos"). In that case, put a rich descriptive English visual prompt in "imagePrompt" (incorporating visual details from any uploaded image if they asked to recreate/transform it) and write a brief friendly message in "reply" like "Creating that image for you now...".
+- Set "intent" to "chat" for everything else: greetings, chatting normally, questions about VeriBox, analyzing/describing/answering questions about an uploaded photo, brainstorming, or writing. In that case, set "imagePrompt" to "" and write a clear, helpful, concise answer in "reply".`;
+
+  function parseAiJsonReply(rawText: string): {
+    intent: 'chat' | 'generate_image';
+    reply: string;
+    imagePrompt: string;
+  } {
+    const cleaned = rawText
+      .trim()
+      .replace(/^```json\s*/i, '')
+      .replace(/^```\s*/i, '')
+      .replace(/```$/i, '')
+      .trim();
+    try {
+      const parsed = JSON.parse(cleaned) as {
+        intent?: string;
+        reply?: string;
+        imagePrompt?: string;
+      };
+      const intent = parsed.intent === 'generate_image' ? 'generate_image' : 'chat';
+      const reply = typeof parsed.reply === 'string' && parsed.reply.trim() ? parsed.reply.trim() : cleaned;
+      const imagePrompt = typeof parsed.imagePrompt === 'string' ? parsed.imagePrompt.trim() : '';
+      return { intent, reply, imagePrompt };
+    } catch {
+      return {
+        intent: 'chat',
+        reply: rawText.trim() || 'How can I help you today?',
+        imagePrompt: '',
+      };
+    }
+  }
+
+  function looksLikeImageRequest(text: string): boolean {
+    const lower = text.toLowerCase();
+    return /\b(generate|create|draw|paint|sketch|render|design|illustrate|make)\b.{0,40}\b(image|picture|photo|logo|art|artwork|wallpaper|avatar|portrait|illustration|banner|icon|poster)\b|\b(draw me|generate a|create a picture|image of)\b/i.test(
+      lower
+    );
+  }
+
+  app.post('/api/ai/chat', async (req, res) => {
+    const message = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
+    const mode = req.body?.mode === 'chat' || req.body?.mode === 'image' ? req.body.mode : 'auto';
+    const imageDataUrl =
+      typeof req.body?.imageDataUrl === 'string' && req.body.imageDataUrl.startsWith('data:image/')
+        ? req.body.imageDataUrl
+        : undefined;
+    const rawHistory = Array.isArray(req.body?.history) ? req.body.history.slice(-8) : [];
+
+    if (!message && !imageDataUrl) {
+      res.status(400).json({ error: 'Please type a message or attach an image.' });
+      return;
+    }
+
+    const userPromptText =
+      message || 'Describe this uploaded image clearly and suggest what I can do with it.';
+
+    // Parse base64 payload if user attached a photo
+    let inlineImage: { mimeType: string; data: string } | null = null;
+    if (imageDataUrl) {
+      const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/.exec(imageDataUrl);
+      if (match) {
+        inlineImage = { mimeType: match[1], data: match[2] };
+      }
+    }
+
+    const geminiKey = String(process.env.GEMINI_API_KEY || '').trim();
+
+    if (geminiKey) {
+      try {
+        const ai = new GoogleGenAI({
+          apiKey: geminiKey,
+          httpOptions: {
+            headers: {
+              'User-Agent': 'aistudio-build',
+            },
+          },
+        });
+
+        const historyText = rawHistory
+          .filter(
+            (h: unknown): h is { role: string; text: string } =>
+              Boolean(h && typeof h === 'object' && typeof (h as { text?: string }).text === 'string')
+          )
+          .map((h: { role: string; text: string }) => `${h.role === 'assistant' ? 'Assistant' : 'User'}: ${h.text.slice(0, 600)}`)
+          .join('\n');
+
+        const modeHint =
+          mode === 'image'
+            ? '\n[Mode override: User explicitly selected Generate Image mode. Return intent="generate_image" with a detailed visual imagePrompt.]'
+            : mode === 'chat'
+              ? '\n[Mode override: User explicitly selected Chat mode. Return intent="chat" and answer directly without triggering image generation.]'
+              : '';
+
+        const combinedText = `${historyText ? `Recent conversation:\n${historyText}\n\n` : ''}User: ${userPromptText}${modeHint}`;
+
+        const parts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> = [];
+        if (inlineImage) {
+          parts.push({ inlineData: inlineImage });
+        }
+        parts.push({ text: combinedText });
+
+        const response: GenerateContentResponse = await ai.models.generateContent({
+          model: 'gemini-4-hydrogen',
+          contents: { parts },
+          config: {
+            systemInstruction: VERIBOX_AI_SYSTEM_PROMPT,
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                intent: {
+                  type: Type.STRING,
+                  description: 'Either "chat" or "generate_image".',
+                },
+                reply: {
+                  type: Type.STRING,
+                  description: 'Conversational reply to show to the user.',
+                },
+                imagePrompt: {
+                  type: Type.STRING,
+                  description: 'Rich image generation prompt when intent is generate_image, otherwise empty string.',
+                },
+              },
+            },
+          },
+        });
+
+        const parsed = parseAiJsonReply(response.text || '');
+        const finalIntent =
+          mode === 'image'
+            ? 'generate_image'
+            : mode === 'chat'
+              ? 'chat'
+              : parsed.intent;
+
+        res.json({
+          intent: finalIntent,
+          reply: parsed.reply,
+          imagePrompt:
+            finalIntent === 'generate_image' ? parsed.imagePrompt || userPromptText : '',
+          provider: 'Gemini AI',
+        });
+        return;
+      } catch (err) {
+        // If Pollinations text fallback fails too, surface clear error below
+        console.warn('Gemini AI chat fallback check:', err instanceof Error ? err.message : err);
+      }
+    }
+
+    // Fast-path direct image generation prompts when Gemini prompt-refiner is absent
+    if (!geminiKey && (mode === 'image' || (mode === 'auto' && !imageDataUrl && looksLikeImageRequest(userPromptText)))) {
+      res.json({
+        intent: 'generate_image',
+        reply: 'Creating that image for you now!',
+        imagePrompt: userPromptText,
+        provider: 'VeriBox AI',
+      });
+      return;
+    }
+
+    // Secondary free upstream LLM endpoint (works seamlessly even if GEMINI_API_KEY isn't configured yet)
+    try {
+      const modeDirective =
+        mode === 'image'
+          ? 'The user selected Generate Image mode. Set intent="generate_image" and craft a vivid imagePrompt.'
+          : mode === 'chat'
+            ? 'The user selected Chat mode. Set intent="chat" and answer naturally.'
+            : 'Automatically decide whether intent is "chat" or "generate_image".';
+
+      const upstreamMessages: Array<{
+        role: 'system' | 'user' | 'assistant';
+        content:
+          | string
+          | Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } }>;
+      }> = [
+        {
+          role: 'system',
+          content: `${VERIBOX_AI_SYSTEM_PROMPT}\n${modeDirective}\nRespond ONLY with valid JSON: {"intent":"chat"|"generate_image","reply":"...","imagePrompt":"..."}`,
+        },
+      ];
+
+      for (const item of rawHistory) {
+        if (item && typeof item.text === 'string' && item.text.trim()) {
+          upstreamMessages.push({
+            role: item.role === 'assistant' ? 'assistant' : 'user',
+            content: item.text.slice(0, 600),
+          });
+        }
+      }
+
+      if (imageDataUrl) {
+        upstreamMessages.push({
+          role: 'user',
+          content: [
+            { type: 'text', text: userPromptText },
+            { type: 'image_url', image_url: { url: imageDataUrl } },
+          ],
+        });
+      } else {
+        upstreamMessages.push({
+          role: 'user',
+          content: userPromptText,
+        });
+      }
+
+      const callPollinationsText = async (modelName: string, withImage: boolean) => {
+        const msgs = withImage
+          ? upstreamMessages
+          : upstreamMessages.map((m) =>
+              Array.isArray(m.content)
+                ? {
+                    role: m.role,
+                    content: `${userPromptText} (Note: user attached a photo for context)`,
+                  }
+                : m
+            );
+
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 9000);
+        try {
+          const r = await fetch('https://text.pollinations.ai/openai', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'User-Agent': USER_AGENT,
+            },
+            body: JSON.stringify({
+              model: modelName,
+              messages: msgs,
+              jsonMode: true,
+            }),
+            signal: controller.signal,
+          });
+          if (!r.ok) {
+            return { ok: false as const, status: r.status, rawContent: '' };
+          }
+          const aiJson = (await r.json()) as {
+            choices?: Array<{ message?: { content?: string } }>;
+          };
+          return {
+            ok: true as const,
+            status: r.status,
+            rawContent: aiJson.choices?.[0]?.message?.content || '',
+          };
+        } finally {
+          clearTimeout(timer);
+        }
+      };
+
+      // Try openai-fast first (highest reliability/no 402 burst limit), then openai fallback
+      let result = await callPollinationsText('openai-fast', Boolean(imageDataUrl));
+      if (!result.ok && imageDataUrl) {
+        result = await callPollinationsText('openai-fast', false);
+      }
+      if (!result.ok) {
+        result = await callPollinationsText('openai', false);
+      }
+
+      if (!result.ok) {
+        throw new Error(`AI chat upstream unavailable (${result.status})`);
+      }
+
+      const parsed = parseAiJsonReply(result.rawContent);
+
+      const fallbackIntent =
+        mode === 'image'
+          ? 'generate_image'
+          : mode === 'chat'
+            ? 'chat'
+            : parsed.intent === 'generate_image' || (!imageDataUrl && looksLikeImageRequest(userPromptText))
+              ? 'generate_image'
+              : 'chat';
+
+      res.json({
+        intent: fallbackIntent,
+        reply: parsed.reply,
+        imagePrompt:
+          fallbackIntent === 'generate_image' ? parsed.imagePrompt || userPromptText : '',
+        provider: 'VeriBox AI',
+      });
+    } catch (err) {
+      if (mode === 'image' || (mode === 'auto' && !imageDataUrl && looksLikeImageRequest(userPromptText))) {
+        res.json({
+          intent: 'generate_image',
+          reply: 'Creating that image for you now!',
+          imagePrompt: userPromptText,
+          provider: 'VeriBox AI',
+        });
+        return;
+      }
+      res.status(502).json({
+        error: err instanceof Error ? err.message : 'Unable to reach VeriBox AI right now.',
       });
     }
   });

@@ -1,14 +1,22 @@
 import { useEffect, useRef, useState } from 'react';
 import {
   AlertCircle,
+  Bot,
   Copy,
   Download,
   Image as ImageIcon,
+  ImagePlus,
   Loader2,
+  MessageSquare,
+  Plus,
   RefreshCw,
+  Send,
+  SlidersHorizontal,
   Sparkles,
   Trash2,
+  User,
   Wand2,
+  X,
 } from 'lucide-react';
 import type { GeneratedImageItem } from '../types';
 import { parseJsonResponse } from '../utils/apiFetch';
@@ -18,6 +26,21 @@ interface ImageGenTabProps {
   onRequireAuth?: (reason?: string) => void;
   onCopyText: (value: string, label: string) => void;
   onShowToast: (message: string) => void;
+}
+
+type ChatMode = 'auto' | 'chat' | 'image';
+
+interface AiChatMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  text: string;
+  uploadedImageUrl?: string;
+  generatedImage?: GeneratedImageItem;
+  generatingImage?: boolean;
+  queueStatus?: string | null;
+  provider?: string;
+  error?: string;
+  createdAt: string;
 }
 
 const STYLE_OPTIONS = [
@@ -30,21 +53,38 @@ const STYLE_OPTIONS = [
 ];
 
 const ASPECT_OPTIONS = [
-  { id: '1:1', label: '1:1 Square' },
-  { id: '16:9', label: '16:9 Wide' },
-  { id: '9:16', label: '9:16 Portrait' },
-  { id: '4:3', label: '4:3 Classic' },
-  { id: '3:4', label: '3:4 Vertical' },
+  { id: '1:1', label: '1:1' },
+  { id: '16:9', label: '16:9' },
+  { id: '9:16', label: '9:16' },
+  { id: '4:3', label: '4:3' },
+  { id: '3:4', label: '3:4' },
 ];
 
-const PROMPT_SUGGESTIONS = [
-  'Luxury black and gold futuristic smartphone product photography, dramatic studio lighting',
-  'Minimalist flat gold vault shield emblem icon on deep obsidian background',
-  'Vibrant Lagos skyline at golden sunset, warm cinematic reflections',
-  'Cyberpunk neon coffee shop in rain, glowing reflections, cozy atmosphere',
+const STARTER_CHIPS: Array<{ label: string; text: string; mode?: ChatMode }> = [
+  {
+    label: 'Tell me about VeriBox app',
+    text: 'Tell me about the VeriBox app and all its features.',
+    mode: 'chat',
+  },
+  {
+    label: 'Generate gold 3D lion logo',
+    text: 'Generate a minimalist luxury black and gold lion shield logo icon, 3D studio lighting',
+    mode: 'image',
+  },
+  {
+    label: 'How do free daily emails work?',
+    text: 'How do the 5 free daily emails and ₦50 custom emails work?',
+    mode: 'chat',
+  },
+  {
+    label: 'Draw Lagos sunset skyline',
+    text: 'Draw a vibrant futuristic Lagos skyline at golden sunset with warm reflections',
+    mode: 'image',
+  },
 ];
 
 const GALLERY_STORAGE_KEY = 'veribox_generated_images_v1';
+const CHAT_STORAGE_KEY = 'veribox_ai_chat_messages_v1';
 
 function loadStoredGallery(): GeneratedImageItem[] {
   try {
@@ -58,13 +98,57 @@ function loadStoredGallery(): GeneratedImageItem[] {
 }
 
 function saveStoredGallery(items: GeneratedImageItem[]) {
-  const list = items.slice(0, 6);
+  const list = items.slice(0, 8);
   for (let count = list.length; count >= 0; count--) {
     try {
       localStorage.setItem(GALLERY_STORAGE_KEY, JSON.stringify(list.slice(0, count)));
       return;
     } catch {
       // Trim oldest if localStorage quota is tight
+    }
+  }
+}
+
+function loadStoredChat(): AiChatMessage[] {
+  try {
+    const raw = localStorage.getItem(CHAT_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return (parsed as AiChatMessage[]).map((m) => ({
+      ...m,
+      generatingImage: false,
+      queueStatus: null,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+function saveStoredChat(msgs: AiChatMessage[]) {
+  const clean = msgs.slice(-20).map((m) => ({
+    ...m,
+    generatingImage: false,
+    queueStatus: null,
+    // Keep uploaded thumbnail light if storage gets tight
+  }));
+  for (let count = clean.length; count >= 0; count--) {
+    try {
+      localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(clean.slice(-count)));
+      return;
+    } catch {
+      // Strip heavy base64 images on tight quota
+      try {
+        const light = clean.slice(-count).map((m) => ({
+          ...m,
+          uploadedImageUrl: undefined,
+          generatedImage: undefined,
+        }));
+        localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(light));
+        return;
+      } catch {
+        // Keep shrinking
+      }
     }
   }
 }
@@ -93,11 +177,42 @@ function blobToDataUrl(blob: Blob): Promise<string> {
       if (typeof reader.result === 'string' && reader.result.startsWith('data:image/')) {
         resolve(reader.result);
       } else {
-        reject(new Error('Could not decode generated image'));
+        reject(new Error('Could not decode image'));
       }
     };
     reader.onerror = () => reject(new Error('Failed to read image data'));
     reader.readAsDataURL(blob);
+  });
+}
+
+async function compressUploadedImage(file: File): Promise<string> {
+  if (!file.type.startsWith('image/')) {
+    throw new Error('Please choose a valid image file (PNG, JPG, WEBP).');
+  }
+  const rawUrl = await blobToDataUrl(file);
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const maxDim = 960;
+      let { width, height } = img;
+      if (width > maxDim || height > maxDim) {
+        const scale = Math.min(maxDim / width, maxDim / height);
+        width = Math.max(1, Math.round(width * scale));
+        height = Math.max(1, Math.round(height * scale));
+      }
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        resolve(rawUrl);
+        return;
+      }
+      ctx.drawImage(img, 0, 0, width, height);
+      resolve(canvas.toDataURL('image/jpeg', 0.84));
+    };
+    img.onerror = () => resolve(rawUrl);
+    img.src = rawUrl;
   });
 }
 
@@ -137,17 +252,22 @@ export function ImageGenTab({
   onCopyText,
   onShowToast,
 }: ImageGenTabProps) {
-  const [prompt, setPrompt] = useState<string>('');
+  const [viewMode, setViewMode] = useState<'chat' | 'gallery'>('chat');
+  const [chatMode, setChatMode] = useState<ChatMode>('auto');
+  const [showImageOptions, setShowImageOptions] = useState<boolean>(false);
+  const [inputText, setInputText] = useState<string>('');
   const [style, setStyle] = useState<string>('photorealistic');
   const [aspectRatio, setAspectRatio] = useState<string>('1:1');
-  const [generating, setGenerating] = useState<boolean>(false);
-  const [queueStatus, setQueueStatus] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [gallery, setGallery] = useState<GeneratedImageItem[]>(() => loadStoredGallery());
-  const [activeImage, setActiveImage] = useState<GeneratedImageItem | null>(
-    () => loadStoredGallery()[0] || null
-  );
 
+  const [attachedImageUrl, setAttachedImageUrl] = useState<string | null>(null);
+  const [attachedImageName, setAttachedImageName] = useState<string>('');
+  const [sending, setSending] = useState<boolean>(false);
+  const [messages, setMessages] = useState<AiChatMessage[]>(() => loadStoredChat());
+  const [gallery, setGallery] = useState<GeneratedImageItem[]>(() => loadStoredGallery());
+  const [globalError, setGlobalError] = useState<string | null>(null);
+
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const chatEndRef = useRef<HTMLDivElement | null>(null);
   const abortRef = useRef<boolean>(false);
 
   useEffect(() => {
@@ -155,40 +275,48 @@ export function ImageGenTab({
   }, [gallery]);
 
   useEffect(() => {
+    saveStoredChat(messages);
+  }, [messages]);
+
+  useEffect(() => {
+    if (viewMode === 'chat') {
+      chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    }
+  }, [messages.length, sending, viewMode]);
+
+  useEffect(() => {
     return () => {
       abortRef.current = true;
     };
   }, []);
 
-  const pushNewImage = (item: GeneratedImageItem) => {
-    setActiveImage(item);
-    setGallery((prev) => [item, ...prev.filter((g) => g.id !== item.id)].slice(0, 6));
+  const updateMessage = (id: string, patch: Partial<AiChatMessage>) => {
+    setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, ...patch } : m)));
   };
 
-  const handleGenerate = async (overridePrompt?: string) => {
-    if (!isAuthenticated) {
-      onRequireAuth?.('Sign in to generate free AI images');
-      return;
-    }
-    const finalPrompt = (overridePrompt ?? prompt).trim();
-    if (finalPrompt.length < 3) {
-      setError('Please enter a prompt with at least 3 characters.');
-      return;
-    }
+  const pushNewGalleryItem = (item: GeneratedImageItem) => {
+    setGallery((prev) => [item, ...prev.filter((g) => g.id !== item.id)].slice(0, 8));
+  };
 
-    abortRef.current = false;
-    setGenerating(true);
-    setError(null);
-    setQueueStatus('Sending request to free image engine...');
+  const renderImageIntoMessage = async (
+    assistantMsgId: string,
+    imagePrompt: string,
+    useStyle: string,
+    useAspect: string
+  ) => {
+    const updateStatus = (txt: string) => {
+      updateMessage(assistantMsgId, { queueStatus: txt });
+    };
 
     try {
+      updateStatus('Sending to free image studio...');
       const res = await fetch('/api/images/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          prompt: finalPrompt,
-          style,
-          aspectRatio,
+          prompt: imagePrompt,
+          style: useStyle,
+          aspectRatio: useAspect,
         }),
       });
 
@@ -209,22 +337,28 @@ export function ImageGenTab({
       if (data.status === 'done' && data.imageDataUrl) {
         const item: GeneratedImageItem = {
           id: `img-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-          prompt: finalPrompt,
-          style,
-          aspectRatio,
+          prompt: imagePrompt,
+          style: useStyle,
+          aspectRatio: useAspect,
           imageDataUrl: data.imageDataUrl,
           provider: data.provider || 'Free AI',
           createdAt: new Date().toISOString(),
         };
-        pushNewImage(item);
-        onShowToast('Image generated!');
+        pushNewGalleryItem(item);
+        updateMessage(assistantMsgId, {
+          generatingImage: false,
+          queueStatus: null,
+          generatedImage: item,
+          provider: item.provider,
+        });
+        onShowToast('Image ready!');
         return;
       }
 
       if (data.status === 'pending' && data.jobId) {
         const jobId = data.jobId;
         const maxWaitUntil = Date.now() + 90000;
-        setQueueStatus(
+        updateStatus(
           data.queuePosition && data.queuePosition > 0
             ? `Queued (#${data.queuePosition}) · Rendering free image...`
             : 'Rendering your image...'
@@ -251,25 +385,31 @@ export function ImageGenTab({
           if (statusData.status === 'done' && statusData.imageDataUrl) {
             const item: GeneratedImageItem = {
               id: `img-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-              prompt: finalPrompt,
-              style,
-              aspectRatio,
+              prompt: imagePrompt,
+              style: useStyle,
+              aspectRatio: useAspect,
               imageDataUrl: statusData.imageDataUrl,
               provider: statusData.provider || 'Free AI',
               createdAt: new Date().toISOString(),
             };
-            pushNewImage(item);
-            onShowToast('Image generated!');
+            pushNewGalleryItem(item);
+            updateMessage(assistantMsgId, {
+              generatingImage: false,
+              queueStatus: null,
+              generatedImage: item,
+              provider: item.provider,
+            });
+            onShowToast('Image ready!');
             return;
           }
 
-          setQueueStatus(
+          updateStatus(
             statusData.queuePosition && statusData.queuePosition > 0
-              ? `In free render queue (#${statusData.queuePosition}) · ~${Math.max(
+              ? `In render queue (#${statusData.queuePosition}) · ~${Math.max(
                   3,
                   statusData.waitTime || 10
                 )}s left`
-              : `Rendering image · ~${Math.max(3, statusData.waitTime || 8)}s left`
+              : `Rendering artwork · ~${Math.max(3, statusData.waitTime || 8)}s left`
           );
         }
 
@@ -279,28 +419,34 @@ export function ImageGenTab({
         return;
       }
 
-      throw new Error('Unexpected response from image generator');
+      throw new Error('Unexpected response from image studio');
     } catch (serverErr) {
       if (abortRef.current) return;
       try {
-        setQueueStatus('Switching to direct free image renderer...');
+        updateStatus('Switching to fast direct renderer...');
         const fallbackDataUrl = await generateDirectPollinationsFallback(
-          finalPrompt,
-          style,
-          aspectRatio
+          imagePrompt,
+          useStyle,
+          useAspect
         );
         if (abortRef.current) return;
         const item: GeneratedImageItem = {
           id: `img-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-          prompt: finalPrompt,
-          style,
-          aspectRatio,
+          prompt: imagePrompt,
+          style: useStyle,
+          aspectRatio: useAspect,
           imageDataUrl: fallbackDataUrl,
-          provider: 'pollinations',
+          provider: 'Pollinations',
           createdAt: new Date().toISOString(),
         };
-        pushNewImage(item);
-        onShowToast('Image generated!');
+        pushNewGalleryItem(item);
+        updateMessage(assistantMsgId, {
+          generatingImage: false,
+          queueStatus: null,
+          generatedImage: item,
+          provider: item.provider,
+        });
+        onShowToast('Image ready!');
       } catch (fallbackErr) {
         if (!abortRef.current) {
           const msg =
@@ -309,14 +455,184 @@ export function ImageGenTab({
               : serverErr instanceof Error
                 ? serverErr.message
                 : 'Unable to generate image right now.';
-          setError(msg);
+          updateMessage(assistantMsgId, {
+            generatingImage: false,
+            queueStatus: null,
+            error: msg,
+          });
         }
       }
-    } finally {
-      if (!abortRef.current) {
-        setGenerating(false);
-        setQueueStatus(null);
+    }
+  };
+
+  const handleSelectPhoto = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setGlobalError(null);
+    try {
+      const compressedDataUrl = await compressUploadedImage(file);
+      setAttachedImageUrl(compressedDataUrl);
+      setAttachedImageName(file.name || 'Uploaded image');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Could not attach image';
+      setGlobalError(msg);
+      onShowToast(msg);
+    }
+  };
+
+  const handleSendMessage = async (
+    overrideText?: string,
+    overrideMode?: ChatMode
+  ) => {
+    if (!isAuthenticated) {
+      onRequireAuth?.('Sign in to chat with VeriBox AI & generate free images');
+      return;
+    }
+
+    const activeMode = overrideMode || chatMode;
+    const text = (overrideText ?? inputText).trim();
+    const photo = attachedImageUrl;
+
+    if (!text && !photo) {
+      setGlobalError('Type a message or upload a picture first.');
+      return;
+    }
+
+    abortRef.current = false;
+    setGlobalError(null);
+    setSending(true);
+    setViewMode('chat');
+
+    const userMsgId = `u-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const assistantMsgId = `a-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+
+    const userMsg: AiChatMessage = {
+      id: userMsgId,
+      role: 'user',
+      text: text || 'Analyze this uploaded photo',
+      uploadedImageUrl: photo || undefined,
+      createdAt: new Date().toISOString(),
+    };
+
+    const pendingBotMsg: AiChatMessage = {
+      id: assistantMsgId,
+      role: 'assistant',
+      text:
+        activeMode === 'image'
+          ? 'Creating your image now...'
+          : photo
+            ? 'Looking at your image...'
+            : 'Thinking...',
+      generatingImage: activeMode === 'image',
+      queueStatus: activeMode === 'image' ? 'Starting free image studio...' : null,
+      createdAt: new Date().toISOString(),
+    };
+
+    const historySnapshot = messages.slice(-8).map((m) => ({
+      role: m.role,
+      text: m.text,
+    }));
+
+    setMessages((prev) => [...prev, userMsg, pendingBotMsg]);
+    if (!overrideText) {
+      setInputText('');
+      setAttachedImageUrl(null);
+      setAttachedImageName('');
+    }
+
+    try {
+      // If user explicitly toggled Image mode WITHOUT an uploaded photo, generate right away
+      if (activeMode === 'image' && !photo) {
+        await renderImageIntoMessage(assistantMsgId, text, style, aspectRatio);
+        return;
       }
+
+      // Ask /api/ai/chat (Gemini or VeriBox AI) — handles normal chat, app Q&A, photo vision, and auto image intent!
+      const res = await fetch('/api/ai/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: text,
+          history: historySnapshot,
+          mode: activeMode,
+          imageDataUrl: photo || undefined,
+          style,
+          aspectRatio,
+        }),
+        signal: AbortSignal.timeout(18000),
+      });
+
+      const data = await parseJsonResponse<{
+        intent?: 'chat' | 'generate_image';
+        reply?: string;
+        imagePrompt?: string;
+        provider?: string;
+        error?: string;
+      }>(res);
+
+      if (!res.ok) {
+        throw new Error(data.error || 'Could not reach VeriBox AI');
+      }
+
+      const replyText =
+        data.reply ||
+        (data.intent === 'generate_image'
+          ? 'Creating that image for you now...'
+          : 'How else can I help you?');
+
+      if (data.intent === 'generate_image') {
+        const finalImgPrompt = (data.imagePrompt || text).trim();
+        updateMessage(assistantMsgId, {
+          text: replyText,
+          generatingImage: true,
+          queueStatus: 'Rendering free image...',
+          provider: data.provider || 'VeriBox AI',
+        });
+        await renderImageIntoMessage(assistantMsgId, finalImgPrompt, style, aspectRatio);
+      } else {
+        updateMessage(assistantMsgId, {
+          text: replyText,
+          generatingImage: false,
+          queueStatus: null,
+          provider: data.provider || 'VeriBox AI',
+        });
+      }
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : 'Something went wrong.';
+      updateMessage(assistantMsgId, {
+        text: 'Sorry, I ran into a connection hiccup.',
+        generatingImage: false,
+        queueStatus: null,
+        error: errMsg,
+      });
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const handleRegenerateFromMessage = async (item: GeneratedImageItem) => {
+    if (!isAuthenticated) {
+      onRequireAuth?.('Sign in to regenerate free images');
+      return;
+    }
+    setSending(true);
+    const botId = `a-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: botId,
+        role: 'assistant',
+        text: 'Regenerating a fresh variation...',
+        generatingImage: true,
+        queueStatus: 'Starting free image studio...',
+        createdAt: new Date().toISOString(),
+      },
+    ]);
+    try {
+      await renderImageIntoMessage(botId, item.prompt, item.style || style, item.aspectRatio || aspectRatio);
+    } finally {
+      setSending(false);
     }
   };
 
@@ -332,8 +648,8 @@ export function ImageGenTab({
       const ext = item.imageDataUrl.includes('image/png')
         ? 'png'
         : item.imageDataUrl.includes('image/jpeg')
-        ? 'jpg'
-        : 'webp';
+          ? 'jpg'
+          : 'webp';
       link.download = `veribox-${slug || 'image'}.${ext}`;
       document.body.appendChild(link);
       link.click();
@@ -344,320 +660,507 @@ export function ImageGenTab({
     }
   };
 
-  const handleDeleteImage = (id: string) => {
-    setGallery((prev) => {
-      const remaining = prev.filter((item) => item.id !== id);
-      if (activeImage?.id === id) {
-        setActiveImage(remaining[0] || null);
-      }
-      return remaining;
-    });
-    onShowToast('Image removed');
+  const handleDeleteGalleryItem = (id: string) => {
+    setGallery((prev) => prev.filter((item) => item.id !== id));
+    onShowToast('Image removed from gallery');
   };
 
   return (
-    <div className="space-y-5">
-      {/* Header Card */}
-      <section className="rounded-3xl border border-[#D4AF37]/30 bg-white p-4 sm:p-6 shadow-sm dark:bg-[#14120D]">
-        <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
-          <div className="flex items-center gap-3">
-            <div className="flex h-11 w-11 items-center justify-center rounded-2xl border border-[#D4AF37]/40 bg-[#D4AF37]/15 text-[#8A6208] dark:text-[#F5D77A]">
-              <Sparkles className="h-5 w-5" />
+    <div className="mx-auto max-w-2xl space-y-4">
+      <section className="overflow-hidden rounded-3xl border border-[#D4AF37]/30 bg-white shadow-sm dark:bg-[#14120D]">
+        {/* Top Chat Header */}
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#D4AF37]/20 px-4 py-3.5 sm:px-5">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl border border-[#D4AF37]/50 bg-[#D4AF37]/15 text-[#8A6208] dark:text-[#F5D77A]">
+              <Bot className="h-5 w-5" />
             </div>
-            <div>
-              <h1 className="font-display text-lg sm:text-xl font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
-                Free Image Generator
-              </h1>
-              <p className="text-xs text-[#6E6552] dark:text-[#A89F8C]">
-                Create crisp images &amp; profile visuals free — zero credits deducted
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <h1 className="font-display text-base font-extrabold text-[#1A160D] truncate dark:text-[#FAF6EC]">
+                  VeriBox AI
+                </h1>
+                <span className="rounded-md border border-emerald-500/35 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-extrabold text-emerald-700 dark:text-emerald-300">
+                  Free
+                </span>
+              </div>
+              <p className="text-[11px] text-[#6E6552] truncate dark:text-[#A89F8C]">
+                Chat, upload photos, &amp; generate free AI images
               </p>
             </div>
           </div>
-          <span className="rounded-full border border-emerald-500/35 bg-emerald-500/10 px-3 py-1 text-[11px] font-extrabold text-emerald-700 dark:text-emerald-300">
-            100% Free Unlimited
-          </span>
-        </div>
 
-        {/* Prompt Box */}
-        <div className="space-y-4">
-          <div>
-            <label
-              htmlFor="image-prompt-input"
-              className="mb-1.5 block text-xs font-bold text-[#6E6552] dark:text-[#A89F8C]"
-            >
-              Describe the image you want to create
-            </label>
-            <textarea
-              id="image-prompt-input"
-              rows={3}
-              value={prompt}
-              onChange={(e) => {
-                setPrompt(e.target.value);
-                setError(null);
-              }}
-              placeholder="e.g., Minimalist luxury gold and obsidian app logo emblem, studio lighting..."
-              className="w-full rounded-2xl border border-[#D4AF37]/35 bg-[#FAF7F0] p-3.5 text-sm text-[#1A160D] placeholder:text-[#8F8673] focus:border-[#D4AF37] focus:outline-none dark:bg-[#0B0A07] dark:text-[#FAF6EC]"
-            />
-          </div>
-
-          {/* Quick Prompt Ideas */}
-          <div>
-            <p className="mb-1.5 text-[11px] font-bold text-[#6E6552] dark:text-[#A89F8C]">
-              Quick Ideas
-            </p>
-            <div className="flex flex-wrap gap-1.5">
-              {PROMPT_SUGGESTIONS.map((suggestion, idx) => (
-                <button
-                  key={idx}
-                  type="button"
-                  onClick={() => {
-                    setPrompt(suggestion);
-                    setError(null);
-                  }}
-                  className="rounded-xl border border-[#D4AF37]/25 bg-[#FAF7F0] px-2.5 py-1.5 text-left text-[11px] font-medium text-[#3E3522] transition-colors hover:border-[#D4AF37] hover:bg-[#D4AF37]/15 dark:bg-[#0B0A07] dark:text-[#D5CCB8]"
-                >
-                  {suggestion.slice(0, 48)}...
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Style & Aspect Ratio Controls */}
-          <div className="grid gap-4 sm:grid-cols-2">
-            <div>
-              <p className="mb-1.5 text-xs font-bold text-[#6E6552] dark:text-[#A89F8C]">Style</p>
-              <div className="flex flex-wrap gap-1.5">
-                {STYLE_OPTIONS.map((opt) => {
-                  const selected = style === opt.id;
-                  return (
-                    <button
-                      key={opt.id}
-                      type="button"
-                      onClick={() => setStyle(opt.id)}
-                      className={`min-h-[36px] rounded-xl border px-3 py-1.5 text-xs font-bold transition-all ${
-                        selected
-                          ? 'border-[#D4AF37] bg-[#D4AF37] text-[#0A0906]'
-                          : 'border-[#D4AF37]/25 bg-[#FAF7F0] text-[#3E3522] hover:bg-[#D4AF37]/10 dark:bg-[#0B0A07] dark:text-[#D5CCB8]'
-                      }`}
-                    >
-                      {opt.label}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-
-            <div>
-              <p className="mb-1.5 text-xs font-bold text-[#6E6552] dark:text-[#A89F8C]">
-                Aspect Ratio
-              </p>
-              <div className="flex flex-wrap gap-1.5">
-                {ASPECT_OPTIONS.map((opt) => {
-                  const selected = aspectRatio === opt.id;
-                  return (
-                    <button
-                      key={opt.id}
-                      type="button"
-                      onClick={() => setAspectRatio(opt.id)}
-                      className={`min-h-[36px] rounded-xl border px-3 py-1.5 text-xs font-bold transition-all ${
-                        selected
-                          ? 'border-[#D4AF37] bg-[#D4AF37] text-[#0A0906]'
-                          : 'border-[#D4AF37]/25 bg-[#FAF7F0] text-[#3E3522] hover:bg-[#D4AF37]/10 dark:bg-[#0B0A07] dark:text-[#D5CCB8]'
-                      }`}
-                    >
-                      {opt.label}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          </div>
-
-          {error && (
-            <div className="flex items-start gap-2.5 rounded-2xl border border-rose-500/35 bg-rose-500/10 p-3.5 text-xs font-medium text-rose-700 dark:text-rose-200">
-              <AlertCircle className="h-4 w-4 shrink-0 mt-0.5 text-rose-500" />
-              <span>{error}</span>
-            </div>
-          )}
-
-          {/* Generate CTA */}
-          <div className="flex items-center gap-2.5">
+          <div className="flex items-center gap-1.5 shrink-0">
             <button
               type="button"
-              disabled={generating || (isAuthenticated && prompt.trim().length < 3)}
-              onClick={() => void handleGenerate()}
-              className="inline-flex min-h-[48px] flex-1 items-center justify-center gap-2 rounded-2xl bg-[#D4AF37] px-5 py-3 text-sm font-extrabold text-[#0A0906] shadow-lg shadow-[#D4AF37]/20 transition-all hover:bg-[#E5C150] active:scale-[0.98] disabled:opacity-60 cursor-pointer"
+              onClick={() => setViewMode((v) => (v === 'chat' ? 'gallery' : 'chat'))}
+              className={`inline-flex min-h-[34px] items-center gap-1.5 rounded-xl border px-2.5 py-1 text-xs font-bold transition-colors cursor-pointer ${
+                viewMode === 'gallery'
+                  ? 'border-[#D4AF37] bg-[#D4AF37] text-[#0A0906]'
+                  : 'border-[#D4AF37]/30 text-[#4F4736] hover:bg-[#D4AF37]/10 dark:text-[#F5D77A]'
+              }`}
             >
-              {generating ? (
-                <>
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  <span>{queueStatus || 'Generating Image...'}</span>
-                </>
-              ) : (
-                <>
-                  <Wand2 className="h-4 w-4" />
-                  <span>Generate Free Image</span>
-                </>
-              )}
+              <ImageIcon className="h-3.5 w-3.5" />
+              <span>Gallery ({gallery.length})</span>
             </button>
 
-            {generating && (
+            {messages.length > 0 && viewMode === 'chat' && (
               <button
                 type="button"
                 onClick={() => {
                   abortRef.current = true;
-                  setGenerating(false);
-                  setQueueStatus(null);
+                  setMessages([]);
+                  setSending(false);
+                  setGlobalError(null);
+                  onShowToast('Started a fresh chat');
                 }}
-                className="min-h-[48px] rounded-2xl border border-[#D4AF37]/35 px-4 text-xs font-bold text-[#6E6552] hover:bg-[#D4AF37]/10 dark:text-[#D5CCB8]"
+                title="Start a new chat"
+                className="inline-flex min-h-[34px] items-center gap-1 rounded-xl border border-[#D4AF37]/25 px-2.5 py-1 text-xs font-bold text-[#6E6552] hover:bg-[#D4AF37]/10 cursor-pointer dark:text-[#D5CCB8]"
               >
-                Cancel
+                <Plus className="h-3.5 w-3.5" />
+                <span>New</span>
               </button>
             )}
           </div>
         </div>
-      </section>
 
-      {/* Active Result Viewer */}
-      <section className="rounded-3xl border border-[#D4AF37]/30 bg-white p-4 sm:p-6 shadow-sm dark:bg-[#14120D]">
-        {generating && !activeImage ? (
-          <div className="flex flex-col items-center justify-center py-16 text-center">
-            <div className="flex h-16 w-16 items-center justify-center rounded-3xl border border-[#D4AF37]/40 bg-[#D4AF37]/10 text-[#D4AF37] mb-4">
-              <Loader2 className="h-8 w-8 animate-spin" />
-            </div>
-            <p className="font-display text-base font-bold text-[#1A160D] dark:text-[#FAF6EC]">
-              {queueStatus || 'Creating your artwork...'}
-            </p>
-            <p className="mt-1 text-xs text-[#6E6552] dark:text-[#A89F8C]">
-              Usually completes in 8–20 seconds
-            </p>
-          </div>
-        ) : activeImage ? (
-          <div className="space-y-4">
-            <div className="relative overflow-hidden rounded-2xl border border-[#D4AF37]/30 bg-[#0B0A07] flex items-center justify-center">
-              <img
-                src={activeImage.imageDataUrl}
-                alt={activeImage.prompt}
-                className="max-h-[520px] w-full object-contain"
-              />
-            </div>
-
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="min-w-0 flex-1">
-                <p className="text-xs font-semibold text-[#1A160D] line-clamp-2 dark:text-[#FAF6EC]">
-                  {activeImage.prompt}
-                </p>
-                <p className="mt-0.5 text-[11px] text-[#6E6552] dark:text-[#A89F8C]">
-                  {activeImage.aspectRatio} · {activeImage.style} · {activeImage.provider}
-                </p>
-              </div>
-
-              <div className="flex flex-wrap items-center gap-2">
+        {/* VIEW A: GALLERY */}
+        {viewMode === 'gallery' ? (
+          <div className="p-4 sm:p-5">
+            <div className="flex items-center justify-between mb-3">
+              <p className="text-xs font-bold text-[#6E6552] dark:text-[#A89F8C]">
+                Saved Free Creations ({gallery.length})
+              </p>
+              {gallery.length > 0 && (
                 <button
                   type="button"
-                  onClick={() => handleDownload(activeImage)}
-                  className="inline-flex min-h-[40px] items-center gap-1.5 rounded-xl bg-[#D4AF37] px-3.5 py-2 text-xs font-extrabold text-[#0A0906] hover:bg-[#E5C150] cursor-pointer"
-                >
-                  <Download className="h-3.5 w-3.5" />
-                  <span>Download</span>
-                </button>
-
-                <button
-                  type="button"
-                  disabled={generating}
                   onClick={() => {
-                    setPrompt(activeImage.prompt);
-                    void handleGenerate(activeImage.prompt);
+                    setGallery([]);
+                    onShowToast('Gallery cleared');
                   }}
-                  className="inline-flex min-h-[40px] items-center gap-1.5 rounded-xl border border-[#D4AF37]/35 px-3 py-2 text-xs font-bold text-[#3E3522] hover:bg-[#D4AF37]/10 disabled:opacity-50 dark:text-[#FAF6EC]"
+                  className="text-xs font-bold text-rose-600 hover:underline cursor-pointer dark:text-rose-400"
                 >
-                  <RefreshCw className="h-3.5 w-3.5" />
-                  <span>Regenerate</span>
+                  Clear All
                 </button>
+              )}
+            </div>
 
+            {gallery.length === 0 ? (
+              <div className="flex flex-col items-center justify-center rounded-2xl border border-dashed border-[#D4AF37]/30 py-14 text-center px-4">
+                <ImageIcon className="h-8 w-8 text-[#D4AF37] mb-2.5" />
+                <p className="text-sm font-bold text-[#1A160D] dark:text-[#FAF6EC]">
+                  No generated images yet
+                </p>
+                <p className="mt-1 max-w-xs text-xs text-[#6E6552] dark:text-[#A89F8C]">
+                  Ask VeriBox AI to draw or generate any picture in the chat to save it here.
+                </p>
                 <button
                   type="button"
-                  onClick={() => onCopyText(activeImage.prompt, 'Prompt copied!')}
-                  className="inline-flex min-h-[40px] items-center gap-1.5 rounded-xl border border-[#D4AF37]/35 px-3 py-2 text-xs font-bold text-[#3E3522] hover:bg-[#D4AF37]/10 dark:text-[#FAF6EC]"
+                  onClick={() => setViewMode('chat')}
+                  className="mt-4 rounded-xl bg-[#D4AF37] px-4 py-2 text-xs font-extrabold text-[#0A0906] hover:bg-[#E5C150] cursor-pointer"
                 >
-                  <Copy className="h-3.5 w-3.5" />
-                  <span>Copy Prompt</span>
+                  Back to Chat
                 </button>
               </div>
-            </div>
+            ) : (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {gallery.map((item) => (
+                  <div
+                    key={item.id}
+                    className="overflow-hidden rounded-2xl border border-[#D4AF37]/25 bg-[#FAF7F0] dark:bg-[#0B0A07]"
+                  >
+                    <div className="relative aspect-square bg-[#0A0906]">
+                      <img
+                        src={item.imageDataUrl}
+                        alt={item.prompt}
+                        className="h-full w-full object-cover"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteGalleryItem(item.id)}
+                        aria-label="Delete image"
+                        className="absolute right-2 top-2 flex h-8 w-8 items-center justify-center rounded-lg bg-black/70 text-white hover:bg-rose-600 cursor-pointer"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                    <div className="p-3 space-y-2">
+                      <p className="text-xs font-semibold text-[#1A160D] line-clamp-2 dark:text-[#FAF6EC]">
+                        {item.prompt}
+                      </p>
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[10px] font-bold text-[#8A7F6A]">
+                          {item.aspectRatio} · {item.provider}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => handleDownload(item)}
+                          className="inline-flex items-center gap-1 rounded-lg bg-[#D4AF37] px-2.5 py-1 text-[11px] font-extrabold text-[#0A0906] hover:bg-[#E5C150] cursor-pointer"
+                        >
+                          <Download className="h-3 w-3" />
+                          <span>Save</span>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         ) : (
-          <div className="flex flex-col items-center justify-center py-12 text-center">
-            <div className="flex h-14 w-14 items-center justify-center rounded-2xl border border-[#D4AF37]/30 bg-[#D4AF37]/10 text-[#9A6F09] dark:text-[#F5D77A] mb-3">
-              <ImageIcon className="h-7 w-7" />
+          /* VIEW B: CONVERSATIONAL AI BOT CHAT + IMAGE UPLOAD + FREE GENERATOR */
+          <div className="flex flex-col">
+            {/* Scrollable Messages Feed */}
+            <div className="min-h-[340px] max-h-[54dvh] overflow-y-auto px-3.5 py-4 sm:px-5 space-y-3.5 bg-[#FAF7F0]/40 dark:bg-[#0B0A07]/60">
+              {messages.length === 0 ? (
+                <div className="space-y-4 py-4">
+                  <div className="flex items-start gap-2.5">
+                    <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border border-[#D4AF37]/40 bg-[#D4AF37]/15 text-[#8A6208] dark:text-[#F5D77A]">
+                      <Bot className="h-4 w-4" />
+                    </div>
+                    <div className="max-w-[88%] rounded-2xl rounded-tl-sm border border-[#D4AF37]/25 bg-white p-3.5 shadow-sm dark:bg-[#14120D]">
+                      <p className="text-sm font-bold text-[#1A160D] dark:text-[#FAF6EC]">
+                        Hello! I&apos;m VeriBox AI
+                      </p>
+                      <p className="mt-1 text-xs leading-relaxed text-[#6E6552] dark:text-[#A89F8C]">
+                        Chat with me normally, ask anything about VeriBox (emails, numbers, Paystack deposits), upload any photo using the picture icon below, or tell me what image to create for free.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="pl-10 space-y-2">
+                    <p className="text-[11px] font-bold text-[#8A7F6A] dark:text-[#A89F8C]">
+                      Try asking or generating:
+                    </p>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      {STARTER_CHIPS.map((chip, idx) => (
+                        <button
+                          key={idx}
+                          type="button"
+                          onClick={() => void handleSendMessage(chip.text, chip.mode || 'auto')}
+                          className="flex items-center gap-2 rounded-xl border border-[#D4AF37]/25 bg-white px-3 py-2.5 text-left text-xs font-semibold text-[#2C261A] transition-colors hover:border-[#D4AF37] hover:bg-[#D4AF37]/10 cursor-pointer dark:bg-[#14120D] dark:text-[#EAE2CF]"
+                        >
+                          {chip.mode === 'image' ? (
+                            <Wand2 className="h-3.5 w-3.5 shrink-0 text-[#D4AF37]" />
+                          ) : (
+                            <MessageSquare className="h-3.5 w-3.5 shrink-0 text-[#D4AF37]" />
+                          )}
+                          <span className="truncate">{chip.label}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                messages.map((msg) => {
+                  const isUser = msg.role === 'user';
+                  return (
+                    <div
+                      key={msg.id}
+                      className={`flex items-start gap-2.5 ${
+                        isUser ? 'flex-row-reverse' : 'flex-row'
+                      }`}
+                    >
+                      <div
+                        className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border ${
+                          isUser
+                            ? 'border-[#D4AF37] bg-[#D4AF37] text-[#0A0906]'
+                            : 'border-[#D4AF37]/40 bg-[#D4AF37]/15 text-[#8A6208] dark:text-[#F5D77A]'
+                        }`}
+                      >
+                        {isUser ? <User className="h-4 w-4" /> : <Bot className="h-4 w-4" />}
+                      </div>
+
+                      <div
+                        className={`max-w-[85%] space-y-2.5 rounded-2xl px-3.5 py-3 shadow-sm ${
+                          isUser
+                            ? 'rounded-tr-sm border border-[#D4AF37]/50 bg-[#D4AF37]/15 text-[#1A160D] dark:bg-[#D4AF37]/20 dark:text-[#FAF6EC]'
+                            : 'rounded-tl-sm border border-[#D4AF37]/25 bg-white text-[#1A160D] dark:bg-[#14120D] dark:text-[#FAF6EC]'
+                        }`}
+                      >
+                        {msg.uploadedImageUrl && (
+                          <div className="overflow-hidden rounded-xl border border-[#D4AF37]/30 bg-black/40">
+                            <img
+                              src={msg.uploadedImageUrl}
+                              alt="Uploaded attachment"
+                              className="max-h-56 w-auto object-contain"
+                            />
+                          </div>
+                        )}
+
+                        <p className="text-xs sm:text-sm leading-relaxed whitespace-pre-wrap break-words">
+                          {msg.text}
+                        </p>
+
+                        {msg.generatingImage && (
+                          <div className="flex items-center gap-2.5 rounded-xl border border-[#D4AF37]/35 bg-[#FAF7F0] px-3 py-2.5 text-xs dark:bg-[#0B0A07]">
+                            <Loader2 className="h-4 w-4 shrink-0 animate-spin text-[#D4AF37]" />
+                            <span className="font-semibold text-[#8A6208] dark:text-[#F5D77A]">
+                              {msg.queueStatus || 'Generating free artwork...'}
+                            </span>
+                          </div>
+                        )}
+
+                        {msg.generatedImage && (
+                          <div className="space-y-2.5 pt-1">
+                            <div className="overflow-hidden rounded-xl border border-[#D4AF37]/35 bg-[#0A0906]">
+                              <img
+                                src={msg.generatedImage.imageDataUrl}
+                                alt={msg.generatedImage.prompt}
+                                className="max-h-80 w-full object-contain"
+                              />
+                            </div>
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => handleDownload(msg.generatedImage!)}
+                                className="inline-flex min-h-[34px] items-center gap-1 rounded-lg bg-[#D4AF37] px-3 py-1 text-[11px] font-extrabold text-[#0A0906] hover:bg-[#E5C150] cursor-pointer"
+                              >
+                                <Download className="h-3 w-3" />
+                                <span>Download</span>
+                              </button>
+                              <button
+                                type="button"
+                                disabled={sending}
+                                onClick={() => void handleRegenerateFromMessage(msg.generatedImage!)}
+                                className="inline-flex min-h-[34px] items-center gap-1 rounded-lg border border-[#D4AF37]/35 px-2.5 py-1 text-[11px] font-bold text-[#4F4736] hover:bg-[#D4AF37]/10 disabled:opacity-50 cursor-pointer dark:text-[#F5D77A]"
+                              >
+                                <RefreshCw className="h-3 w-3" />
+                                <span>Regenerate</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  onCopyText(msg.generatedImage!.prompt, 'Prompt copied!')
+                                }
+                                className="inline-flex min-h-[34px] items-center gap-1 rounded-lg border border-[#D4AF37]/25 px-2.5 py-1 text-[11px] font-bold text-[#6E6552] hover:bg-[#D4AF37]/10 cursor-pointer dark:text-[#D5CCB8]"
+                              >
+                                <Copy className="h-3 w-3" />
+                                <span>Copy</span>
+                              </button>
+                            </div>
+                          </div>
+                        )}
+
+                        {msg.error && (
+                          <div className="flex items-start gap-2 rounded-xl border border-rose-500/35 bg-rose-500/10 p-2.5 text-[11px] font-medium text-rose-700 dark:text-rose-200">
+                            <AlertCircle className="h-3.5 w-3.5 shrink-0 mt-0.5 text-rose-500" />
+                            <span>{msg.error}</span>
+                          </div>
+                        )}
+
+                        {!isUser && msg.provider && !msg.generatingImage && (
+                          <p className="text-[10px] font-semibold text-[#8A7F6A] dark:text-[#A89F8C]">
+                            {msg.provider}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+              <div ref={chatEndRef} />
             </div>
-            <p className="font-display text-sm font-bold text-[#1A160D] dark:text-[#FAF6EC]">
-              Your generated image will appear here
-            </p>
-            <p className="mt-1 max-w-sm text-xs text-[#6E6552] dark:text-[#A89F8C]">
-              Type any prompt above or tap a quick idea, then press Generate Free Image.
-            </p>
+
+            {/* Composer & Controls */}
+            <div className="border-t border-[#D4AF37]/20 bg-white p-3 sm:p-4 space-y-2.5 dark:bg-[#14120D]">
+              {/* Mode Toggle + Image Options Button */}
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="inline-flex rounded-xl border border-[#D4AF37]/25 bg-[#FAF7F0] p-0.5 dark:bg-[#0B0A07]">
+                  {(
+                    [
+                      { id: 'auto', label: 'Auto Smart' },
+                      { id: 'chat', label: 'Chat' },
+                      { id: 'image', label: 'Create Image' },
+                    ] as const
+                  ).map((m) => (
+                    <button
+                      key={m.id}
+                      type="button"
+                      onClick={() => {
+                        setChatMode(m.id);
+                        if (m.id === 'image') setShowImageOptions(true);
+                      }}
+                      className={`rounded-lg px-2.5 py-1 text-[11px] font-extrabold transition-colors cursor-pointer ${
+                        chatMode === m.id
+                          ? 'bg-[#D4AF37] text-[#0A0906]'
+                          : 'text-[#6E6552] hover:text-[#1A160D] dark:text-[#A89F8C] dark:hover:text-[#FAF6EC]'
+                      }`}
+                    >
+                      {m.label}
+                    </button>
+                  ))}
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => setShowImageOptions((prev) => !prev)}
+                  className={`inline-flex items-center gap-1 rounded-xl border px-2.5 py-1 text-[11px] font-bold transition-colors cursor-pointer ${
+                    showImageOptions
+                      ? 'border-[#D4AF37] bg-[#D4AF37]/15 text-[#8A6208] dark:text-[#F5D77A]'
+                      : 'border-[#D4AF37]/25 text-[#6E6552] hover:bg-[#D4AF37]/10 dark:text-[#A89F8C]'
+                  }`}
+                >
+                  <SlidersHorizontal className="h-3 w-3" />
+                  <span>{style} · {aspectRatio}</span>
+                </button>
+              </div>
+
+              {/* Optional Style & Aspect Ratio Controls */}
+              {showImageOptions && (
+                <div className="rounded-2xl border border-[#D4AF37]/25 bg-[#FAF7F0] p-3 space-y-2.5 dark:bg-[#0B0A07]">
+                  <div>
+                    <p className="mb-1 text-[10px] font-bold text-[#6E6552] dark:text-[#A89F8C]">
+                      Image Style
+                    </p>
+                    <div className="flex flex-wrap gap-1.5">
+                      {STYLE_OPTIONS.map((opt) => (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          onClick={() => setStyle(opt.id)}
+                          className={`rounded-lg border px-2.5 py-1 text-[11px] font-bold transition-colors cursor-pointer ${
+                            style === opt.id
+                              ? 'border-[#D4AF37] bg-[#D4AF37] text-[#0A0906]'
+                              : 'border-[#D4AF37]/25 bg-white text-[#4F4736] dark:bg-[#14120D] dark:text-[#D5CCB8]'
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div>
+                    <p className="mb-1 text-[10px] font-bold text-[#6E6552] dark:text-[#A89F8C]">
+                      Aspect Ratio
+                    </p>
+                    <div className="flex flex-wrap gap-1.5">
+                      {ASPECT_OPTIONS.map((opt) => (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          onClick={() => setAspectRatio(opt.id)}
+                          className={`rounded-lg border px-2.5 py-1 text-[11px] font-bold transition-colors cursor-pointer ${
+                            aspectRatio === opt.id
+                              ? 'border-[#D4AF37] bg-[#D4AF37] text-[#0A0906]'
+                              : 'border-[#D4AF37]/25 bg-white text-[#4F4736] dark:bg-[#14120D] dark:text-[#D5CCB8]'
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {globalError && (
+                <div className="flex items-center justify-between gap-2 rounded-xl border border-rose-500/35 bg-rose-500/10 px-3 py-2 text-xs text-rose-700 dark:text-rose-200">
+                  <span>{globalError}</span>
+                  <button
+                    type="button"
+                    onClick={() => setGlobalError(null)}
+                    className="shrink-0 text-rose-500"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              )}
+
+              {/* Uploaded Photo Attachment Preview */}
+              {attachedImageUrl && (
+                <div className="flex items-center justify-between gap-2 rounded-2xl border border-[#D4AF37]/40 bg-[#FAF7F0] p-2 dark:bg-[#0B0A07]">
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <img
+                      src={attachedImageUrl}
+                      alt="Upload preview"
+                      className="h-11 w-11 shrink-0 rounded-xl border border-[#D4AF37]/30 object-cover"
+                    />
+                    <div className="min-w-0">
+                      <p className="truncate text-xs font-bold text-[#1A160D] dark:text-[#FAF6EC]">
+                        {attachedImageName || 'Attached photo'}
+                      </p>
+                      <p className="text-[10px] text-[#6E6552] dark:text-[#A89F8C]">
+                        Ready to send to VeriBox AI
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAttachedImageUrl(null);
+                      setAttachedImageName('');
+                    }}
+                    aria-label="Remove attached photo"
+                    className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-[#6E6552] hover:bg-rose-500/15 hover:text-rose-500 cursor-pointer"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+              )}
+
+              {/* Chat Input Bar with Photo Upload & Send */}
+              <div className="flex items-end gap-2 rounded-2xl border border-[#D4AF37]/40 bg-[#FAF7F0] p-1.5 focus-within:border-[#D4AF37] dark:bg-[#0B0A07]">
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="image/*"
+                  onChange={(e) => void handleSelectPhoto(e)}
+                  className="hidden"
+                />
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={sending}
+                  title="Upload a photo"
+                  aria-label="Upload a photo"
+                  className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-[#D4AF37]/30 bg-white text-[#8A6208] transition-colors hover:bg-[#D4AF37]/15 disabled:opacity-50 cursor-pointer dark:bg-[#14120D] dark:text-[#F5D77A]"
+                >
+                  <ImagePlus className="h-4 w-4" />
+                </button>
+
+                <textarea
+                  rows={1}
+                  value={inputText}
+                  onChange={(e) => {
+                    setInputText(e.target.value);
+                    if (globalError) setGlobalError(null);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                      e.preventDefault();
+                      void handleSendMessage();
+                    }
+                  }}
+                  placeholder={
+                    chatMode === 'image'
+                      ? 'Describe the free image to generate...'
+                      : attachedImageUrl
+                        ? 'Ask about this photo or how to edit it...'
+                        : 'Chat with VeriBox AI, upload photo, or ask to draw...'
+                  }
+                  className="max-h-28 min-h-[40px] flex-1 resize-none bg-transparent py-2 text-xs sm:text-sm text-[#1A160D] placeholder:text-[#8A7F6A] focus:outline-none dark:text-[#FAF6EC]"
+                />
+
+                <button
+                  type="button"
+                  disabled={sending || (!inputText.trim() && !attachedImageUrl)}
+                  onClick={() => void handleSendMessage()}
+                  aria-label="Send message"
+                  className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[#D4AF37] text-[#0A0906] shadow-md transition-all hover:bg-[#E5C150] disabled:opacity-45 cursor-pointer"
+                >
+                  {sending ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : chatMode === 'image' ? (
+                    <Sparkles className="h-4 w-4" />
+                  ) : (
+                    <Send className="h-4 w-4" />
+                  )}
+                </button>
+              </div>
+            </div>
           </div>
         )}
       </section>
-
-      {/* Recent Creations */}
-      {gallery.length > 0 && (
-        <section className="rounded-3xl border border-[#D4AF37]/25 bg-white p-4 sm:p-5 shadow-sm dark:bg-[#14120D]">
-          <div className="flex items-center justify-between mb-3">
-            <h2 className="font-display text-sm font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
-              Recent Creations ({gallery.length})
-            </h2>
-            <button
-              type="button"
-              onClick={() => {
-                setGallery([]);
-                setActiveImage(null);
-                onShowToast('Gallery cleared');
-              }}
-              className="text-xs font-bold text-[#6E6552] hover:text-rose-500 dark:text-[#A89F8C]"
-            >
-              Clear All
-            </button>
-          </div>
-
-          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-            {gallery.map((item) => {
-              const isSelected = activeImage?.id === item.id;
-              return (
-                <div
-                  key={item.id}
-                  className={`group relative overflow-hidden rounded-2xl border transition-all ${
-                    isSelected
-                      ? 'border-[#D4AF37] ring-2 ring-[#D4AF37]/40'
-                      : 'border-[#D4AF37]/20 hover:border-[#D4AF37]/60'
-                  }`}
-                >
-                  <button
-                    type="button"
-                    onClick={() => setActiveImage(item)}
-                    className="block w-full aspect-square bg-[#0B0A07] overflow-hidden"
-                  >
-                    <img
-                      src={item.imageDataUrl}
-                      alt={item.prompt}
-                      className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
-                    />
-                  </button>
-                  <button
-                    type="button"
-                    aria-label="Delete generated image"
-                    onClick={() => handleDeleteImage(item.id)}
-                    className="absolute right-2 top-2 flex h-7 w-7 items-center justify-center rounded-lg bg-black/70 text-white opacity-90 hover:bg-rose-600"
-                  >
-                    <Trash2 className="h-3.5 w-3.5" />
-                  </button>
-                </div>
-              );
-            })}
-          </div>
-        </section>
-      )}
     </div>
   );
 }

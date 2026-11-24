@@ -45,6 +45,7 @@ interface CreateEmailTabProps {
 type BrowserScreen =
   | 'signin'
   | 'signin-password'
+  | 'name'
   | 'birthdate'
   | 'choose'
   | 'password'
@@ -98,6 +99,8 @@ export function CreateEmailTab({
   const [accountMode, setAccountMode] = useState<AccountMode>('personal');
   const [createMenuOpen, setCreateMenuOpen] = useState(false);
   const [usernameInput, setUsernameInput] = useState('');
+  const [firstName, setFirstName] = useState('');
+  const [lastName, setLastName] = useState('');
 
   // Existing Email Login / Recovery State
   const [recoveryEmail, setRecoveryEmail] = useState('');
@@ -329,7 +332,7 @@ export function CreateEmailTab({
     }
   };
 
-  // STEP 1B: Selecting Personal / Business / Privacy automatically loads account creation by itself
+  // STEP 1B: Selecting Personal / Business / Privacy automatically loads Name entry screen first
   const handleSelectAccountModeAndStart = (mode: AccountMode) => {
     setAccountMode(mode);
     setCreateMenuOpen(false);
@@ -340,7 +343,19 @@ export function CreateEmailTab({
         : mode === 'privacy'
           ? 'Loading high-privacy stealth setup...'
           : 'Loading personal email setup...';
-    navigateBrowserTo('birthdate', 480, label);
+    navigateBrowserTo('name', 420, label);
+  };
+
+  // STEP 1D: First Name & Second Name -> Next (Proceeds to Birthday & Age)
+  const handleNameNext = (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    const cleanFirst = firstName.trim();
+    if (cleanFirst.length < 2) {
+      setError('Please enter your first name (at least 2 letters).');
+      return;
+    }
+    navigateBrowserTo('birthdate', 320);
   };
 
   // STEP 1C: Verify password to sign in / recover an existing or deleted email
@@ -439,7 +454,7 @@ export function CreateEmailTab({
     }
   };
 
-  // STEP 2: Birthday & Age -> Next (Fetches live email choices)
+  // STEP 2: Birthday & Age -> Next (Fetches live email choices personalized to First + Second Name)
   const handleBirthdateNext = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
@@ -452,16 +467,14 @@ export function CreateEmailTab({
 
     setIsBrowserLoading(true);
     setBrowserProgress(50);
-    const typedPrefix = usernameInput.includes('@')
-      ? usernameInput.split('@')[0]
-      : usernameInput;
-    const cleanName = typedPrefix.trim().replace(/[^a-zA-Z0-9]/g, '') || 'veribox';
-    const yearSuffix = birthYear.slice(-2);
+    const cleanFirst = firstName.trim().replace(/[^a-zA-Z0-9]/g, '') || 'veribox';
+    const cleanSecond =
+      lastName.trim().replace(/[^a-zA-Z0-9]/g, '') || birthYear.slice(-2) || 'mail';
 
     try {
       const params = new URLSearchParams({
-        firstName: cleanName,
-        lastName: yearSuffix,
+        firstName: cleanFirst,
+        lastName: cleanSecond,
       });
       const res = await fetch(`/api/email/suggestions?${params.toString()}`, {
         signal: AbortSignal.timeout(6000),
@@ -480,7 +493,7 @@ export function CreateEmailTab({
       setBrowserProgress(100);
       setScreen('choose');
     } catch {
-      const fallbackOptions = generateDirectEmailSuggestions(cleanName, yearSuffix);
+      const fallbackOptions = generateDirectEmailSuggestions(cleanFirst, cleanSecond);
       setOptions(fallbackOptions);
       setSelectedOption(fallbackOptions[0]);
       setBrowserProgress(100);
@@ -616,6 +629,8 @@ export function CreateEmailTab({
       paidSessionRefCurrent.current = null;
       setPaidSessionRef(null);
 
+      const fullName = [firstName.trim(), lastName.trim()].filter(Boolean).join(' ');
+
       const newAccount: TempEmailAccount = {
         id: data.id,
         address: data.address,
@@ -624,7 +639,7 @@ export function CreateEmailTab({
         provider: data.provider || 'guerrilla',
         createdAt: data.createdAt || new Date().toISOString(),
         accountMode,
-        displayName: usernameInput.trim() || undefined,
+        displayName: fullName || usernameInput.trim() || undefined,
       };
 
       onShowToast(`Email live: ${newAccount.address}`);
@@ -645,13 +660,15 @@ export function CreateEmailTab({
       ? 'https://accounts.veribox.net/v3/signin/identifier'
       : screen === 'signin-password'
         ? 'https://accounts.veribox.net/v3/signin/challenge/pwd'
-        : screen === 'birthdate'
-          ? 'https://accounts.veribox.net/v3/signup/basicinfo'
-          : screen === 'choose'
-            ? 'https://accounts.veribox.net/v3/signup/webaddress'
-            : screen === 'password'
-              ? 'https://accounts.veribox.net/v3/signup/passwd'
-              : 'https://accounts.veribox.net/v3/signup/privacyterms';
+        : screen === 'name'
+          ? 'https://accounts.veribox.net/v3/signup/name'
+          : screen === 'birthdate'
+            ? 'https://accounts.veribox.net/v3/signup/basicinfo'
+            : screen === 'choose'
+              ? 'https://accounts.veribox.net/v3/signup/webaddress'
+              : screen === 'password'
+                ? 'https://accounts.veribox.net/v3/signup/passwd'
+                : 'https://accounts.veribox.net/v3/signup/privacyterms';
 
   // 1. INITIAL GOOGLE-STYLE SSO TRIGGER CARD
   if (!inBrowser) {
@@ -871,8 +888,8 @@ export function CreateEmailTab({
                   </p>
                 </div>
 
-                {/* Create Account Selector Menu — selecting an option immediately loads the creation flow */}
-                <div className="relative pt-1">
+                {/* Create Account Selector Menu — selecting an option immediately loads the Name screen */}
+                <div className="pt-1">
                   <button
                     type="button"
                     onClick={() => setCreateMenuOpen((prev) => !prev)}
@@ -887,7 +904,7 @@ export function CreateEmailTab({
                   </button>
 
                   {createMenuOpen && (
-                    <div className="absolute left-0 z-30 mt-1 w-68 overflow-hidden rounded-2xl border border-[#D4AF37]/35 bg-white p-1.5 shadow-2xl dark:bg-[#19160F]">
+                    <div className="mt-2 w-full overflow-hidden rounded-2xl border border-[#D4AF37]/35 bg-[#FAF7F0] p-1.5 shadow-xl dark:bg-[#19160F]">
                       <button
                         type="button"
                         onClick={() => handleSelectAccountModeAndStart('personal')}
@@ -925,7 +942,7 @@ export function CreateEmailTab({
                   )}
                 </div>
 
-                <div className="flex items-center justify-end pt-4">
+                <div className="flex items-center justify-end pt-3">
                   <button
                     type="submit"
                     disabled={!hasTypedEmail || isBrowserLoading}
@@ -1037,6 +1054,75 @@ export function CreateEmailTab({
               </form>
             )}
 
+            {/* SCREEN 1D: FIRST NAME & SECOND NAME */}
+            {!loadingMessage && screen === 'name' && (
+              <form onSubmit={handleNameNext} className="mt-6 space-y-4">
+                <div>
+                  <h2 className="font-display text-2xl font-black tracking-tight text-[#1A160D] dark:text-[#FAF6EC]">
+                    Create a VeriBox Mail
+                  </h2>
+                  <p className="mt-0.5 text-xs text-[#6E6552] dark:text-[#A89F8C]">
+                    {modeLabel(accountMode)} · Enter your first name and second name
+                  </p>
+                </div>
+
+                <div className="space-y-3 pt-2">
+                  <div>
+                    <label className="mb-1 block text-[11px] font-bold text-[#6E6552] dark:text-[#A89F8C]">
+                      First name
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      autoFocus
+                      value={firstName}
+                      onChange={(e) => {
+                        setFirstName(e.target.value);
+                        if (error) setError(null);
+                      }}
+                      placeholder="First name"
+                      className="h-12 w-full rounded-xl border border-[#D4AF37]/35 bg-[#FAF7F0] px-4 text-sm font-semibold text-[#1A160D] placeholder:text-[#8A7F6A] focus:border-[#D4AF37] focus:outline-none dark:bg-[#0A0906] dark:text-[#FAF6EC]"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="mb-1 block text-[11px] font-bold text-[#6E6552] dark:text-[#A89F8C]">
+                      Second name <span className="font-normal opacity-75">(optional)</span>
+                    </label>
+                    <input
+                      type="text"
+                      value={lastName}
+                      onChange={(e) => {
+                        setLastName(e.target.value);
+                        if (error) setError(null);
+                      }}
+                      placeholder="Second / Last name (optional)"
+                      className="h-12 w-full rounded-xl border border-[#D4AF37]/35 bg-[#FAF7F0] px-4 text-sm font-semibold text-[#1A160D] placeholder:text-[#8A7F6A] focus:border-[#D4AF37] focus:outline-none dark:bg-[#0A0906] dark:text-[#FAF6EC]"
+                    />
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between pt-6">
+                  <button
+                    type="button"
+                    onClick={() => navigateBrowserTo('signin')}
+                    className="inline-flex min-h-[42px] items-center gap-1 rounded-xl px-3 py-2 text-xs font-bold text-[#7B6F57] hover:bg-[#D4AF37]/10 cursor-pointer dark:text-[#A89F8C]"
+                  >
+                    <ArrowLeft className="h-3.5 w-3.5" />
+                    <span>Back</span>
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={firstName.trim().length < 2}
+                    className="inline-flex min-h-[44px] items-center justify-center rounded-full bg-[#D4AF37] px-7 py-2.5 text-xs font-extrabold text-[#0A0906] hover:bg-[#E5C150] shadow-md disabled:opacity-45 cursor-pointer"
+                  >
+                    <span>Next</span>
+                    <ArrowRight className="ml-1.5 h-3.5 w-3.5" />
+                  </button>
+                </div>
+              </form>
+            )}
+
             {/* SCREEN 2: BIRTHDAY & AGE / DATE */}
             {!loadingMessage && screen === 'birthdate' && (
               <form onSubmit={handleBirthdateNext} className="mt-6 space-y-4">
@@ -1046,7 +1132,7 @@ export function CreateEmailTab({
                       Basic information
                     </h2>
                     <p className="mt-0.5 text-xs text-[#6E6552] dark:text-[#A89F8C]">
-                      {modeLabel(accountMode)} · Enter your birthday and gender
+                      {firstName.trim() ? `${firstName.trim()} · ` : ''}Enter your birthday and gender
                     </p>
                   </div>
                 </div>
@@ -1124,8 +1210,8 @@ export function CreateEmailTab({
                 <div className="flex items-center justify-between pt-6">
                   <button
                     type="button"
-                    onClick={() => navigateBrowserTo('signin')}
-                    className="inline-flex min-h-[42px] items-center gap-1 rounded-xl px-3 py-2 text-xs font-bold text-[#7B6F57] hover:bg-[#D4AF37]/10 dark:text-[#A89F8C]"
+                    onClick={() => navigateBrowserTo('name')}
+                    className="inline-flex min-h-[42px] items-center gap-1 rounded-xl px-3 py-2 text-xs font-bold text-[#7B6F57] hover:bg-[#D4AF37]/10 cursor-pointer dark:text-[#A89F8C]"
                   >
                     <ArrowLeft className="h-3.5 w-3.5" />
                     <span>Back</span>
@@ -1330,7 +1416,7 @@ export function CreateEmailTab({
                     Privacy and Terms
                   </h2>
                   <p className="mt-0.5 text-xs text-[#6E6552] dark:text-[#A89F8C]">
-                    Scroll and review your options, then tap Allow to activate
+                    Scroll and review your options, then tap Confirm to activate
                   </p>
                 </div>
 
@@ -1348,7 +1434,7 @@ export function CreateEmailTab({
                     Terms of VeriBox Ephemeral Mail:
                   </p>
                   <p className="leading-relaxed">
-                    By tapping Allow, you agree to the VeriBox disposable mailbox protocols. Your
+                    By tapping Confirm, you agree to the VeriBox disposable mailbox protocols. Your
                     inbox will receive incoming emails, verification codes, and signups in real time.
                   </p>
 
@@ -1410,7 +1496,7 @@ export function CreateEmailTab({
                     ) : (
                       <>
                         <Check className="h-4 w-4 stroke-[3]" />
-                        <span>Allow</span>
+                        <span>Allow &amp; Confirm</span>
                       </>
                     )}
                   </button>

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   ArrowLeft,
   ArrowRight,
@@ -15,6 +15,7 @@ import {
   ShieldCheck,
   Sparkles,
   User,
+  Wallet,
   X,
 } from 'lucide-react';
 import type { AccountMode, EmailSuggestionOption, TempEmailAccount } from '../types';
@@ -24,9 +25,15 @@ import {
   generateDirectEmailSuggestions,
 } from '../utils/directEmailFallback';
 
+const CREATE_EMAIL_FEE_NGN = 50;
+
 interface CreateEmailTabProps {
   isAuthenticated?: boolean;
   onRequireAuth?: (reason?: string) => void;
+  walletBalance?: number;
+  walletUserId?: string;
+  onWalletBalanceChange?: (nextBalance: number) => void;
+  onOpenDeposit?: () => void;
   savedEmails: TempEmailAccount[];
   deletedEmails?: TempEmailAccount[];
   onComplete: (account: TempEmailAccount) => void;
@@ -69,6 +76,10 @@ function modeLabel(mode: AccountMode): string {
 export function CreateEmailTab({
   isAuthenticated = true,
   onRequireAuth,
+  walletBalance = 0,
+  walletUserId = 'default-wallet',
+  onWalletBalanceChange,
+  onOpenDeposit,
   savedEmails,
   deletedEmails = [],
   onComplete,
@@ -104,9 +115,42 @@ export function CreateEmailTab({
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
 
-  // Email Choices
+  // Email Choices & ₦50 Fee Session Tracking
   const [options, setOptions] = useState<EmailSuggestionOption[]>([]);
   const [selectedOption, setSelectedOption] = useState<EmailSuggestionOption | null>(null);
+  const [paidSessionRef, setPaidSessionRef] = useState<string | null>(null);
+  const paidSessionRefCurrent = useRef<string | null>(null);
+  const [chargingCreateFee, setChargingCreateFee] = useState(false);
+  const [liveServerBalance, setLiveServerBalance] = useState<number | null>(null);
+  const walletUserIdRef = useRef(walletUserId);
+  walletUserIdRef.current = walletUserId;
+  const onWalletBalanceChangeRef = useRef(onWalletBalanceChange);
+  onWalletBalanceChangeRef.current = onWalletBalanceChange;
+
+  useEffect(() => {
+    return () => {
+      const refToRefund = paidSessionRefCurrent.current;
+      if (!refToRefund) return;
+      paidSessionRefCurrent.current = null;
+      void fetch('/api/wallet/refund', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: walletUserIdRef.current,
+          amount: CREATE_EMAIL_FEE_NGN,
+          reference: `refund-${refToRefund}`,
+        }),
+        keepalive: true,
+      })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d: { balance?: number | null } | null) => {
+          if (d && typeof d.balance === 'number') {
+            onWalletBalanceChangeRef.current?.(d.balance);
+          }
+        })
+        .catch(() => undefined);
+    };
+  }, []);
 
   // Terms Checkboxes
   const [agreeSpamShield, setAgreeSpamShield] = useState(true);
@@ -116,6 +160,71 @@ export function CreateEmailTab({
   // Error & Submission
   const [error, setError] = useState<string | null>(null);
   const [creatingFinal, setCreatingFinal] = useState(false);
+
+  const effectiveBalance =
+    typeof liveServerBalance === 'number' ? liveServerBalance : walletBalance;
+
+  useEffect(() => {
+    setLiveServerBalance(walletBalance);
+  }, [walletBalance]);
+
+  useEffect(() => {
+    if (!inBrowser || screen !== 'choose' || !isAuthenticated) return;
+    let active = true;
+    void (async () => {
+      try {
+        const res = await fetch(
+          `/api/wallet/balance?userId=${encodeURIComponent(walletUserId)}`
+        );
+        if (!res.ok || !active) return;
+        const data = await parseJsonResponse<{
+          balance?: number | null;
+          supabasePersisted?: boolean;
+        }>(res);
+        if (active && typeof data.balance === 'number') {
+          setLiveServerBalance(data.balance);
+          onWalletBalanceChange?.(data.balance);
+        }
+      } catch {
+        // Keep prop balance
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [inBrowser, screen, isAuthenticated, walletUserId, onWalletBalanceChange]);
+
+  const refundHeldCreateFee = async (reasonToast?: string) => {
+    const refToRefund = paidSessionRefCurrent.current;
+    if (!refToRefund) return;
+    paidSessionRefCurrent.current = null;
+    setPaidSessionRef(null);
+    try {
+      const res = await fetch('/api/wallet/refund', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: walletUserId,
+          amount: CREATE_EMAIL_FEE_NGN,
+          reference: `refund-${refToRefund}`,
+        }),
+      });
+      const data = await parseJsonResponse<{ balance?: number | null }>(res);
+      if (res.ok && typeof data.balance === 'number') {
+        setLiveServerBalance(data.balance);
+        onWalletBalanceChange?.(data.balance);
+      } else {
+        const next = effectiveBalance + CREATE_EMAIL_FEE_NGN;
+        setLiveServerBalance(next);
+        onWalletBalanceChange?.(next);
+      }
+      if (reasonToast) {
+        onShowToast(reasonToast);
+      }
+    } catch {
+      // Best-effort refund
+    }
+  };
 
   // Trigger smooth browser page loading
   const navigateBrowserTo = (
@@ -151,6 +260,7 @@ export function CreateEmailTab({
   };
 
   const handleCloseBrowser = () => {
+    void refundHeldCreateFee('Setup cancelled · ₦50 refunded to your wallet');
     setInBrowser(false);
     setScreen('signin');
     setCreateMenuOpen(false);
@@ -381,14 +491,75 @@ export function CreateEmailTab({
     }
   };
 
-  // STEP 3: Choose Email Address -> Next
-  const handleChooseNext = () => {
+  // STEP 3: Choose Email Address -> Next (Charges ₦50 from real wallet before advancing)
+  const handleChooseNext = async () => {
     setError(null);
     if (!selectedOption) {
       setError('Please select an email address');
       return;
     }
-    navigateBrowserTo('password');
+
+    if (paidSessionRefCurrent.current) {
+      navigateBrowserTo('password');
+      return;
+    }
+
+    setChargingCreateFee(true);
+    setIsBrowserLoading(true);
+    setBrowserProgress(45);
+    const chargeRef = `create-email-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+
+    try {
+      const res = await fetch('/api/wallet/deduct', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: walletUserId,
+          amount: CREATE_EMAIL_FEE_NGN,
+          reference: chargeRef,
+        }),
+        signal: AbortSignal.timeout(8000),
+      });
+      const data = await parseJsonResponse<{
+        balance?: number | null;
+        insufficient?: boolean;
+        error?: string;
+      }>(res);
+
+      if (res.status === 402 || data.insufficient) {
+        const serverBal = typeof data.balance === 'number' ? data.balance : effectiveBalance;
+        setLiveServerBalance(serverBal);
+        onWalletBalanceChange?.(serverBal);
+        const msg = `Insufficient wallet balance (₦${serverBal.toLocaleString()}). You need ₦${CREATE_EMAIL_FEE_NGN} to create a custom email.`;
+        setError(msg);
+        onShowToast(msg);
+        onOpenDeposit?.();
+        return;
+      }
+
+      if (!res.ok) {
+        throw new Error(data.error || 'Could not process ₦50 wallet payment.');
+      }
+
+      const nextBal =
+        typeof data.balance === 'number'
+          ? data.balance
+          : Math.max(0, effectiveBalance - CREATE_EMAIL_FEE_NGN);
+      setLiveServerBalance(nextBal);
+      onWalletBalanceChange?.(nextBal);
+      paidSessionRefCurrent.current = chargeRef;
+      setPaidSessionRef(chargeRef);
+      onShowToast(`₦${CREATE_EMAIL_FEE_NGN} deducted for custom email`);
+      navigateBrowserTo('password', 320);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Unable to verify wallet balance';
+      setError(msg);
+      onShowToast(msg);
+    } finally {
+      setChargingCreateFee(false);
+      setIsBrowserLoading(false);
+      setTimeout(() => setBrowserProgress(0), 200);
+    }
   };
 
   // STEP 4: Password -> Next
@@ -442,6 +613,8 @@ export function CreateEmailTab({
       }
 
       setBrowserProgress(100);
+      paidSessionRefCurrent.current = null;
+      setPaidSessionRef(null);
 
       const newAccount: TempEmailAccount = {
         id: data.id,
@@ -457,6 +630,7 @@ export function CreateEmailTab({
       onShowToast(`Email live: ${newAccount.address}`);
       onComplete(newAccount);
     } catch (err) {
+      await refundHeldCreateFee('Activation failed · ₦50 refunded to your wallet');
       setError(err instanceof Error ? err.message : 'Could not finalize email account');
       setCreatingFinal(false);
       setIsBrowserLoading(false);
@@ -554,11 +728,11 @@ export function CreateEmailTab({
             <div className="grid grid-cols-2 gap-2 text-[11px] font-semibold text-[#6E6552] dark:text-[#D5CCB8]">
               <div className="flex items-center gap-2">
                 <ShieldCheck className="h-3.5 w-3.5 text-[#D4AF37]" />
-                <span>Password Recovery</span>
+                <span>Free Password Recovery</span>
               </div>
               <div className="flex items-center gap-2">
-                <Sparkles className="h-3.5 w-3.5 text-[#D4AF37]" />
-                <span>Instant Activation</span>
+                <Wallet className="h-3.5 w-3.5 text-[#D4AF37]" />
+                <span>₦{CREATE_EMAIL_FEE_NGN} / New Custom Email</span>
               </div>
             </div>
           </div>
@@ -967,7 +1141,7 @@ export function CreateEmailTab({
               </form>
             )}
 
-            {/* SCREEN 3: CHOOSE EMAIL ADDRESS */}
+            {/* SCREEN 3: CHOOSE EMAIL ADDRESS (₦50 fee on Next) */}
             {!loadingMessage && screen === 'choose' && (
               <div className="mt-6 space-y-4">
                 <div>
@@ -975,9 +1149,46 @@ export function CreateEmailTab({
                     Choose your email address
                   </h2>
                   <p className="mt-0.5 text-xs text-[#6E6552] dark:text-[#A89F8C]">
-                    Select an address generated for your {accountMode} mailbox
+                    Select an address for your {accountMode} mailbox (₦{CREATE_EMAIL_FEE_NGN} creation fee)
                   </p>
                 </div>
+
+                {/* Live Wallet Balance & Fee Summary Bar */}
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[#D4AF37]/30 bg-[#FAF7F0] px-3.5 py-2.5 text-xs dark:bg-[#0A0906]">
+                  <div className="flex items-center gap-2">
+                    <Wallet className="h-3.5 w-3.5 text-[#D4AF37]" />
+                    <span className="font-bold text-[#1A160D] dark:text-[#FAF6EC]">
+                      Wallet: ₦{effectiveBalance.toLocaleString()}
+                    </span>
+                  </div>
+                  {paidSessionRef ? (
+                    <span className="rounded-md bg-emerald-500/15 px-2 py-0.5 text-[11px] font-extrabold text-emerald-700 dark:text-emerald-300">
+                      ₦{CREATE_EMAIL_FEE_NGN} Paid
+                    </span>
+                  ) : (
+                    <span className="rounded-md bg-[#D4AF37]/15 px-2 py-0.5 text-[11px] font-extrabold text-[#8A6208] dark:text-[#F5D77A]">
+                      Fee: ₦{CREATE_EMAIL_FEE_NGN} on Next
+                    </span>
+                  )}
+                </div>
+
+                {!paidSessionRef && effectiveBalance < CREATE_EMAIL_FEE_NGN && (
+                  <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-rose-500/35 bg-rose-500/10 px-3.5 py-2.5 text-xs">
+                    <span className="font-semibold text-rose-700 dark:text-rose-200">
+                      Insufficient balance (₦{effectiveBalance.toLocaleString()}). Deposit at least ₦
+                      {CREATE_EMAIL_FEE_NGN} to continue.
+                    </span>
+                    {onOpenDeposit && (
+                      <button
+                        type="button"
+                        onClick={onOpenDeposit}
+                        className="rounded-lg bg-[#D4AF37] px-3 py-1 text-[11px] font-extrabold text-[#0A0906] hover:bg-[#E5C150] cursor-pointer"
+                      >
+                        Top Up Wallet
+                      </button>
+                    )}
+                  </div>
+                )}
 
                 <div className="divide-y divide-[#D4AF37]/15 overflow-hidden rounded-2xl border border-[#D4AF37]/25 bg-[#FAF7F0]/70 dark:bg-[#0A0906]">
                   {options.map((opt) => {
@@ -987,7 +1198,7 @@ export function CreateEmailTab({
                         key={opt.id}
                         type="button"
                         onClick={() => setSelectedOption(opt)}
-                        className={`flex min-h-[50px] w-full items-center justify-between gap-3 px-3.5 py-2.5 text-left transition-colors ${
+                        className={`flex min-h-[50px] w-full items-center justify-between gap-3 px-3.5 py-2.5 text-left transition-colors cursor-pointer ${
                           isSelected ? 'bg-[#D4AF37]/15' : 'hover:bg-[#D4AF37]/10'
                         }`}
                       >
@@ -1005,6 +1216,9 @@ export function CreateEmailTab({
                             {opt.address}
                           </span>
                         </div>
+                        <span className="shrink-0 font-mono text-[11px] font-bold text-[#8A6208] dark:text-[#F5D77A]">
+                          ₦{CREATE_EMAIL_FEE_NGN}
+                        </span>
                       </button>
                     );
                   })}
@@ -1014,6 +1228,7 @@ export function CreateEmailTab({
                   <button
                     type="button"
                     onClick={() => navigateBrowserTo('birthdate')}
+                    disabled={chargingCreateFee}
                     className="inline-flex min-h-[42px] items-center gap-1 rounded-xl px-3 py-2 text-xs font-bold text-[#7B6F57] hover:bg-[#D4AF37]/10 dark:text-[#A89F8C]"
                   >
                     <ArrowLeft className="h-3.5 w-3.5" />
@@ -1021,12 +1236,23 @@ export function CreateEmailTab({
                   </button>
                   <button
                     type="button"
-                    onClick={handleChooseNext}
-                    disabled={!selectedOption}
-                    className="inline-flex min-h-[44px] items-center justify-center rounded-full bg-[#D4AF37] px-7 py-2.5 text-xs font-extrabold text-[#0A0906] hover:bg-[#E5C150] shadow-md disabled:opacity-60"
+                    onClick={() => void handleChooseNext()}
+                    disabled={!selectedOption || chargingCreateFee}
+                    className="inline-flex min-h-[44px] items-center justify-center gap-1.5 rounded-full bg-[#D4AF37] px-7 py-2.5 text-xs font-extrabold text-[#0A0906] hover:bg-[#E5C150] shadow-md disabled:opacity-60 cursor-pointer"
                   >
-                    <span>Next</span>
-                    <ArrowRight className="ml-1.5 h-3.5 w-3.5" />
+                    {chargingCreateFee ? (
+                      <>
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        <span>Charging ₦{CREATE_EMAIL_FEE_NGN}...</span>
+                      </>
+                    ) : (
+                      <>
+                        <span>
+                          {paidSessionRef ? 'Next' : `Next · ₦${CREATE_EMAIL_FEE_NGN}`}
+                        </span>
+                        <ArrowRight className="h-3.5 w-3.5" />
+                      </>
+                    )}
                   </button>
                 </div>
               </div>

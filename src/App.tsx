@@ -51,7 +51,10 @@ const STORAGE_KEYS = {
   walletUserId: 'veribox_wallet_user_id_v2',
   creditedRefs: 'veribox_credited_refs_v2',
   pendingRef: 'veribox_pending_paystack_ref',
+  dailyEmailQuota: 'veribox_daily_email_quota_v1',
 };
+
+const DAILY_FREE_EMAIL_LIMIT = 5;
 
 const DEFAULT_SERVICES: NumberServiceOption[] = [
   { id: 'whatsapp', name: 'WhatsApp', popular: true },
@@ -93,6 +96,43 @@ function markReferenceCredited(reference: string): boolean {
     return true;
   } catch {
     return true;
+  }
+}
+
+function getLocalTodayKey(): string {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, '0');
+  const d = String(now.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+function readLocalDailyQuotaCount(userId: string, dateKey: string): number {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEYS.dailyEmailQuota);
+    if (!raw) return 0;
+    const map = JSON.parse(raw) as Record<string, number>;
+    const val = map[`${userId}:${dateKey}`];
+    return typeof val === 'number' && val > 0 ? Math.min(DAILY_FREE_EMAIL_LIMIT, val) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function writeLocalDailyQuotaCount(userId: string, dateKey: string, count: number): void {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEYS.dailyEmailQuota);
+    const map: Record<string, number> = raw ? (JSON.parse(raw) as Record<string, number>) : {};
+    const nextMap: Record<string, number> = {};
+    for (const [k, v] of Object.entries(map)) {
+      if (k.endsWith(`:${dateKey}`)) {
+        nextMap[k] = v;
+      }
+    }
+    nextMap[`${userId}:${dateKey}`] = Math.max(0, Math.min(DAILY_FREE_EMAIL_LIMIT, count));
+    localStorage.setItem(STORAGE_KEYS.dailyEmailQuota, JSON.stringify(nextMap));
+  } catch {
+    // Non-blocking
   }
 }
 
@@ -174,6 +214,10 @@ export default function App() {
   const [loadingEmailDetail, setLoadingEmailDetail] = useState<boolean>(false);
   const [emailError, setEmailError] = useState<string | null>(null);
   const [generatingEmail, setGeneratingEmail] = useState<boolean>(false);
+  const [dailyQuotaDate, setDailyQuotaDate] = useState<string>(() => getLocalTodayKey());
+  const [freeUsedToday, setFreeUsedToday] = useState<number>(() =>
+    readLocalDailyQuotaCount(walletUserId, getLocalTodayKey())
+  );
 
   // Profile / Vault state
   const [savedNumbers, setSavedNumbers] = useState<PhoneNumberEntry[]>(() =>
@@ -185,6 +229,8 @@ export default function App() {
 
   const lastFetchedAddressRef = useRef<string | null>(null);
   const hasAutoCreatedInitialEmailRef = useRef<boolean>(false);
+  const notifiedSmsOrderIdsRef = useRef<Set<number>>(new Set());
+  const autoRefundedOrderIdsRef = useRef<Set<number>>(new Set());
 
   useEffect(() => {
     const root = document.documentElement;
@@ -235,6 +281,47 @@ export default function App() {
       setToast((prev) => (prev === message ? null : prev));
     }, 2400);
   }, []);
+
+  // Automatically roll over daily 5-email quota at local midnight & sync with server
+  useEffect(() => {
+    const checkDate = () => {
+      const today = getLocalTodayKey();
+      setDailyQuotaDate((prev) => (prev === today ? prev : today));
+    };
+    const timer = window.setInterval(checkDate, 30000);
+    window.addEventListener('focus', checkDate);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('focus', checkDate);
+    };
+  }, []);
+
+  useEffect(() => {
+    const localUsed = readLocalDailyQuotaCount(walletUserId, dailyQuotaDate);
+    setFreeUsedToday(localUsed);
+    let active = true;
+    void (async () => {
+      try {
+        const res = await fetch(
+          `/api/email/quota?userId=${encodeURIComponent(walletUserId)}&dateKey=${encodeURIComponent(
+            dailyQuotaDate
+          )}`
+        );
+        if (!res.ok || !active) return;
+        const data = await parseJsonResponse<{ usedToday?: number }>(res);
+        if (active && typeof data.usedToday === 'number') {
+          const merged = Math.min(DAILY_FREE_EMAIL_LIMIT, Math.max(localUsed, data.usedToday));
+          setFreeUsedToday(merged);
+          writeLocalDailyQuotaCount(walletUserId, dailyQuotaDate, merged);
+        }
+      } catch {
+        // Keep local daily count offline
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [walletUserId, dailyQuotaDate]);
 
   const openAuthModal = useCallback((reason?: string, pendingAction?: () => void) => {
     pendingAuthActionRef.current = pendingAction || null;
@@ -613,28 +700,90 @@ export default function App() {
     [pickBestProviderForCountry]
   );
 
-  const syncOrderIntoState = useCallback((updated: PrivateNumberOrder) => {
-    const mergeOrder = (o: PrivateNumberOrder): PrivateNumberOrder => ({
-      ...o,
-      ...updated,
-      provider: o.provider || updated.provider,
-      phone: updated.phone || o.phone,
-      digits: updated.digits || o.digits,
-      country: updated.country || o.country,
-      countryCode: o.countryCode || updated.countryCode,
-      service: updated.service || o.service,
-      serviceName: o.serviceName || updated.serviceName,
-      price: updated.price ?? o.price,
-      rawPriceUsd: updated.rawPriceUsd ?? o.rawPriceUsd,
-      currency: o.currency || updated.currency,
-      expires: updated.expires || o.expires,
-      createdAt: o.createdAt || updated.createdAt,
-      sms: Array.isArray(updated.sms) ? updated.sms : o.sms,
-    });
+  const activeOrdersRef = useRef(activeOrders);
+  activeOrdersRef.current = activeOrders;
+  const numberHistoryRef = useRef(numberHistory);
+  numberHistoryRef.current = numberHistory;
 
-    setActiveOrders((prev) => prev.map((o) => (o.id === updated.id ? mergeOrder(o) : o)));
-    setNumberHistory((prev) => prev.map((o) => (o.id === updated.id ? mergeOrder(o) : o)));
-  }, []);
+  const refundOrderHold = useCallback(
+    async (orderId: number, amountNgn: number, toastMessage?: string) => {
+      if (amountNgn <= 0 || autoRefundedOrderIdsRef.current.has(orderId)) return;
+      autoRefundedOrderIdsRef.current.add(orderId);
+      setWalletBalance((prev) => prev + amountNgn);
+      try {
+        const res = await fetch('/api/wallet/refund', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            userId: walletUserId,
+            amount: amountNgn,
+            reference: `refund-${orderId}`,
+          }),
+        });
+        const data = await parseJsonResponse<{ balance?: number | null }>(res);
+        if (res.ok && typeof data.balance === 'number') {
+          setWalletBalance(data.balance);
+        }
+      } catch {
+        // Local optimistic refund already applied; webhook/sync reconciles
+      }
+      if (toastMessage) {
+        showToast(toastMessage);
+      }
+    },
+    [walletUserId, showToast]
+  );
+
+  const syncOrderIntoState = useCallback(
+    (updated: PrivateNumberOrder) => {
+      const existing =
+        activeOrdersRef.current.find((o) => o.id === updated.id) ||
+        numberHistoryRef.current.find((o) => o.id === updated.id);
+
+      const mergedSms = Array.isArray(updated.sms) ? updated.sms : existing?.sms || [];
+      const orderPrice = updated.price ?? existing?.price ?? 0;
+
+      if (mergedSms.length > 0 && !notifiedSmsOrderIdsRef.current.has(updated.id)) {
+        notifiedSmsOrderIdsRef.current.add(updated.id);
+        showToast('Verification code received! Charge finalized.');
+      }
+
+      if (
+        mergedSms.length === 0 &&
+        ['CANCELED', 'TIMEOUT', 'BANNED'].includes(updated.status) &&
+        orderPrice > 0 &&
+        !autoRefundedOrderIdsRef.current.has(updated.id)
+      ) {
+        void refundOrderHold(
+          updated.id,
+          orderPrice,
+          `Order ${updated.status.toLowerCase()} · ₦${orderPrice.toLocaleString()} refunded`
+        );
+      }
+
+      const mergeOrder = (o: PrivateNumberOrder): PrivateNumberOrder => ({
+        ...o,
+        ...updated,
+        provider: o.provider || updated.provider,
+        phone: updated.phone || o.phone,
+        digits: updated.digits || o.digits,
+        country: updated.country || o.country,
+        countryCode: o.countryCode || updated.countryCode,
+        service: updated.service || o.service,
+        serviceName: o.serviceName || updated.serviceName,
+        price: updated.price ?? o.price,
+        rawPriceUsd: updated.rawPriceUsd ?? o.rawPriceUsd,
+        currency: o.currency || updated.currency,
+        expires: updated.expires || o.expires,
+        createdAt: o.createdAt || updated.createdAt,
+        sms: Array.isArray(updated.sms) ? updated.sms : o.sms,
+      });
+
+      setActiveOrders((prev) => prev.map((o) => (o.id === updated.id ? mergeOrder(o) : o)));
+      setNumberHistory((prev) => prev.map((o) => (o.id === updated.id ? mergeOrder(o) : o)));
+    },
+    [refundOrderHold, showToast]
+  );
 
   const handleAcquireNumbers = useCallback(async () => {
     if (!selectedService || !selectedCountry) return;
@@ -669,6 +818,7 @@ export default function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          userId: walletUserId,
           provider: chosenProvider,
           countryId: chosenCountryId,
           countryName: selectedCountry.country,
@@ -680,8 +830,15 @@ export default function App() {
           walletBalance,
         }),
       });
-      const data = await parseJsonResponse<{ orders?: PrivateNumberOrder[]; error?: string }>(res);
+      const data = await parseJsonResponse<{
+        orders?: PrivateNumberOrder[];
+        balance?: number;
+        error?: string;
+      }>(res);
       if (res.status === 402) {
+        if (typeof data.balance === 'number') {
+          setWalletBalance(data.balance);
+        }
         setDepositModalOpen(true);
         throw new Error(data.error || 'Insufficient wallet balance for live operator price.');
       }
@@ -704,7 +861,14 @@ export default function App() {
             amount: actualChargedNgn,
             reference: `order-${data.orders[0].id}`,
           }),
-        }).catch(() => undefined);
+        })
+          .then((r) => parseJsonResponse<{ balance?: number | null }>(r).then((d) => ({ ok: r.ok, d })))
+          .then(({ ok, d }) => {
+            if (ok && typeof d.balance === 'number') {
+              setWalletBalance(d.balance);
+            }
+          })
+          .catch(() => undefined);
       }
 
       setActiveOrders((prev) => {
@@ -769,10 +933,39 @@ export default function App() {
       try {
         const res = await fetch(
           `/api/numbers/cancel/${orderId}?provider=${encodeURIComponent(provider)}`,
-          { method: 'POST' }
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              userId: walletUserId,
+              refundAmount: targetOrder?.price || 0,
+            }),
+          }
         );
-        const data = await parseJsonResponse<{ order?: PrivateNumberOrder }>(res);
-        if (res.ok && data.order) {
+        const data = await parseJsonResponse<{
+          cancelled?: boolean;
+          alreadyHasSms?: boolean;
+          refunded?: boolean;
+          refundedAmount?: number;
+          walletBalance?: number | null;
+          order?: PrivateNumberOrder;
+          error?: string;
+        }>(res);
+
+        if (res.status === 409 && data.alreadyHasSms) {
+          if (data.order) {
+            syncOrderIntoState(data.order);
+          }
+          showToast(data.error || 'Verification code already arrived — charge finalized.');
+          return;
+        }
+
+        if (!res.ok) {
+          throw new Error(data.error || 'Could not cancel number session');
+        }
+
+        if (data.order) {
+          autoRefundedOrderIdsRef.current.add(orderId);
           syncOrderIntoState(data.order);
         } else {
           setNumberHistory((prev) =>
@@ -780,18 +973,16 @@ export default function App() {
           );
         }
 
-        // Refund Naira if cancelled before any SMS arrived
-        if (targetOrder && targetOrder.sms.length === 0 && targetOrder.price) {
-          setWalletBalance((prev) => prev + targetOrder.price!);
-          void fetch('/api/wallet/refund', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              userId: walletUserId,
-              amount: targetOrder.price,
-              reference: `refund-${targetOrder.id}`,
-            }),
-          }).catch(() => undefined);
+        if (typeof data.walletBalance === 'number') {
+          autoRefundedOrderIdsRef.current.add(orderId);
+          setWalletBalance(data.walletBalance);
+        } else if (
+          targetOrder &&
+          targetOrder.sms.length === 0 &&
+          targetOrder.price &&
+          !autoRefundedOrderIdsRef.current.has(orderId)
+        ) {
+          await refundOrderHold(targetOrder.id, targetOrder.price);
         }
 
         setActiveOrders((prev) => {
@@ -802,16 +993,18 @@ export default function App() {
           }
           return remaining;
         });
+
+        const refundedAmt = data.refundedAmount || (targetOrder?.sms.length === 0 ? targetOrder?.price : 0) || 0;
         showToast(
-          targetOrder?.price && targetOrder.sms.length === 0
-            ? `Number cancelled · ₦${targetOrder.price.toLocaleString()} refunded`
+          refundedAmt > 0
+            ? `Number cancelled · ₦${refundedAmt.toLocaleString()} refunded`
             : 'Number session cancelled'
         );
-      } catch {
-        showToast('Could not cancel number session');
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : 'Could not cancel number session');
       }
     },
-    [activeOrders, syncOrderIntoState, walletUserId, showToast]
+    [activeOrders, syncOrderIntoState, walletUserId, refundOrderHold, showToast]
   );
 
   const handleFinishOrder = useCallback(
@@ -1033,28 +1226,72 @@ export default function App() {
   );
 
   const handleGenerateInstantEmail = useCallback(async () => {
+    const todayKey = getLocalTodayKey();
+    if (todayKey !== dailyQuotaDate) {
+      setDailyQuotaDate(todayKey);
+    }
+    const currentUsed = readLocalDailyQuotaCount(walletUserId, todayKey);
+    if (currentUsed >= DAILY_FREE_EMAIL_LIMIT || freeUsedToday >= DAILY_FREE_EMAIL_LIMIT) {
+      const limitMsg =
+        'Daily free limit reached (5/5 free emails generated today). Your 5 free emails reset tomorrow — or tap Create (₦50).';
+      setEmailError(limitMsg);
+      showToast(limitMsg);
+      return;
+    }
+
     setGeneratingEmail(true);
     setEmailError(null);
     try {
-      let created: TempEmailAccount | null = null;
+      let created: (TempEmailAccount & { quota?: { usedToday?: number } }) | null = null;
+      let hitLimit = false;
+      let limitError = '';
+
       try {
         const res = await fetch('/api/email/create', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ provider: 'auto' }),
+          body: JSON.stringify({
+            provider: 'auto',
+            consumeFreeQuota: true,
+            userId: walletUserId,
+            dateKey: todayKey,
+          }),
           signal: AbortSignal.timeout(8000),
         });
-        const data = await parseJsonResponse<TempEmailAccount & { error?: string }>(res);
-        if (res.ok && data.address) {
+        const data = await parseJsonResponse<
+          TempEmailAccount & { error?: string; quota?: { usedToday?: number } }
+        >(res);
+
+        if (res.status === 429) {
+          hitLimit = true;
+          limitError =
+            data.error ||
+            'Daily free limit reached (5/5 free emails generated today). Your 5 free emails reset tomorrow.';
+          setFreeUsedToday(DAILY_FREE_EMAIL_LIMIT);
+          writeLocalDailyQuotaCount(walletUserId, todayKey, DAILY_FREE_EMAIL_LIMIT);
+        } else if (res.ok && data.address) {
           created = data;
         }
       } catch {
         // Fall through to direct browser CORS provider
       }
 
+      if (hitLimit) {
+        setEmailError(limitError);
+        showToast(limitError);
+        return;
+      }
+
       if (!created) {
         created = await createDirectGuerrillaAccount();
       }
+
+      const nextUsed =
+        typeof created.quota?.usedToday === 'number'
+          ? Math.min(DAILY_FREE_EMAIL_LIMIT, created.quota.usedToday)
+          : Math.min(DAILY_FREE_EMAIL_LIMIT, currentUsed + 1);
+      setFreeUsedToday(nextUsed);
+      writeLocalDailyQuotaCount(walletUserId, todayKey, nextUsed);
 
       setActiveEmail(created);
       setSavedEmails((prev) =>
@@ -1062,7 +1299,8 @@ export default function App() {
       );
       setSelectedEmailDetail(null);
       setEmailMessages([]);
-      showToast(`Generated: ${created.address}`);
+      const remainingAfter = Math.max(0, DAILY_FREE_EMAIL_LIMIT - nextUsed);
+      showToast(`Generated: ${created.address} (${remainingAfter}/5 free left today)`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Could not generate email';
       setEmailError(msg);
@@ -1070,7 +1308,7 @@ export default function App() {
     } finally {
       setGeneratingEmail(false);
     }
-  }, [showToast]);
+  }, [dailyQuotaDate, freeUsedToday, walletUserId, showToast]);
 
   const handleOpenEmailDetail = useCallback(
     async (id: string) => {
@@ -1365,6 +1603,8 @@ export default function App() {
               })
             }
             generatingEmail={generatingEmail}
+            freeRemainingToday={Math.max(0, DAILY_FREE_EMAIL_LIMIT - freeUsedToday)}
+            freeDailyLimit={DAILY_FREE_EMAIL_LIMIT}
             onSelectAccount={(acct) =>
               requireAuth('Sign in to switch email accounts', () => {
                 setActiveEmail(acct);
@@ -1404,6 +1644,10 @@ export default function App() {
             onRequireAuth={(reason) =>
               openAuthModal(reason || 'Sign in to create an email', () => setActiveTab('create'))
             }
+            walletBalance={walletBalance}
+            walletUserId={walletUserId}
+            onWalletBalanceChange={setWalletBalance}
+            onOpenDeposit={() => setDepositModalOpen(true)}
             savedEmails={savedEmails}
             deletedEmails={deletedEmails}
             onComplete={(newAccount) => {

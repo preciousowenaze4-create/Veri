@@ -29,6 +29,8 @@ interface HomeEmailTabProps {
   onGoToNumbers: () => void;
   onGenerateEmail: () => void;
   generatingEmail?: boolean;
+  freeRemainingToday?: number;
+  freeDailyLimit?: number;
   onSelectAccount: (account: TempEmailAccount) => void;
   onDeleteAccount: (address: string) => void;
   onRefreshInbox: () => void;
@@ -65,6 +67,8 @@ export function HomeEmailTab({
   onGoToNumbers,
   onGenerateEmail,
   generatingEmail = false,
+  freeRemainingToday = 5,
+  freeDailyLimit = 5,
   onSelectAccount,
   onDeleteAccount,
   onRefreshInbox,
@@ -89,9 +93,20 @@ export function HomeEmailTab({
       <section className="rounded-2xl border border-[#D4AF37]/30 bg-white p-4 sm:p-5 dark:bg-[#14120D]">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
-            <p className="text-xs font-bold text-[#8A6208] dark:text-[#D4AF37]">
-              Home · Active Email Address
-            </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <p className="text-xs font-bold text-[#8A6208] dark:text-[#D4AF37]">
+                Home · Active Email Address
+              </p>
+              <span
+                className={`inline-flex items-center rounded-md border px-2 py-0.5 text-[10px] font-extrabold tabular-nums ${
+                  freeRemainingToday > 0
+                    ? 'border-[#D4AF37]/35 bg-[#D4AF37]/10 text-[#8A6208] dark:text-[#F5D77A]'
+                    : 'border-rose-500/35 bg-rose-500/10 text-rose-700 dark:text-rose-300'
+                }`}
+              >
+                {freeRemainingToday}/{freeDailyLimit} free today
+              </span>
+            </div>
             <h1 className="mt-0.5 font-display text-base sm:text-lg font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
               Receive Codes & Emails Here
             </h1>
@@ -118,17 +133,42 @@ export function HomeEmailTab({
               type="button"
               onClick={onGenerateEmail}
               disabled={generatingEmail}
-              className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl border border-[#D4AF37]/60 bg-[#D4AF37]/15 px-3 py-1.5 text-xs font-bold text-[#8A6208] hover:bg-[#D4AF37]/25 whitespace-nowrap disabled:opacity-60 dark:text-[#F5D77A]"
+              className={`inline-flex min-h-[38px] items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-bold whitespace-nowrap disabled:opacity-60 cursor-pointer ${
+                freeRemainingToday > 0
+                  ? 'border-[#D4AF37]/60 bg-[#D4AF37]/15 text-[#8A6208] hover:bg-[#D4AF37]/25 dark:text-[#F5D77A]'
+                  : 'border-rose-500/40 bg-rose-500/10 text-rose-700 hover:bg-rose-500/15 dark:text-rose-300'
+              }`}
             >
               {generatingEmail ? (
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
               ) : (
                 <Sparkles className="h-3.5 w-3.5 text-[#D4AF37]" />
               )}
-              <span>{generatingEmail ? 'Generating...' : 'Generate'}</span>
+              <span>
+                {generatingEmail
+                  ? 'Generating...'
+                  : freeRemainingToday > 0
+                    ? `Generate (${freeRemainingToday})`
+                    : 'Limit 5/5'}
+              </span>
             </button>
           </div>
         </div>
+
+        {freeRemainingToday <= 0 && (
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-500/35 bg-amber-500/10 px-3.5 py-2.5 text-xs">
+            <span className="font-semibold text-amber-800 dark:text-amber-200">
+              Daily free limit reached ({freeDailyLimit}/{freeDailyLimit} used today). Your 5 free emails reset tomorrow.
+            </span>
+            <button
+              type="button"
+              onClick={onGoToCreate}
+              className="rounded-lg bg-[#D4AF37] px-2.5 py-1 text-[11px] font-extrabold text-[#0A0906] hover:bg-[#E5C150] cursor-pointer"
+            >
+              Create Custom (₦50)
+            </button>
+          </div>
+        )}
 
         {generatingEmail ? (
           <div className="mt-3.5 flex items-center gap-3 rounded-xl border border-[#D4AF37]/35 bg-[#FAF7F0] p-4 dark:bg-[#0B0A07]">

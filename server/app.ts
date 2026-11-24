@@ -2385,8 +2385,56 @@ export function createApiApp() {
   });
 
   // ==========================================
-  // Multi-provider Email Domains & Providers
+  // Multi-provider Email Domains, Daily Quota & Recovery
   // ==========================================
+  const DAILY_FREE_EMAIL_LIMIT = 5;
+  const dailyEmailQuotaMap = new Map<string, number>();
+  const numberOrderHoldMap = new Map<
+    number,
+    { userId?: string; amountNgn: number; provider: string; refunded?: boolean }
+  >();
+  const walletAdjustmentRefs = new Map<string, { balance: number; delta: number }>();
+
+  function getTodayDateKey(clientDateKey?: unknown): string {
+    if (typeof clientDateKey === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(clientDateKey.trim())) {
+      return clientDateKey.trim();
+    }
+    return new Date().toISOString().slice(0, 10);
+  }
+
+  function getDailyEmailQuota(userId: string, clientDateKey?: unknown) {
+    const safeUser = normalizeWalletUserId(userId);
+    const dateKey = getTodayDateKey(clientDateKey);
+    const key = `${safeUser}:${dateKey}`;
+    const usedToday = Math.min(DAILY_FREE_EMAIL_LIMIT, dailyEmailQuotaMap.get(key) ?? 0);
+    return {
+      dailyLimit: DAILY_FREE_EMAIL_LIMIT,
+      usedToday,
+      remainingToday: Math.max(0, DAILY_FREE_EMAIL_LIMIT - usedToday),
+      dateKey,
+    };
+  }
+
+  function incrementDailyEmailQuota(userId: string, clientDateKey?: unknown) {
+    const safeUser = normalizeWalletUserId(userId);
+    const dateKey = getTodayDateKey(clientDateKey);
+    const key = `${safeUser}:${dateKey}`;
+    const next = Math.min(DAILY_FREE_EMAIL_LIMIT, (dailyEmailQuotaMap.get(key) ?? 0) + 1);
+    dailyEmailQuotaMap.set(key, next);
+    return {
+      dailyLimit: DAILY_FREE_EMAIL_LIMIT,
+      usedToday: next,
+      remainingToday: Math.max(0, DAILY_FREE_EMAIL_LIMIT - next),
+      dateKey,
+    };
+  }
+
+  app.get('/api/email/quota', (req, res) => {
+    const userId = normalizeWalletUserId(req.query.userId);
+    const quota = getDailyEmailQuota(userId, req.query.dateKey);
+    res.json(quota);
+  });
+
   app.get('/api/email/domains', async (_req, res) => {
     const [ioDomains, tmDomains] = await Promise.all([
       getTempMailIoDomains().catch(() => []),
@@ -2624,6 +2672,21 @@ export function createApiApp() {
     const username = typeof req.body?.username === 'string' ? req.body.username : undefined;
     const domain = typeof req.body?.domain === 'string' ? req.body.domain : undefined;
     const password = typeof req.body?.password === 'string' ? req.body.password : undefined;
+    const consumeFreeQuota = Boolean(req.body?.consumeFreeQuota);
+    const userId = normalizeWalletUserId(req.body?.userId);
+    const dateKey = req.body?.dateKey;
+
+    if (consumeFreeQuota) {
+      const currentQuota = getDailyEmailQuota(userId, dateKey);
+      if (currentQuota.remainingToday <= 0) {
+        res.status(429).json({
+          error:
+            'Daily free limit reached (5/5 free emails generated today). Your 5 free emails reset tomorrow — or tap Create (₦50) for custom email.',
+          quota: currentQuota,
+        });
+        return;
+      }
+    }
 
     const order: Array<'mailtm' | 'tempmail' | 'tempmailio' | 'guerrilla'> =
       provider === 'mailtm'
@@ -2642,25 +2705,29 @@ export function createApiApp() {
         if (candidate === 'tempmailio') {
           const acct = await createTempMailIoAccount(username, domain, password);
           registerCreatedEmail(acct, password);
-          res.json(acct);
+          const quota = consumeFreeQuota ? incrementDailyEmailQuota(userId, dateKey) : undefined;
+          res.json(quota ? { ...acct, quota } : acct);
           return;
         }
         if (candidate === 'mailtm') {
           const acct = await createMailTmAccount(username, domain, password);
           registerCreatedEmail(acct, acct.password || password);
-          res.json(acct);
+          const quota = consumeFreeQuota ? incrementDailyEmailQuota(userId, dateKey) : undefined;
+          res.json(quota ? { ...acct, quota } : acct);
           return;
         }
         if (candidate === 'tempmail') {
           const acct = await createTempMailLolAccount();
           registerCreatedEmail(acct, password);
-          res.json(acct);
+          const quota = consumeFreeQuota ? incrementDailyEmailQuota(userId, dateKey) : undefined;
+          res.json(quota ? { ...acct, quota } : acct);
           return;
         }
         if (candidate === 'guerrilla') {
           const acct = await createGuerrillaAccount(username);
           registerCreatedEmail(acct, password);
-          res.json(acct);
+          const quota = consumeFreeQuota ? incrementDailyEmailQuota(userId, dateKey) : undefined;
+          res.json(quota ? { ...acct, quota } : acct);
           return;
         }
       } catch (err) {
@@ -3331,7 +3398,15 @@ export function createApiApp() {
     const countryCodeHint =
       typeof req.body?.countryCode === 'string' ? req.body.countryCode.toUpperCase() : undefined;
     const quantity = Math.min(10, Math.max(1, Number(req.body?.quantity || 1) || 1));
-    const clientWalletBalance = Number(req.body?.walletBalance);
+    const userId = req.body?.userId ? normalizeWalletUserId(req.body.userId) : undefined;
+    const rawClientBalance = Number(req.body?.walletBalance);
+    let clientWalletBalance = rawClientBalance;
+    if (userId) {
+      const serverBal = await getUserWalletBalance(userId);
+      if (serverBal.supabasePersisted && typeof serverBal.balance === 'number') {
+        clientWalletBalance = serverBal.balance;
+      }
+    }
 
     // STRICTLY ISOLATED GRIZZLY SMS FLOW
     if (provider === 'grizzly') {
@@ -3509,6 +3584,15 @@ export function createApiApp() {
           orders.push(acquiredOrder);
         }
 
+        for (const ord of orders) {
+          if (ord.id && typeof ord.price === 'number' && ord.price > 0) {
+            numberOrderHoldMap.set(ord.id, {
+              userId,
+              amountNgn: ord.price,
+              provider: 'grizzly',
+            });
+          }
+        }
         res.json({ orders });
         return;
       } catch (err) {
@@ -3604,6 +3688,15 @@ export function createApiApp() {
         orders.push(acquired);
       }
 
+      for (const ord of orders) {
+        if (ord.id && typeof ord.price === 'number' && ord.price > 0) {
+          numberOrderHoldMap.set(ord.id, {
+            userId,
+            amountNgn: ord.price,
+            provider: 'fivesim',
+          });
+        }
+      }
       res.json({ orders });
     } catch (err) {
       const message = sanitizeNumberApiError(
@@ -3741,10 +3834,22 @@ export function createApiApp() {
     const provider = String(req.query.provider || req.body?.provider || 'fivesim').toLowerCase();
     const action = req.params.action;
     const orderId = req.params.orderId.replace(/[^0-9]/g, '');
+    const numericOrderId = Number(orderId);
+    const reqUserId = req.body?.userId || req.query.userId;
+    const reqRefundAmount = Number(req.body?.refundAmount || 0);
+
     if (!orderId) {
       res.status(400).json({ error: 'Invalid number ID' });
       return;
     }
+
+    const heldRecord = numberOrderHoldMap.get(numericOrderId);
+    const refundUserId = reqUserId
+      ? normalizeWalletUserId(reqUserId)
+      : heldRecord?.userId;
+    const refundAmountNgn = Math.round(
+      heldRecord?.amountNgn || (Number.isFinite(reqRefundAmount) && reqRefundAmount > 0 ? reqRefundAmount : 0)
+    );
 
     if (provider === 'grizzly') {
       const grizzlyKey = getGrizzlyApiKey();
@@ -3752,12 +3857,52 @@ export function createApiApp() {
         res.status(503).json({ error: 'Grizzly SMS service unavailable' });
         return;
       }
+
+      if (action === 'cancel') {
+        try {
+          const liveStatusText = await callGrizzlyApi({ action: 'getStatus', id: orderId }, grizzlyKey);
+          const parsedLive = parseGrizzlyStatus(liveStatusText, numericOrderId, 'other');
+          if (parsedLive.sms.length > 0) {
+            res.status(409).json({
+              cancelled: false,
+              alreadyHasSms: true,
+              error: 'Verification code already arrived on this number — charge finalized.',
+              order: {
+                id: numericOrderId,
+                provider: 'grizzly',
+                status: parsedLive.status,
+                sms: parsedLive.sms,
+              },
+            });
+            return;
+          }
+        } catch {
+          // Continue to setStatus cancel if status probe errored transiently
+        }
+      }
+
       const statusCode = action === 'finish' ? '6' : '8';
       try {
         await callGrizzlyApi({ action: 'setStatus', status: statusCode, id: orderId }, grizzlyKey);
+        let refunded = false;
+        let walletBalance: number | null = null;
+        if (action === 'cancel' && refundUserId && refundAmountNgn > 0 && !heldRecord?.refunded) {
+          const adj = await adjustUserWalletBalance({
+            userId: refundUserId,
+            deltaNgn: refundAmountNgn,
+            reference: `refund-${orderId}`,
+          });
+          if (heldRecord) heldRecord.refunded = true;
+          refunded = !adj.alreadyProcessed;
+          walletBalance = adj.balance;
+        }
         res.json({
+          cancelled: action === 'cancel',
+          refunded,
+          refundedAmount: refunded ? refundAmountNgn : 0,
+          walletBalance,
           order: {
-            id: Number(orderId),
+            id: numericOrderId,
             provider: 'grizzly',
             status: action === 'finish' ? 'FINISHED' : 'CANCELED',
           },
@@ -3777,12 +3922,59 @@ export function createApiApp() {
     }
 
     try {
-      const [raw, accountCurrency, rates] = await Promise.all([
-        callFiveSimUserApi(`${action}/${orderId}`, apiKey),
+      const [accountCurrency, rates] = await Promise.all([
         getFiveSimAccountCurrency(apiKey),
         getExchangeRates(),
       ]);
-      res.json({ order: toPublicNumberOrder(raw, undefined, undefined, accountCurrency, rates) });
+
+      if (action === 'cancel') {
+        try {
+          const liveRaw = await callFiveSimUserApi(`check/${orderId}`, apiKey);
+          const liveOrder = toPublicNumberOrder(liveRaw, undefined, undefined, accountCurrency, rates);
+          if (liveOrder.sms.length > 0) {
+            res.status(409).json({
+              cancelled: false,
+              alreadyHasSms: true,
+              error: 'Verification code already arrived on this number — charge finalized.',
+              order: liveOrder,
+            });
+            return;
+          }
+        } catch {
+          // Proceed to cancel call
+        }
+      }
+
+      const raw = await callFiveSimUserApi(`${action}/${orderId}`, apiKey);
+      const order = toPublicNumberOrder(raw, undefined, undefined, accountCurrency, rates);
+
+      let refunded = false;
+      let walletBalance: number | null = null;
+      if (
+        action === 'cancel' &&
+        order.sms.length === 0 &&
+        refundUserId &&
+        (order.price || refundAmountNgn) > 0 &&
+        !heldRecord?.refunded
+      ) {
+        const effectiveRefund = Math.round(order.price || refundAmountNgn);
+        const adj = await adjustUserWalletBalance({
+          userId: refundUserId,
+          deltaNgn: effectiveRefund,
+          reference: `refund-${orderId}`,
+        });
+        if (heldRecord) heldRecord.refunded = true;
+        refunded = !adj.alreadyProcessed;
+        walletBalance = adj.balance;
+      }
+
+      res.json({
+        cancelled: action === 'cancel',
+        refunded,
+        refundedAmount: refunded ? Math.round(order.price || refundAmountNgn) : 0,
+        walletBalance,
+        order,
+      });
     } catch (err) {
       res.status(502).json({
         error: sanitizeNumberApiError(err instanceof Error ? err.message : 'Action failed'),
@@ -3975,13 +4167,47 @@ export function createApiApp() {
     userId: string;
     deltaNgn: number;
     reference: string;
-  }): Promise<{ balance: number | null; supabasePersisted: boolean }> {
+  }): Promise<{
+    balance: number | null;
+    supabasePersisted: boolean;
+    alreadyProcessed?: boolean;
+    insufficient?: boolean;
+  }> {
     const safeUserId = normalizeWalletUserId(params.userId);
     const delta = Math.round(params.deltaNgn);
+    const ref = (params.reference || '').trim() || `adj-${Date.now()}`;
+
+    const existingMem = walletAdjustmentRefs.get(ref);
+    if (existingMem) {
+      return {
+        balance: walletBalancesMap.get(safeUserId) ?? existingMem.balance,
+        supabasePersisted: false,
+        alreadyProcessed: true,
+      };
+    }
+
     const sb = getSupabaseServerClient();
 
     if (sb) {
       try {
+        const { data: existingTx } = await sb
+          .from('wallet_transactions')
+          .select('reference')
+          .eq('reference', ref)
+          .maybeSingle();
+
+        if (existingTx) {
+          const { data: walletRow } = await sb
+            .from('wallets')
+            .select('balance')
+            .eq('user_id', safeUserId)
+            .maybeSingle();
+          const curBal = Math.max(0, Number(walletRow?.balance ?? walletBalancesMap.get(safeUserId) ?? 0));
+          walletBalancesMap.set(safeUserId, curBal);
+          walletAdjustmentRefs.set(ref, { balance: curBal, delta });
+          return { balance: curBal, supabasePersisted: true, alreadyProcessed: true };
+        }
+
         const { data: walletRow, error: readErr } = await sb
           .from('wallets')
           .select('balance')
@@ -3990,6 +4216,10 @@ export function createApiApp() {
 
         if (!readErr) {
           const prevBal = Math.max(0, Number(walletRow?.balance ?? walletBalancesMap.get(safeUserId) ?? 0));
+          if (delta < 0 && prevBal < Math.abs(delta)) {
+            walletBalancesMap.set(safeUserId, prevBal);
+            return { balance: prevBal, supabasePersisted: true, insufficient: true };
+          }
           const newBal = Math.max(0, prevBal + delta);
           const { error: upsertErr } = await sb.from('wallets').upsert(
             {
@@ -4000,7 +4230,20 @@ export function createApiApp() {
             { onConflict: 'user_id' }
           );
           if (!upsertErr) {
+            await sb
+              .from('wallet_transactions')
+              .insert({
+                reference: ref,
+                user_id: safeUserId,
+                amount: Math.abs(delta),
+                status: delta < 0 ? 'debit' : 'refund',
+                channel: delta < 0 ? 'wallet_debit' : 'wallet_refund',
+                provider: 'veribox',
+              })
+              .then(() => undefined, () => undefined);
+
             walletBalancesMap.set(safeUserId, newBal);
+            walletAdjustmentRefs.set(ref, { balance: newBal, delta });
             return { balance: newBal, supabasePersisted: true };
           }
         }
@@ -4009,14 +4252,14 @@ export function createApiApp() {
       }
     }
 
-    if (walletBalancesMap.has(safeUserId)) {
-      const prevBal = walletBalancesMap.get(safeUserId)!;
-      const newBal = Math.max(0, prevBal + delta);
-      walletBalancesMap.set(safeUserId, newBal);
-      return { balance: newBal, supabasePersisted: false };
+    const prevBal = walletBalancesMap.get(safeUserId) ?? 0;
+    if (delta < 0 && prevBal < Math.abs(delta)) {
+      return { balance: prevBal, supabasePersisted: false, insufficient: true };
     }
-
-    return { balance: null, supabasePersisted: false };
+    const newBal = Math.max(0, prevBal + delta);
+    walletBalancesMap.set(safeUserId, newBal);
+    walletAdjustmentRefs.set(ref, { balance: newBal, delta });
+    return { balance: newBal, supabasePersisted: false };
   }
 
   app.get('/api/auth/public-config', (_req, res) => {
@@ -4345,6 +4588,16 @@ export function createApiApp() {
       deltaNgn: -amount,
       reference,
     });
+    if (result.insufficient) {
+      res.status(402).json({
+        success: false,
+        insufficient: true,
+        balance: result.balance ?? 0,
+        required: amount,
+        error: `Insufficient wallet balance (₦${(result.balance ?? 0).toLocaleString()}). Required: ₦${amount.toLocaleString()}. Please top up your wallet.`,
+      });
+      return;
+    }
     res.json({ success: true, ...result });
   });
 

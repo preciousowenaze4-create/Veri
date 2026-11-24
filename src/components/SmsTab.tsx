@@ -195,7 +195,7 @@ export function SmsTab({
 
   const lowestCountryPrice = useMemo(() => {
     const prices = countries
-      .map((c) => c.inStockMinPrice || c.minPrice || 0)
+      .map((c) => c.minPrice || 0)
       .filter((p) => p > 0);
     return prices.length > 0 ? Math.min(...prices) : 0;
   }, [countries]);
@@ -494,17 +494,14 @@ export function SmsTab({
                   </div>
 
                   <div className="flex items-center gap-1.5 shrink-0">
-                    {!countriesLoading && (selectedCountry?.inStockMinPrice || selectedCountry?.minPrice) ? (
+                    {!countriesLoading && selectedCountry?.minPrice ? (
                       <div className="flex flex-col items-end leading-tight">
                         <span className="font-mono text-[11px] font-extrabold text-[#8A6208] tabular-nums dark:text-[#F5D77A]">
-                          {formatPrice(
-                            selectedCountry.inStockMinPrice || selectedCountry.minPrice,
-                            selectedCountry.currency
-                          )}
+                          {formatPrice(selectedCountry.minPrice, selectedCountry.currency)}
                         </span>
-                        {(selectedCountry.inStockPriceUsd || selectedCountry.rawPriceUsd) ? (
+                        {selectedCountry.rawPriceUsd ? (
                           <span className="text-[9px] text-[#8A7F6A] tabular-nums dark:text-[#A89F8C]">
-                            ≈ {formatUsdCompact(selectedCountry.inStockPriceUsd || selectedCountry.rawPriceUsd)}
+                            ≈ {formatUsdCompact(selectedCountry.rawPriceUsd)}
                           </span>
                         ) : null}
                       </div>
@@ -539,12 +536,12 @@ export function SmsTab({
                       ) : (
                         filteredCountries.map((c) => {
                           const isSelected = selectedCountry?.slug === c.slug;
-                          const countryDisplayPrice = c.inStockMinPrice || c.minPrice || 0;
+                          const countryDisplayPrice = c.minPrice || 0;
                           const isLowest =
                             lowestCountryPrice > 0 && countryDisplayPrice === lowestCountryPrice;
                           return (
                             <button
-                              key={c.slug}
+                              key={`${c.slug}-${c.country}`}
                               type="button"
                               onClick={() => {
                                 onSelectCountry(c);
@@ -577,13 +574,13 @@ export function SmsTab({
                               <div className="flex flex-col items-end shrink-0 leading-tight">
                                 <div className="flex items-center gap-1">
                                   <span className="font-mono text-[11px] font-extrabold text-[#8A6208] tabular-nums dark:text-[#F5D77A]">
-                                    {formatPrice(c.inStockMinPrice || c.minPrice, c.currency)}
+                                    {formatPrice(countryDisplayPrice, c.currency)}
                                   </span>
                                   {isSelected && <Check className="h-3.5 w-3.5 text-[#D4AF37]" />}
                                 </div>
-                                {(c.inStockPriceUsd || c.rawPriceUsd) ? (
+                                {c.rawPriceUsd ? (
                                   <span className="text-[9px] text-[#8A7F6A] tabular-nums dark:text-[#A89F8C]">
-                                    ≈ {formatUsdCompact(c.inStockPriceUsd || c.rawPriceUsd)}
+                                    ≈ {formatUsdCompact(c.rawPriceUsd)}
                                   </span>
                                 ) : null}
                               </div>
@@ -629,13 +626,13 @@ export function SmsTab({
 
               // Order cheapest available quote first so lowest price appears top-left
               twoOptions.sort((a, b) => {
-                const pa = a.quote?.inStockMinPrice || Number.MAX_SAFE_INTEGER;
-                const pb = b.quote?.inStockMinPrice || Number.MAX_SAFE_INTEGER;
+                const pa = a.quote?.minPrice || Number.MAX_SAFE_INTEGER;
+                const pb = b.quote?.minPrice || Number.MAX_SAFE_INTEGER;
                 return pa - pb;
               });
 
               const lowestAvailableQuotePrice = Math.min(
-                ...[grizzlyQuote?.inStockMinPrice, fivesimQuote?.inStockMinPrice].filter(
+                ...[grizzlyQuote?.minPrice, fivesimQuote?.minPrice].filter(
                   (v): v is number => typeof v === 'number' && v > 0
                 )
               );
@@ -645,20 +642,15 @@ export function SmsTab({
                 selectedCountry.providers?.[0] ||
                 null;
               const checkoutUnitNgn =
-                activeQuote?.inStockMinPrice ||
                 activeQuote?.minPrice ||
-                selectedCountry.inStockMinPrice ||
-                selectedCountry.minPrice;
+                selectedCountry.minPrice ||
+                activeQuote?.inStockMinPrice ||
+                selectedCountry.inStockMinPrice;
               const checkoutUnitUsd =
-                activeQuote?.inStockPriceUsd ||
                 activeQuote?.rawPriceUsd ||
-                selectedCountry.inStockPriceUsd ||
-                selectedCountry.rawPriceUsd;
-              const hasHigherInStockOnly =
-                activeQuote &&
-                typeof activeQuote.inStockMinPrice === 'number' &&
-                typeof activeQuote.minPrice === 'number' &&
-                activeQuote.inStockMinPrice > activeQuote.minPrice;
+                selectedCountry.rawPriceUsd ||
+                activeQuote?.inStockPriceUsd ||
+                selectedCountry.inStockPriceUsd;
               const activeProviderConfigured = Boolean(activeQuote?.configured);
 
               return (
@@ -682,8 +674,8 @@ export function SmsTab({
                         const isCheapest =
                           Boolean(q) &&
                           Number.isFinite(lowestAvailableQuotePrice) &&
-                          q!.inStockMinPrice === lowestAvailableQuotePrice;
-                        const unitUsd = q?.inStockPriceUsd || q?.rawPriceUsd || 0;
+                          q!.minPrice === lowestAvailableQuotePrice;
+                        const unitUsd = q?.rawPriceUsd || 0;
 
                         return (
                           <button
@@ -726,7 +718,7 @@ export function SmsTab({
                               <div className="flex items-center justify-between gap-2 border-t border-[#D4AF37]/15 pt-2">
                                 <div className="flex items-baseline gap-1.5">
                                   <span className="font-mono text-xs font-extrabold text-[#8A6208] tabular-nums dark:text-[#F5D77A]">
-                                    {formatPrice(q.inStockMinPrice || q.minPrice, 'NGN')}
+                                    {formatPrice(q.minPrice, 'NGN')}
                                   </span>
                                   {unitUsd > 0 && (
                                     <span className="text-[10px] text-[#8A7F6A] tabular-nums dark:text-[#A89F8C]">
@@ -840,16 +832,6 @@ export function SmsTab({
                       </div>
                     )}
                   </div>
-
-                  {hasHigherInStockOnly && activeQuote && (
-                    <p className="rounded-xl border border-[#D4AF37]/25 bg-[#FAF7F0] px-3 py-2 text-[11px] font-medium text-[#6E6552] dark:bg-[#0B0A07] dark:text-[#A89F8C]">
-                      Lowest operator ({formatPrice(activeQuote.minPrice, selectedCountry.currency)}) is currently at 0 pcs; cheapest live operator in stock is{' '}
-                      <span className="font-bold text-[#8A6208] dark:text-[#F5D77A]">
-                        {formatPrice(checkoutUnitNgn, selectedCountry.currency)}
-                      </span>
-                      . You are always charged the exact real-time order price.
-                    </p>
-                  )}
 
                   {/* Buy Button */}
                   <button

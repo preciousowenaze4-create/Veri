@@ -824,6 +824,7 @@ interface FiveSimCountryOption {
   bestOperator: string;
   maxRate: number;
   operators: FiveSimOperatorOption[];
+  lowestOperators?: string[];
 }
 
 const fiveSimCountriesCache: { data: Record<string, FiveSimGuestCountryRaw> | null; expiresAt: number } = {
@@ -1290,6 +1291,7 @@ async function getFiveSimCountriesForPlatform(
       bestOperator: lowestAnyOp.operator,
       maxRate,
       operators: operators.slice(0, 12),
+      lowestOperators: allPricedOperators.slice(0, 8).map((o) => o.operator),
     });
   }
 
@@ -1622,7 +1624,9 @@ function normalizeCountryMatchKey(name: string): string {
     unitedstatesvirt: 'usavirtual',
     russianfederation: 'russia',
     cotedivoire: 'ivorycoast',
+    czech: 'czechrepublic',
     czechia: 'czechrepublic',
+    czechrepublic: 'czechrepublic',
     turkiye: 'turkey',
     vietnam: 'vietnam',
     southkorea: 'korea',
@@ -1816,7 +1820,9 @@ async function getGrizzlyCountriesForPlatform(
 
     const canonicalKey = normalizeCountryMatchKey(meta.name);
     const geo = fiveSimLookup.get(canonicalKey) ||
-      (canonicalKey === 'usavirtual' ? { iso: 'US', dial: '+1' } : { iso: '', dial: '' });
+      (canonicalKey === 'usavirtual' || canonicalKey === 'usa2'
+        ? { iso: 'US', dial: '+1' }
+        : { iso: '', dial: '' });
 
     list.push({
       countryId,
@@ -1942,8 +1948,8 @@ async function getUnifiedCountriesForPlatform(
         country: c.country === 'England' ? 'United Kingdom (England)' : c.country,
         countryCode: c.countryCode,
         dialCode: c.dialCode,
-        minPrice: inStockNgn,
-        rawPriceUsd: inStockUsd,
+        minPrice: minNgn,
+        rawPriceUsd: c.minPrice,
         inStockMinPrice: inStockNgn,
         inStockPriceUsd: inStockUsd,
         currency: 'NGN',
@@ -1953,9 +1959,11 @@ async function getUnifiedCountriesForPlatform(
     } else {
       existing.providers.push(quote);
       existing.stockCount += c.stockCount;
-      if (inStockNgn > 0 && (existing.inStockMinPrice <= 0 || inStockNgn < existing.inStockMinPrice)) {
-        existing.minPrice = inStockNgn;
-        existing.rawPriceUsd = inStockUsd;
+      if (inStockNgnMore(existing.minPrice, minNgn)) {
+        existing.minPrice = minNgn;
+        existing.rawPriceUsd = c.minPrice;
+      }
+      if (inStockNgnMore(existing.inStockMinPrice, inStockNgn)) {
         existing.inStockMinPrice = inStockNgn;
         existing.inStockPriceUsd = inStockUsd;
       }
@@ -1996,9 +2004,11 @@ async function getUnifiedCountriesForPlatform(
       if (!alreadyHasGrizzly) {
         existing.providers.push(quote);
         existing.stockCount += g.stockCount;
-        if (inStockNgnMore(existing.inStockMinPrice, minNgn)) {
+        if (inStockNgnMore(existing.minPrice, minNgn)) {
           existing.minPrice = minNgn;
           existing.rawPriceUsd = g.minPriceUsd;
+        }
+        if (inStockNgnMore(existing.inStockMinPrice, minNgn)) {
           existing.inStockMinPrice = minNgn;
           existing.inStockPriceUsd = g.minPriceUsd;
         }
@@ -2006,10 +2016,19 @@ async function getUnifiedCountriesForPlatform(
     }
   }
 
-  const countries = Array.from(merged.values()).map((row) => ({
-    ...row,
-    providers: [...row.providers].sort((a, b) => a.inStockMinPrice - b.inStockMinPrice),
-  }));
+  const usedSlugs = new Set<string>();
+  const countries = Array.from(merged.values()).map((row, idx) => {
+    let uniqueSlug = row.slug || `country-${idx}`;
+    if (usedSlugs.has(uniqueSlug)) {
+      uniqueSlug = `${uniqueSlug}-${idx}`;
+    }
+    usedSlugs.add(uniqueSlug);
+    return {
+      ...row,
+      slug: uniqueSlug,
+      providers: [...row.providers].sort((a, b) => a.minPrice - b.minPrice),
+    };
+  });
 
   // Sort ALL countries strictly alphabetically A to Z
   countries.sort((a, b) => a.country.localeCompare(b.country));
@@ -3076,7 +3095,7 @@ export function createApiApp() {
         const { countries } = await getUnifiedCountriesForPlatform(serviceId, refresh, rates);
         if (countries.length === 0) return null;
         const cheapest = [...countries].sort(
-          (a, b) => a.inStockMinPrice - b.inStockMinPrice || b.stockCount - a.stockCount
+          (a, b) => a.minPrice - b.minPrice || b.stockCount - a.stockCount
         )[0];
         if (!cheapest) return null;
         const bestProv = cheapest.providers[0];
@@ -3087,8 +3106,8 @@ export function createApiApp() {
           country: cheapest.country,
           countryCode: cheapest.countryCode,
           dialCode: cheapest.dialCode,
-          minPrice: bestProv ? bestProv.inStockMinPrice : cheapest.inStockMinPrice,
-          rawPriceUsd: bestProv ? bestProv.inStockPriceUsd : cheapest.inStockPriceUsd,
+          minPrice: bestProv ? bestProv.minPrice : cheapest.minPrice,
+          rawPriceUsd: bestProv ? bestProv.rawPriceUsd : cheapest.rawPriceUsd,
           currency: 'NGN',
           stockCount: cheapest.stockCount,
           provider: bestProv?.provider || ('fivesim' as const),
@@ -3201,14 +3220,15 @@ export function createApiApp() {
         for (let i = 0; i < quantity; i++) {
           let acquiredOrder = null;
           try {
-            const v2Raw = await callGrizzlyApi(
-              {
-                action: 'getNumberV2',
-                service: grizzlyService,
-                country: grizzlyCountryId,
-              },
-              grizzlyKey
-            );
+            const grizzlyReqParams: Record<string, string> = {
+              action: 'getNumberV2',
+              service: grizzlyService,
+              country: grizzlyCountryId,
+            };
+            if (liveUnitUsd > 0) {
+              grizzlyReqParams.maxPrice = String(liveUnitUsd);
+            }
+            const v2Raw = await callGrizzlyApi(grizzlyReqParams, grizzlyKey);
 
             if (v2Raw.startsWith('{')) {
               const parsed = JSON.parse(v2Raw) as {
@@ -3270,14 +3290,15 @@ export function createApiApp() {
                 };
               }
             } else if (v2Raw === 'BAD_ACTION') {
-              const v1Raw = await callGrizzlyApi(
-                {
-                  action: 'getNumber',
-                  service: grizzlyService,
-                  country: grizzlyCountryId,
-                },
-                grizzlyKey
-              );
+              const v1Params: Record<string, string> = {
+                action: 'getNumber',
+                service: grizzlyService,
+                country: grizzlyCountryId,
+              };
+              if (liveUnitUsd > 0) {
+                v1Params.maxPrice = String(liveUnitUsd);
+              }
+              const v1Raw = await callGrizzlyApi(v1Params, grizzlyKey);
               if (v1Raw.startsWith('ACCESS_NUMBER:')) {
                 const parts = v1Raw.split(':');
                 const actId = Number(parts[1] || 0);
@@ -3352,25 +3373,26 @@ export function createApiApp() {
       ]);
       const resolvedCurrency = fiveSimCurrencyCache.currency || accountCurrency;
       const countryMeta = countriesList.find((c) => c.slug === country);
-      const sortedOps = countryMeta?.operators.map((o) => o.operator) || [];
-      // Strictly buy from the lowest in-stock operator first, falling back to next cheapest, then 'any'
-      const operatorCandidates = Array.from(new Set([...sortedOps, 'any']));
+      const lowestOps = countryMeta?.lowestOperators || [];
+      const sortedInStockOps = countryMeta?.operators.map((o) => o.operator) || [];
+      // Strictly try the cheapest operators first, then 'any' (matching 5sim's Any operator rate), then other in-stock operators
+      const operatorCandidates = Array.from(new Set([...lowestOps, 'any', ...sortedInStockOps]));
 
-      const liveUnitNgn = countryMeta?.inStockMinPrice
-        ? roundToNaira(countryMeta.inStockMinPrice, rates.NGN)
-        : 0;
+      const liveUnitUsd = countryMeta?.minPrice || 0;
+      const liveUnitNgn = liveUnitUsd > 0 ? roundToNaira(liveUnitUsd, rates.NGN) : 0;
       if (
         Number.isFinite(clientWalletBalance) &&
         liveUnitNgn > 0 &&
         clientWalletBalance < liveUnitNgn * quantity
       ) {
         res.status(402).json({
-          error: `Insufficient wallet balance for the current live operator price (₦${(liveUnitNgn * quantity).toLocaleString()} required, wallet has ₦${clientWalletBalance.toLocaleString()}). Please top up first.`,
+          error: `Insufficient wallet balance for the current live lowest price (₦${(liveUnitNgn * quantity).toLocaleString()} required, wallet has ₦${clientWalletBalance.toLocaleString()}). Please top up first.`,
         });
         return;
       }
 
       const orders = [];
+      let spentNgn = 0;
       let lastError = 'No numbers available for this selection right now.';
 
       for (let i = 0; i < quantity; i++) {
@@ -3381,7 +3403,22 @@ export function createApiApp() {
               `buy/activation/${encodeURIComponent(country)}/${encodeURIComponent(op)}/${encodeURIComponent(service)}`,
               apiKey
             );
-            acquired = toPublicNumberOrder(raw, serviceName, countryCodeHint, resolvedCurrency, rates);
+            const candidate = toPublicNumberOrder(raw, serviceName, countryCodeHint, resolvedCurrency, rates);
+            const orderNgn = candidate.price || 0;
+            const remainingWallet = Number.isFinite(clientWalletBalance)
+              ? clientWalletBalance - spentNgn
+              : Number.POSITIVE_INFINITY;
+            const exceedsListedMin =
+              liveUnitNgn > 0 && orderNgn > Math.max(liveUnitNgn * 1.25, liveUnitNgn + 50);
+
+            if ((orderNgn > remainingWallet || exceedsListedMin) && candidate.id > 0) {
+              // Auto-cancel if upstream assigned a higher-cost operator so user/key balance is never overcharged
+              await callFiveSimUserApi(`cancel/${candidate.id}`, apiKey).catch(() => undefined);
+              lastError = `Lowest rate (₦${liveUnitNgn.toLocaleString()}) is temporarily out of stock right now (live operator fill was ₦${orderNgn.toLocaleString()}). Try the other provider or another country.`;
+              continue;
+            }
+            acquired = candidate;
+            spentNgn += orderNgn || liveUnitNgn;
             break;
           } catch (err) {
             const msg = err instanceof Error ? err.message : '';

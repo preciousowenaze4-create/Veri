@@ -512,10 +512,10 @@ export default function App() {
       selectedCountry.providers?.[0]?.countryId ||
       selectedCountry.slug;
     const unitPriceNgn =
-      selectedProviderQuote?.inStockMinPrice ||
       selectedProviderQuote?.minPrice ||
-      selectedCountry.inStockMinPrice ||
       selectedCountry.minPrice ||
+      selectedProviderQuote?.inStockMinPrice ||
+      selectedCountry.inStockMinPrice ||
       0;
     const requiredNgn = unitPriceNgn * quantity;
     if (walletBalance < requiredNgn) {

@@ -27,6 +27,12 @@ import type {
 } from './types';
 import { parseJsonResponse } from './utils/apiFetch';
 import { copyToClipboard } from './utils/clipboard';
+import {
+  createDirectGuerrillaAccount,
+  deleteDirectGuerrillaMessage,
+  fetchDirectGuerrillaMessageDetail,
+  fetchDirectGuerrillaMessages,
+} from './utils/directEmailFallback';
 import { supabase } from './utils/supabase';
 
 const STORAGE_KEYS = {
@@ -820,6 +826,7 @@ export default function App() {
             'x-email-provider': provider,
             'x-email-address': target.address,
           },
+          signal: AbortSignal.timeout(8000),
         });
 
         if (res.status === 401 && provider === 'mailtm' && target.password) {
@@ -827,6 +834,7 @@ export default function App() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ address: target.address, password: target.password }),
+            signal: AbortSignal.timeout(7000),
           });
           if (loginRes.ok) {
             const loginJson = await parseJsonResponse<{ token: string }>(loginRes);
@@ -843,6 +851,7 @@ export default function App() {
                 'x-email-provider': provider,
                 'x-email-address': target.address,
               },
+              signal: AbortSignal.timeout(8000),
             });
           }
         }
@@ -853,6 +862,15 @@ export default function App() {
         }
         setEmailMessages(data.messages || []);
       } catch (err) {
+        if ((target.provider || '').toLowerCase() === 'guerrilla' && target.token) {
+          try {
+            const directMsgs = await fetchDirectGuerrillaMessages(target.token);
+            setEmailMessages(directMsgs);
+            return;
+          } catch {
+            // Fall through to error message
+          }
+        }
         setEmailError(err instanceof Error ? err.message : 'Failed to load emails');
       } finally {
         setLoadingEmailMessages(false);
@@ -863,23 +881,39 @@ export default function App() {
 
   const handleGenerateInstantEmail = useCallback(async () => {
     setGeneratingEmail(true);
+    setEmailError(null);
     try {
-      const res = await fetch('/api/email/create', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ provider: 'auto' }),
-      });
-      const data = await parseJsonResponse<TempEmailAccount & { error?: string }>(res);
-      if (!res.ok || !data.address) {
-        throw new Error(data.error || 'Failed to generate email');
+      let created: TempEmailAccount | null = null;
+      try {
+        const res = await fetch('/api/email/create', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ provider: 'auto' }),
+          signal: AbortSignal.timeout(8000),
+        });
+        const data = await parseJsonResponse<TempEmailAccount & { error?: string }>(res);
+        if (res.ok && data.address) {
+          created = data;
+        }
+      } catch {
+        // Fall through to direct browser CORS provider
       }
-      setActiveEmail(data);
-      setSavedEmails((prev) => [data, ...prev.filter((a) => a.address !== data.address)].slice(0, 15));
+
+      if (!created) {
+        created = await createDirectGuerrillaAccount();
+      }
+
+      setActiveEmail(created);
+      setSavedEmails((prev) =>
+        [created!, ...prev.filter((a) => a.address !== created!.address)].slice(0, 15)
+      );
       setSelectedEmailDetail(null);
       setEmailMessages([]);
-      showToast(`Generated: ${data.address}`);
+      showToast(`Generated: ${created.address}`);
     } catch (err) {
-      showToast(err instanceof Error ? err.message : 'Could not generate email');
+      const msg = err instanceof Error ? err.message : 'Could not generate email';
+      setEmailError(msg);
+      showToast(msg);
     } finally {
       setGeneratingEmail(false);
     }
@@ -890,18 +924,33 @@ export default function App() {
       if (!activeEmail) return;
       setLoadingEmailDetail(true);
       try {
-        const res = await fetch(`/api/email/messages/${encodeURIComponent(id)}`, {
-          headers: {
-            Authorization: `Bearer ${activeEmail.token}`,
-            'x-email-provider': activeEmail.provider || 'mailtm',
-            'x-email-address': activeEmail.address,
-          },
-        });
-        const data = await parseJsonResponse<EmailMessageDetail & { error?: string }>(res);
-        if (!res.ok) {
-          throw new Error(data.error || 'Could not load email');
+        let detail: EmailMessageDetail | null = null;
+        try {
+          const res = await fetch(`/api/email/messages/${encodeURIComponent(id)}`, {
+            headers: {
+              Authorization: `Bearer ${activeEmail.token}`,
+              'x-email-provider': activeEmail.provider || 'mailtm',
+              'x-email-address': activeEmail.address,
+            },
+            signal: AbortSignal.timeout(8000),
+          });
+          const data = await parseJsonResponse<EmailMessageDetail & { error?: string }>(res);
+          if (res.ok && data.id) {
+            detail = data;
+          }
+        } catch {
+          // Try direct CORS fallback for GuerrillaMail below
         }
-        setSelectedEmailDetail(data);
+
+        if (!detail && (activeEmail.provider || '').toLowerCase() === 'guerrilla' && activeEmail.token) {
+          detail = await fetchDirectGuerrillaMessageDetail(activeEmail.token, id);
+        }
+
+        if (!detail) {
+          throw new Error('Could not load email');
+        }
+
+        setSelectedEmailDetail(detail);
         setEmailMessages((prev) => prev.map((m) => (m.id === id ? { ...m, seen: true } : m)));
       } catch (err) {
         showToast(err instanceof Error ? err.message : 'Failed to open email');
@@ -916,14 +965,21 @@ export default function App() {
     async (id: string) => {
       if (!activeEmail) return;
       try {
-        await fetch(`/api/email/messages/${encodeURIComponent(id)}`, {
-          method: 'DELETE',
-          headers: {
-            Authorization: `Bearer ${activeEmail.token}`,
-            'x-email-provider': activeEmail.provider || 'mailtm',
-            'x-email-address': activeEmail.address,
-          },
-        });
+        try {
+          await fetch(`/api/email/messages/${encodeURIComponent(id)}`, {
+            method: 'DELETE',
+            headers: {
+              Authorization: `Bearer ${activeEmail.token}`,
+              'x-email-provider': activeEmail.provider || 'mailtm',
+              'x-email-address': activeEmail.address,
+            },
+            signal: AbortSignal.timeout(6000),
+          });
+        } catch {
+          if ((activeEmail.provider || '').toLowerCase() === 'guerrilla' && activeEmail.token) {
+            await deleteDirectGuerrillaMessage(activeEmail.token, id);
+          }
+        }
         setEmailMessages((prev) => prev.filter((m) => m.id !== id));
         setSelectedEmailDetail(null);
         showToast('Email deleted');
@@ -948,16 +1004,25 @@ export default function App() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ provider: 'auto' }),
+            signal: AbortSignal.timeout(7000),
           });
           if (res.ok) {
             const data = await parseJsonResponse<TempEmailAccount>(res);
             if (data.address) {
               setActiveEmail(data);
               setSavedEmails([data]);
+              return;
             }
           }
         } catch {
-          // User can create via Create tab
+          // Fall back cleanly to browser direct provider
+        }
+        try {
+          const directAcct = await createDirectGuerrillaAccount();
+          setActiveEmail(directAcct);
+          setSavedEmails([directAcct]);
+        } catch {
+          // User can tap Create or Generate manually
         }
       })();
     }
@@ -1037,7 +1102,7 @@ export default function App() {
       {toast && (
         <div
           role="status"
-          className="fixed left-1/2 top-16 z-50 -translate-x-1/2 rounded-xl border border-[#D4AF37]/40 bg-[#1A160D] px-4 py-2 text-xs font-bold text-[#F5D77A] shadow-xl whitespace-nowrap"
+          className="fixed left-1/2 top-16 z-50 w-max max-w-[calc(100vw-2rem)] -translate-x-1/2 rounded-xl border border-[#D4AF37]/40 bg-[#1A160D] px-4 py-2 text-center text-xs font-bold text-[#F5D77A] shadow-xl whitespace-normal break-words"
         >
           {toast}
         </div>

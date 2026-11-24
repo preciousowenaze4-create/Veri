@@ -19,6 +19,10 @@ import {
 } from 'lucide-react';
 import type { AccountMode, EmailSuggestionOption, TempEmailAccount } from '../types';
 import { parseJsonResponse } from '../utils/apiFetch';
+import {
+  createDirectGuerrillaAccount,
+  generateDirectEmailSuggestions,
+} from '../utils/directEmailFallback';
 
 interface CreateEmailTabProps {
   savedEmails: TempEmailAccount[];
@@ -153,13 +157,17 @@ export function CreateEmailTab({
 
     setIsBrowserLoading(true);
     setBrowserProgress(50);
+    const cleanName = usernameInput.trim().replace(/[^a-zA-Z0-9]/g, '') || 'veribox';
+    const yearSuffix = birthYear.slice(-2);
+
     try {
-      const cleanName = usernameInput.trim().replace(/[^a-zA-Z0-9]/g, '') || 'veribox';
       const params = new URLSearchParams({
         firstName: cleanName,
-        lastName: birthYear.slice(-2),
+        lastName: yearSuffix,
       });
-      const res = await fetch(`/api/email/suggestions?${params.toString()}`);
+      const res = await fetch(`/api/email/suggestions?${params.toString()}`, {
+        signal: AbortSignal.timeout(6000),
+      });
       const data = await parseJsonResponse<{
         options?: EmailSuggestionOption[];
         error?: string;
@@ -173,8 +181,12 @@ export function CreateEmailTab({
       setSelectedOption(data.options[0]);
       setBrowserProgress(100);
       setScreen('choose');
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to generate email choices');
+    } catch {
+      const fallbackOptions = generateDirectEmailSuggestions(cleanName, yearSuffix);
+      setOptions(fallbackOptions);
+      setSelectedOption(fallbackOptions[0]);
+      setBrowserProgress(100);
+      setScreen('choose');
     } finally {
       setIsBrowserLoading(false);
       setTimeout(() => setBrowserProgress(0), 200);
@@ -211,22 +223,34 @@ export function CreateEmailTab({
     setBrowserProgress(60);
 
     try {
-      const res = await fetch('/api/email/create-selected', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          provider: selectedOption.provider,
-          username: selectedOption.username,
-          domain: selectedOption.domain,
-          address: selectedOption.address,
-          precreatedToken: selectedOption.precreatedToken,
-          password: password.trim() || 'VeriBox#2026',
-        }),
-      });
+      let data: (TempEmailAccount & { error?: string }) | null = null;
+      const finalPassword = password.trim() || 'VeriBox#2026';
 
-      const data = await parseJsonResponse<TempEmailAccount & { error?: string }>(res);
-      if (!res.ok || !data.address) {
-        throw new Error(data.error || 'Account creation failed');
+      try {
+        const res = await fetch('/api/email/create-selected', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            provider: selectedOption.provider,
+            username: selectedOption.username,
+            domain: selectedOption.domain,
+            address: selectedOption.address,
+            precreatedToken: selectedOption.precreatedToken,
+            password: finalPassword,
+          }),
+          signal: AbortSignal.timeout(8000),
+        });
+
+        const parsed = await parseJsonResponse<TempEmailAccount & { error?: string }>(res);
+        if (res.ok && parsed.address) {
+          data = parsed;
+        }
+      } catch {
+        // Fall through to direct browser CORS provider
+      }
+
+      if (!data) {
+        data = await createDirectGuerrillaAccount(selectedOption.username, finalPassword);
       }
 
       setBrowserProgress(100);
@@ -234,9 +258,9 @@ export function CreateEmailTab({
       const newAccount: TempEmailAccount = {
         id: data.id,
         address: data.address,
-        password: data.password || password.trim(),
+        password: data.password || finalPassword,
         token: data.token,
-        provider: data.provider || 'tempmailio',
+        provider: data.provider || 'guerrilla',
         createdAt: data.createdAt || new Date().toISOString(),
         accountMode,
         displayName: usernameInput.trim() || undefined,

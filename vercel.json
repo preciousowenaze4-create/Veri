@@ -3,12 +3,20 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "functions": {
-    "api/**/*.ts": {
-      "maxDuration": 30,
+    "api/index.ts": {
+      "maxDuration": 10,
+      "includeFiles": "server/**"
+    },
+    "api/[...all].ts": {
+      "maxDuration": 10,
       "includeFiles": "server/**"
     }
   },
   "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/index?__vercel_path=/api/$1"
+    },
     {
       "source": "/((?!api/|assets/|manifest\\.webmanifest|sw\\.js|icon\\.svg|pwa-.*\\.png|apple-touch-icon\\.png).*)",
       "destination": "/index.html"

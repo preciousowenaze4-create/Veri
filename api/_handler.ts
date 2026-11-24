@@ -29,6 +29,17 @@ function normalizeVercelRequestUrl(req: IncomingMessage): void {
       return;
     }
 
+    if (parsed.pathname === '/api/[...all]') {
+      const segments = parsed.searchParams.getAll('all').filter(Boolean);
+      if (segments.length > 0) {
+        parsed.searchParams.delete('all');
+        const qs = parsed.searchParams.toString();
+        const rebuilt = `/api/${segments.join('/')}`;
+        req.url = qs ? `${rebuilt}?${qs}` : rebuilt;
+        return;
+      }
+    }
+
     if (!parsed.pathname.startsWith('/api')) {
       const qs = parsed.searchParams.toString();
       const prefixed = `/api${parsed.pathname === '/' ? '' : parsed.pathname}`;

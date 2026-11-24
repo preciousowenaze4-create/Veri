@@ -127,7 +127,19 @@ export function HomeEmailTab({
           </div>
         </div>
 
-        {activeEmail ? (
+        {generatingEmail ? (
+          <div className="mt-3.5 flex items-center gap-3 rounded-xl border border-[#D4AF37]/35 bg-[#FAF7F0] p-4 dark:bg-[#0B0A07]">
+            <Loader2 className="h-5 w-5 shrink-0 animate-spin text-[#D4AF37]" />
+            <div>
+              <p className="text-sm font-bold text-[#1A160D] dark:text-[#FAF6EC]">
+                Generating your instant email...
+              </p>
+              <p className="mt-0.5 text-xs text-[#6E6552] dark:text-[#A89F8C]">
+                Connecting to live inbox server
+              </p>
+            </div>
+          </div>
+        ) : activeEmail ? (
           <div className="mt-3.5 rounded-xl border border-[#D4AF37]/25 bg-[#FAF7F0] p-3.5 dark:bg-[#0B0A07]">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="min-w-0 flex-1">
@@ -209,7 +221,7 @@ export function HomeEmailTab({
         ) : (
           <div className="mt-3.5 rounded-xl border border-dashed border-[#D4AF37]/30 p-4 text-center">
             <p className="text-sm text-[#6E6552] dark:text-[#A89F8C]">
-              No email created yet. Tap <strong>Create</strong> above to make your email.
+              No email created yet. Tap <strong>Create</strong> or <strong>Generate</strong> above to make your email.
             </p>
           </div>
         )}

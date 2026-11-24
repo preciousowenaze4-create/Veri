@@ -46,7 +46,46 @@ const STORAGE_KEYS = {
   walletUserId: 'veribox_wallet_user_id_v2',
   creditedRefs: 'veribox_credited_refs_v2',
   pendingRef: 'veribox_pending_paystack_ref',
+  dailyGenerateQuota: 'veribox_daily_generate_quota_v1',
 };
+
+const FREE_DAILY_EMAIL_LIMIT = 5;
+
+function getLocalDateKey(): string {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, '0');
+  const d = String(now.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+function readDailyGenerateCount(userId: string): number {
+  const today = getLocalDateKey();
+  try {
+    const raw = localStorage.getItem(STORAGE_KEYS.dailyGenerateQuota);
+    if (!raw) return 0;
+    const map = JSON.parse(raw) as Record<string, { date?: string; count?: number }>;
+    const entry = map[userId];
+    if (!entry || entry.date !== today) return 0;
+    return Math.max(0, Math.min(FREE_DAILY_EMAIL_LIMIT, Number(entry.count) || 0));
+  } catch {
+    return 0;
+  }
+}
+
+function writeDailyGenerateCount(userId: string, nextCount: number): number {
+  const today = getLocalDateKey();
+  const clamped = Math.max(0, Math.min(FREE_DAILY_EMAIL_LIMIT, nextCount));
+  try {
+    const raw = localStorage.getItem(STORAGE_KEYS.dailyGenerateQuota);
+    const map = raw ? (JSON.parse(raw) as Record<string, { date?: string; count?: number }>) : {};
+    map[userId] = { date: today, count: clamped };
+    localStorage.setItem(STORAGE_KEYS.dailyGenerateQuota, JSON.stringify(map));
+  } catch {
+    // Non-blocking
+  }
+  return clamped;
+}
 
 const DEFAULT_SERVICES: NumberServiceOption[] = [
   { id: 'whatsapp', name: 'WhatsApp', popular: true },
@@ -187,6 +226,9 @@ export default function App() {
   const [loadingEmailDetail, setLoadingEmailDetail] = useState<boolean>(false);
   const [generatingEmail, setGeneratingEmail] = useState<boolean>(false);
   const [emailStreamConnected, setEmailStreamConnected] = useState<boolean>(false);
+  const [dailyGenerateUsed, setDailyGenerateUsed] = useState<number>(() =>
+    readDailyGenerateCount(walletUserId)
+  );
   const [emailError, setEmailError] = useState<string | null>(null);
 
   // Profile / Vault state
@@ -244,6 +286,10 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(STORAGE_KEYS.walletBalance, JSON.stringify(walletBalance));
   }, [walletBalance]);
+
+  useEffect(() => {
+    setDailyGenerateUsed(readDailyGenerateCount(walletUserId));
+  }, [walletUserId]);
 
   const showToast = useCallback((message: string) => {
     setToast(message);
@@ -1151,6 +1197,15 @@ export default function App() {
   );
 
   const handleGenerateCustomEmail = useCallback(async () => {
+    const usedToday = readDailyGenerateCount(walletUserId);
+    setDailyGenerateUsed(usedToday);
+    if (usedToday >= FREE_DAILY_EMAIL_LIMIT) {
+      const limitMsg = `Daily free limit reached (${FREE_DAILY_EMAIL_LIMIT}/${FREE_DAILY_EMAIL_LIMIT} today). Resets tomorrow or use Create (₦50).`;
+      setEmailError(limitMsg);
+      showToast(limitMsg);
+      return;
+    }
+
     setGeneratingEmail(true);
     setEmailError(null);
     try {
@@ -1168,6 +1223,10 @@ export default function App() {
         throw new Error(data.error || `Could not generate @${emailDomain} email`);
       }
 
+      const nextUsed = writeDailyGenerateCount(walletUserId, usedToday + 1);
+      setDailyGenerateUsed(nextUsed);
+      const remaining = Math.max(0, FREE_DAILY_EMAIL_LIMIT - nextUsed);
+
       lastFetchedAddressRef.current = null;
       knownEmailMsgIdsRef.current = new Set();
       setActiveEmail(data);
@@ -1180,7 +1239,7 @@ export default function App() {
       setSelectedEmailDetail(null);
       setEmailMessages([]);
       setCountdown(3);
-      showToast(`Generated ${data.address}`);
+      showToast(`Generated ${data.address} · ${remaining}/${FREE_DAILY_EMAIL_LIMIT} free left today`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : `Could not generate @${emailDomain} email`;
       setEmailError(msg);
@@ -1512,6 +1571,8 @@ export default function App() {
             loadingDetail={loadingEmailDetail}
             generatingEmail={generatingEmail}
             emailStreamConnected={emailStreamConnected}
+            dailyGenerateUsed={dailyGenerateUsed}
+            dailyGenerateLimit={FREE_DAILY_EMAIL_LIMIT}
             emailError={emailError}
             countdown={countdown}
             autoRefresh={autoRefresh}

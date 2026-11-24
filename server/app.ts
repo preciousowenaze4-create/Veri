@@ -270,16 +270,34 @@ function stripTags(html: string): string {
 
 export function extractOtpCode(text: string): string | null {
   if (!text) return null;
-  const prefixed = text.match(/\b(?:G-|FB-|IG-|WA-|TT-)?(\d{3}-\d{3})\b/i);
-  if (prefixed) return prefixed[0].replace(/^[^0-9]+/, '');
+  const prefixed = text.match(/\b(?:G-|FB-|IG-|WA-|TT-)(\d{4,8})\b|\b(\d{3}-\d{3})\b/i);
+  if (prefixed) return (prefixed[1] || prefixed[2] || '').trim();
+
+  const beforePhrase = text.match(
+    /\b(\d{4,8})\s+is\s+(?:your|the)\s+(?:[a-z]+\s+){0,4}(?:code|otp|pin|passcode|token)\b/i
+  );
+  if (beforePhrase) return beforePhrase[1];
+
+  const contextualSpaced = text.match(
+    /(?:code|otp|pin|verification|confirm|confirmation|instagram|facebook|tiktok)[^\d]{0,60}\b(\d{3})\s+(\d{3})\b/i
+  );
+  if (contextualSpaced) return `${contextualSpaced[1]}${contextualSpaced[2]}`;
 
   const contextual = text.match(
-    /(?:code|otp|pin|verification|verify|passcode|token|confirmation|one-time|رمز|código|код)[^\d]{0,28}(\d{4,8})\b/i
+    /(?:code|otp|pin|verification|verify|passcode|token|confirmation|one-time|رمز|código|код)[^\d]{0,80}(\d{4,8})\b/i
   );
   if (contextual) return contextual[1];
 
-  const standalone = text.match(/\b(\d{6})\b/) || text.match(/\b(\d{4,8})\b/);
-  if (standalone) return standalone[1];
+  const sixDigit = text.match(/\b(\d{6})\b/);
+  if (sixDigit) return sixDigit[1];
+
+  const fiveDigit = text.match(/\b(\d{5})\b/);
+  if (fiveDigit) return fiveDigit[1];
+
+  const all4to8 = text.match(/\b(\d{4,8})\b/g) || [];
+  const nonYear = all4to8.find((n) => !/^(?:19|20)\d{2}$/.test(n));
+  if (nonYear) return nonYear;
+  if (all4to8[0]) return all4to8[0];
 
   return null;
 }
@@ -719,16 +737,19 @@ function parseInboundMimePayload(rawText: string, rawHtml: string): { plainText:
   let cleanText = rawText || '';
   let cleanHtml = rawHtml || '';
 
-  const looksLikeRawMime =
-    /(?:^|\r?\n)Content-Type:\s*(?:multipart|text)\//i.test(cleanText) ||
-    /^(?:--[A-Za-z0-9'()+_,-./:=?]{6,})[\r\n]/.test(cleanText.trimStart());
+  const boundaryIndex = cleanText.search(/(?:^|\r?\n)--[A-Za-z0-9'()+_,-./:=?]{4,}\r?\nContent-Type:/i);
+  const hasTopContentType = /(?:^|\r?\n)Content-Type:\s*(?:multipart|text)\//i.test(cleanText);
 
-  if (looksLikeRawMime) {
-    const normalized = cleanText.trimStart();
-    if (/^--[A-Za-z0-9'()+_,-./:=?]{6,}/.test(normalized)) {
-      const firstLine = normalized.split(/\r?\n/, 1)[0];
+  if (hasTopContentType || boundaryIndex !== -1) {
+    if (/^(?:Received|Return-Path|DKIM-Signature|From|To|Subject|MIME-Version|Content-Type):/im.test(cleanText) && hasTopContentType) {
+      const parsed = parseMimeSection(cleanText);
+      if (parsed.htmlParts.length > 0) cleanHtml = parsed.htmlParts.join('\n');
+      if (parsed.textParts.length > 0) cleanText = parsed.textParts.join('\n').trim();
+    } else if (boundaryIndex !== -1) {
+      const fromBoundary = cleanText.slice(boundaryIndex).replace(/^\r?\n/, '');
+      const firstLine = fromBoundary.split(/\r?\n/, 1)[0];
       const boundary = firstLine.slice(2).trim();
-      const synthetic = `Content-Type: multipart/mixed; boundary="${boundary}"\r\n\r\n${normalized}`;
+      const synthetic = `Content-Type: multipart/mixed; boundary="${boundary}"\r\n\r\n${fromBoundary}`;
       const parsed = parseMimeSection(synthetic);
       if (parsed.htmlParts.length > 0) cleanHtml = parsed.htmlParts.join('\n');
       if (parsed.textParts.length > 0) cleanText = parsed.textParts.join('\n').trim();
@@ -786,18 +807,20 @@ function extractAddressFromHeader(raw: string): { name: string; address: string 
 
 function extractTargetRecipients(rawTo: unknown): string[] {
   const values: string[] = [];
-  if (Array.isArray(rawTo)) {
-    for (const item of rawTo) {
-      if (typeof item === 'string') values.push(item);
-      else if (item && typeof item === 'object' && typeof (item as { email?: string; address?: string }).email === 'string') {
-        values.push((item as { email: string }).email);
-      } else if (item && typeof item === 'object' && typeof (item as { address?: string }).address === 'string') {
-        values.push((item as { address: string }).address);
-      }
+  const pushItem = (item: unknown) => {
+    if (!item) return;
+    if (typeof item === 'string') {
+      values.push(...item.split(','));
+    } else if (Array.isArray(item)) {
+      for (const entry of item) pushItem(entry);
+    } else if (typeof item === 'object') {
+      const obj = item as { email?: unknown; address?: unknown; to?: unknown };
+      if (typeof obj.email === 'string') values.push(obj.email);
+      if (typeof obj.address === 'string') values.push(obj.address);
+      if (obj.to) pushItem(obj.to);
     }
-  } else if (typeof rawTo === 'string') {
-    values.push(...rawTo.split(','));
-  }
+  };
+  pushItem(rawTo);
 
   const out: string[] = [];
   const seen = new Set<string>();
@@ -2084,7 +2107,8 @@ export function createApiApp() {
   const app = express();
   app.use(
     express.json({
-      limit: '2mb',
+      limit: '5mb',
+      type: ['application/json', 'application/*+json', 'text/plain'],
       verify: (req, _res, buf) => {
         (req as express.Request & { rawBody?: Buffer }).rawBody = buf;
       },
@@ -3115,25 +3139,55 @@ export function createApiApp() {
       }
     }
 
-    const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, unknown>;
+    let parsedBody: unknown = req.body;
+    if (typeof parsedBody === 'string') {
+      try {
+        parsedBody = JSON.parse(parsedBody);
+      } catch {
+        parsedBody = {};
+      }
+    }
+    const body = (parsedBody && typeof parsedBody === 'object' ? parsedBody : {}) as Record<
+      string,
+      unknown
+    >;
     const payload =
       body.data && typeof body.data === 'object' && !Array.isArray(body.data)
         ? (body.data as Record<string, unknown>)
         : body;
 
-    const rawTo =
-      payload.to ??
-      payload.recipient ??
-      payload.rcpt ??
-      payload.ToFull ??
-      payload.To ??
-      body.to;
+    const envelopeObj =
+      payload.envelope && typeof payload.envelope === 'object'
+        ? (payload.envelope as Record<string, unknown>)
+        : undefined;
+    const headersObj =
+      payload.headers && typeof payload.headers === 'object'
+        ? (payload.headers as Record<string, unknown>)
+        : undefined;
 
-    const rawRecipients = extractTargetRecipients(rawTo).filter((addr) =>
+    const candidateRecipients = [
+      payload.to,
+      payload.rcptTo,
+      payload.recipient,
+      payload.rcpt,
+      payload.envelopeTo,
+      payload.deliveredTo,
+      payload.originalRecipient,
+      envelopeObj?.to,
+      headersObj?.to,
+      payload.ToFull,
+      payload.To,
+      body.to,
+      body.rcptTo,
+      body.recipient,
+    ];
+
+    const rawRecipients = extractTargetRecipients(candidateRecipients).filter((addr) =>
       addr.endsWith(`@${CUSTOM_EMAIL_DOMAIN}`)
     );
 
     if (rawRecipients.length === 0) {
+      console.warn('[VeriBox Inbound] Dropped webhook: no recipient matching @' + CUSTOM_EMAIL_DOMAIN);
       res.status(400).json({
         error: `No recipient matching @${CUSTOM_EMAIL_DOMAIN} found in payload`,
       });
@@ -3164,6 +3218,8 @@ export function createApiApp() {
       String(
         payload.from ||
           payload.sender ||
+          envelopeObj?.from ||
+          headersObj?.from ||
           payload.From ||
           payload.FromFull ||
           `sender@${CUSTOM_EMAIL_DOMAIN}`
@@ -3176,7 +3232,7 @@ export function createApiApp() {
         : parsedFrom.name
     );
     const subject = decodeMimeWord(
-      String(payload.subject || payload.Subject || '(No subject)')
+      String(payload.subject || headersObj?.subject || payload.Subject || '(No subject)')
     ).slice(0, 300);
 
     const rawHtml = String(
@@ -3193,15 +3249,22 @@ export function createApiApp() {
         payload.TextBody ||
         ''
     );
-    if (!rawText && !rawHtml && typeof payload.raw === 'string' && payload.raw.trim()) {
-      const normalizedRaw = payload.raw.replace(/\r\n/g, '\n');
-      const headerSep = normalizedRaw.indexOf('\n\n');
-      rawText = headerSep !== -1 ? normalizedRaw.slice(headerSep + 2) : normalizedRaw;
+    const rawMime =
+      typeof payload.raw === 'string' && payload.raw.trim()
+        ? payload.raw
+        : typeof payload.rawEmail === 'string' && payload.rawEmail.trim()
+          ? payload.rawEmail
+          : '';
+    if (!rawText && !rawHtml && rawMime) {
+      rawText = rawMime;
     }
 
     const { plainText, html } = parseInboundMimePayload(rawText, rawHtml);
     const otp = extractOtpCode(`${subject}\n${plainText}\n${html ? stripTags(html) : ''}`);
     const createdAt = new Date().toISOString();
+    console.log(
+      `[VeriBox Inbound] Stored mail for ${recipients.join(', ')} from ${parsedFrom.address} (otp=${otp || 'none'})`
+    );
 
     const storedIds: string[] = [];
     for (const recipient of recipients) {

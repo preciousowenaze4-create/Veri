@@ -26,6 +26,8 @@ interface HomeEmailTabProps {
   loadingDetail: boolean;
   generatingEmail?: boolean;
   emailStreamConnected?: boolean;
+  dailyGenerateUsed?: number;
+  dailyGenerateLimit?: number;
   emailError: string | null;
   countdown: number;
   autoRefresh: boolean;
@@ -47,8 +49,8 @@ interface HomeEmailTabProps {
 
 function providerName(domain: string, mode?: string): string {
   const modeTag =
-    mode === 'business' ? ' · Business' : mode === 'privacy' ? ' · Privacy' : ' · Personal';
-  return `VeriBox Mail · @${domain}${modeTag}`;
+    mode === 'business' ? 'Business' : mode === 'privacy' ? 'Privacy' : 'Personal';
+  return `@${domain} · ${modeTag}`;
 }
 
 export function HomeEmailTab({
@@ -61,6 +63,8 @@ export function HomeEmailTab({
   loadingDetail,
   generatingEmail = false,
   emailStreamConnected = false,
+  dailyGenerateUsed = 0,
+  dailyGenerateLimit = 5,
   emailError,
   countdown,
   autoRefresh,
@@ -80,6 +84,8 @@ export function HomeEmailTab({
   const [confirmDeleteAddress, setConfirmDeleteAddress] = useState<string | null>(null);
   const [showPasswordChip, setShowPasswordChip] = useState(false);
 
+  const dailyRemaining = Math.max(0, dailyGenerateLimit - dailyGenerateUsed);
+
   const handleCopy = (key: string, value: string, label: string, otpSource?: string) => {
     onCopyText(value, label, otpSource ? { source: otpSource, channel: 'Email' } : undefined);
     setCopiedKey(key);
@@ -88,10 +94,10 @@ export function HomeEmailTab({
 
   return (
     <div className="space-y-4">
-      {/* Top Card: Your Active Email + Generate / Create + Switch Created Emails */}
+      {/* Top Card: Phone Number / Create / Generate + Active Email */}
       <section className="rounded-2xl border border-[#D4AF37]/30 bg-white p-4 sm:p-5 dark:bg-[#14120D]">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div>
+        <div className="flex items-start justify-between gap-2">
+          <div className="min-w-0">
             <p className="text-xs font-bold text-[#8A6208] dark:text-[#D4AF37]">
               Home · @{emailDomain} Mail
             </p>
@@ -100,41 +106,60 @@ export function HomeEmailTab({
             </h1>
           </div>
 
-          <div className="flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              onClick={onGoToNumbers}
-              className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl border border-[#D4AF37]/30 px-3 py-1.5 text-xs font-bold text-[#4F4736] hover:bg-[#D4AF37]/10 whitespace-nowrap cursor-pointer dark:text-[#F5D77A]"
-            >
-              <Phone className="h-3.5 w-3.5" />
-              <span>Numbers</span>
-            </button>
-            <button
-              type="button"
-              onClick={onGenerateEmail}
-              disabled={generatingEmail}
-              className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl bg-[#D4AF37] px-3.5 py-1.5 text-xs font-extrabold text-[#0A0906] hover:bg-[#E5C150] whitespace-nowrap disabled:opacity-60 cursor-pointer shadow-sm"
-            >
-              {generatingEmail ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <Sparkles className="h-3.5 w-3.5" />
-              )}
-              <span>{generatingEmail ? 'Generating...' : 'Generate Email'}</span>
-            </button>
-            <button
-              type="button"
-              onClick={onGoToCreate}
-              className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl border border-[#D4AF37]/50 bg-[#D4AF37]/15 px-3 py-1.5 text-xs font-bold text-[#8A6208] hover:bg-[#D4AF37]/25 whitespace-nowrap cursor-pointer dark:text-[#F5D77A]"
-            >
-              <MailPlus className="h-3.5 w-3.5" />
-              <span>Create Email</span>
-            </button>
-          </div>
+          <span
+            className={`shrink-0 rounded-lg border px-2 py-1 text-[11px] font-bold tabular-nums ${
+              dailyRemaining > 0
+                ? 'border-[#D4AF37]/35 bg-[#D4AF37]/10 text-[#8A6208] dark:text-[#F5D77A]'
+                : 'border-rose-500/35 bg-rose-500/10 text-rose-600 dark:text-rose-300'
+            }`}
+          >
+            {dailyRemaining}/{dailyGenerateLimit} free today
+          </span>
         </div>
 
+        {/* Straight 3-Column Row: Phone Number -> Create -> Generate */}
+        <div className="mt-3 grid grid-cols-3 gap-2">
+          <button
+            type="button"
+            onClick={onGoToNumbers}
+            className="inline-flex h-10 w-full items-center justify-center gap-1.5 rounded-xl border border-[#D4AF37]/30 px-2 text-[11px] sm:text-xs font-bold text-[#4F4736] hover:bg-[#D4AF37]/10 whitespace-nowrap cursor-pointer dark:text-[#F5D77A]"
+          >
+            <Phone className="h-3.5 w-3.5 shrink-0" />
+            <span>Phone No.</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={onGoToCreate}
+            className="inline-flex h-10 w-full items-center justify-center gap-1.5 rounded-xl border border-[#D4AF37]/45 bg-[#D4AF37]/15 px-2 text-[11px] sm:text-xs font-bold text-[#8A6208] hover:bg-[#D4AF37]/25 whitespace-nowrap cursor-pointer dark:text-[#F5D77A]"
+          >
+            <MailPlus className="h-3.5 w-3.5 shrink-0" />
+            <span>Create</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={onGenerateEmail}
+            disabled={generatingEmail}
+            className="inline-flex h-10 w-full items-center justify-center gap-1.5 rounded-xl bg-[#D4AF37] px-2 text-[11px] sm:text-xs font-extrabold text-[#0A0906] hover:bg-[#E5C150] whitespace-nowrap disabled:opacity-60 cursor-pointer shadow-sm"
+          >
+            {generatingEmail ? (
+              <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+            ) : (
+              <Sparkles className="h-3.5 w-3.5 shrink-0" />
+            )}
+            <span>{generatingEmail ? 'Wait...' : 'Generate'}</span>
+          </button>
+        </div>
+
+        {dailyRemaining === 0 && (
+          <p className="mt-2.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-[11px] font-semibold text-amber-800 dark:text-amber-200">
+            5/5 free emails used today. Resets tomorrow, or tap <strong>Create</strong> (₦50) for a custom address.
+          </p>
+        )}
+
         {generatingEmail ? (
-          <div className="mt-3.5 flex items-center gap-3 rounded-xl border border-[#D4AF37]/35 bg-[#FAF7F0] p-4 dark:bg-[#0B0A07]">
+          <div className="mt-3.5 flex items-center gap-3 rounded-xl border border-[#D4AF37]/35 bg-[#FAF7F0] p-3.5 dark:bg-[#0B0A07]">
             <Loader2 className="h-5 w-5 shrink-0 animate-spin text-[#D4AF37]" />
             <div>
               <p className="text-sm font-bold text-[#1A160D] dark:text-[#FAF6EC]">
@@ -146,48 +171,30 @@ export function HomeEmailTab({
             </div>
           </div>
         ) : activeEmail ? (
-          <div className="mt-3.5 rounded-xl border border-[#D4AF37]/25 bg-[#FAF7F0] p-3.5 dark:bg-[#0B0A07]">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="min-w-0 flex-1">
-                <p className="truncate font-mono text-sm sm:text-base font-bold text-[#1A160D] dark:text-[#F5D77A]">
-                  {activeEmail.address}
-                </p>
-                <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-[#6E6552] dark:text-[#A89F8C]">
-                  <span>
-                    {providerName(activeEmail.domain || emailDomain, activeEmail.accountMode)} · Created{' '}
-                    {formatRelativeTime(activeEmail.createdAt)}
-                  </span>
-                  {activeEmail.password && (
-                    <button
-                      type="button"
-                      onClick={() => setShowPasswordChip((prev) => !prev)}
-                      className="inline-flex items-center gap-1 rounded-md border border-[#D4AF37]/25 px-1.5 py-0.5 text-[10px] font-bold text-[#8A6208] hover:bg-[#D4AF37]/10 cursor-pointer dark:text-[#F5D77A]"
-                    >
-                      <KeyRound className="h-2.5 w-2.5" />
-                      <span>{showPasswordChip ? activeEmail.password : 'Recovery Key'}</span>
-                    </button>
-                  )}
-                </div>
-              </div>
+          <div className="mt-3.5 rounded-xl border border-[#D4AF37]/25 bg-[#FAF7F0] p-3 dark:bg-[#0B0A07]">
+            {/* Straight Email Address + Compact Copy Icon + Compact Delete Icon */}
+            <div className="flex items-center justify-between gap-2">
+              <p
+                title={activeEmail.address}
+                className="min-w-0 flex-1 truncate font-mono text-[13px] sm:text-sm font-bold text-[#1A160D] dark:text-[#F5D77A]"
+              >
+                {activeEmail.address}
+              </p>
 
-              <div className="flex items-center gap-2 shrink-0">
+              <div className="flex items-center gap-1.5 shrink-0">
                 <button
                   type="button"
                   onClick={() =>
                     handleCopy('active-email', activeEmail.address, 'Email address copied')
                   }
-                  className="inline-flex min-h-[42px] items-center gap-2 rounded-xl bg-[#D4AF37] px-4 py-2 text-xs font-bold text-[#0A0906] hover:bg-[#E5C150] whitespace-nowrap shrink-0 cursor-pointer"
+                  aria-label="Copy email address"
+                  title="Copy email address"
+                  className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#D4AF37] text-[#0A0906] hover:bg-[#E5C150] transition-colors cursor-pointer"
                 >
                   {copiedKey === 'active-email' ? (
-                    <>
-                      <Check className="h-4 w-4" />
-                      <span>Copied</span>
-                    </>
+                    <Check className="h-4 w-4" />
                   ) : (
-                    <>
-                      <Copy className="h-4 w-4" />
-                      <span>Copy Email</span>
-                    </>
+                    <Copy className="h-4 w-4" />
                   )}
                 </button>
 
@@ -200,11 +207,28 @@ export function HomeEmailTab({
                   }
                   aria-label="Delete active email"
                   title="Delete email from Home"
-                  className="flex min-h-[42px] min-w-[42px] items-center justify-center rounded-xl border border-rose-500/30 text-rose-600 transition-colors hover:bg-rose-500/10 cursor-pointer dark:text-rose-400"
+                  className="flex h-8 w-8 items-center justify-center rounded-lg border border-rose-500/30 text-rose-600 transition-colors hover:bg-rose-500/10 cursor-pointer dark:text-rose-400"
                 >
                   <Trash2 className="h-4 w-4" />
                 </button>
               </div>
+            </div>
+
+            <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[11px] text-[#6E6552] dark:text-[#A89F8C]">
+              <span>
+                {providerName(activeEmail.domain || emailDomain, activeEmail.accountMode)} ·{' '}
+                {formatRelativeTime(activeEmail.createdAt)}
+              </span>
+              {activeEmail.password && (
+                <button
+                  type="button"
+                  onClick={() => setShowPasswordChip((prev) => !prev)}
+                  className="inline-flex items-center gap-1 rounded-md border border-[#D4AF37]/25 px-1.5 py-0.5 text-[10px] font-bold text-[#8A6208] hover:bg-[#D4AF37]/10 cursor-pointer dark:text-[#F5D77A]"
+                >
+                  <KeyRound className="h-2.5 w-2.5" />
+                  <span>{showPasswordChip ? activeEmail.password : 'Recovery Key'}</span>
+                </button>
+              )}
             </div>
 
             {confirmDeleteAddress === activeEmail.address && (
@@ -241,7 +265,7 @@ export function HomeEmailTab({
             )}
 
             {savedEmails.length > 1 && (
-              <div className="mt-3 border-t border-[#D4AF37]/15 pt-3">
+              <div className="mt-3 border-t border-[#D4AF37]/15 pt-2.5">
                 <button
                   type="button"
                   onClick={() => setSwitcherOpen((prev) => !prev)}
@@ -260,7 +284,7 @@ export function HomeEmailTab({
                       return (
                         <div
                           key={acct.address}
-                          className={`flex min-h-[42px] w-full items-center justify-between gap-2 rounded-xl border px-3 py-2 transition-colors ${
+                          className={`flex min-h-[40px] w-full items-center justify-between gap-2 rounded-xl border px-3 py-1.5 transition-colors ${
                             isCurrent
                               ? 'border-[#D4AF37] bg-[#D4AF37]/15'
                               : 'border-[#D4AF37]/15 hover:bg-[#D4AF37]/10'
@@ -303,8 +327,9 @@ export function HomeEmailTab({
           </div>
         ) : (
           <div className="mt-3.5 rounded-xl border border-dashed border-[#D4AF37]/30 p-4 text-center space-y-3">
-            <p className="text-sm text-[#6E6552] dark:text-[#A89F8C]">
-              Generate an instant <strong>@{emailDomain}</strong> address or create a custom username &amp; password mailbox.
+            <p className="text-xs sm:text-sm text-[#6E6552] dark:text-[#A89F8C]">
+              Tap <strong>Generate</strong> ({dailyRemaining}/5 free today) for an instant{' '}
+              <strong>@{emailDomain}</strong> inbox, or <strong>Create</strong> for a custom username.
             </p>
             <div className="flex flex-wrap items-center justify-center gap-2">
               <button
@@ -314,7 +339,7 @@ export function HomeEmailTab({
                 className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl bg-[#D4AF37] px-4 py-1.5 text-xs font-extrabold text-[#0A0906] hover:bg-[#E5C150] cursor-pointer"
               >
                 <Sparkles className="h-3.5 w-3.5" />
-                <span>Generate Email</span>
+                <span>Generate ({dailyRemaining} left)</span>
               </button>
               <button
                 type="button"
@@ -322,7 +347,7 @@ export function HomeEmailTab({
                 className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl border border-[#D4AF37]/45 px-4 py-1.5 text-xs font-bold text-[#8A6208] hover:bg-[#D4AF37]/10 cursor-pointer dark:text-[#F5D77A]"
               >
                 <MailPlus className="h-3.5 w-3.5" />
-                <span>Custom Username</span>
+                <span>Create Custom</span>
               </button>
             </div>
           </div>

@@ -91,11 +91,15 @@ function markReferenceCredited(reference: string): boolean {
   }
 }
 
-function isCustomDomainMailbox(account: TempEmailAccount | null | undefined): account is TempEmailAccount {
+function isCustomDomainMailbox(
+  account: TempEmailAccount | null | undefined,
+  domain: string = CUSTOM_EMAIL_DOMAIN
+): account is TempEmailAccount {
+  const cleanDomain = (domain || CUSTOM_EMAIL_DOMAIN).trim().toLowerCase().replace(/^@+/, '');
   return Boolean(
     account &&
       typeof account.address === 'string' &&
-      account.address.toLowerCase().endsWith(`@${CUSTOM_EMAIL_DOMAIN}`)
+      account.address.toLowerCase().endsWith(`@${cleanDomain}`)
   );
 }
 
@@ -161,21 +165,28 @@ export default function App() {
   const [acquireError, setAcquireError] = useState<string | null>(null);
   const [streamConnected, setStreamConnected] = useState<boolean>(false);
 
-  // Email state (custom @veribox.name.ng mailboxes only)
+  // Email state (custom domain from process.env.EMAIL_DOMAIN)
+  const [emailDomain, setEmailDomain] = useState<string>(CUSTOM_EMAIL_DOMAIN);
   const [savedEmails, setSavedEmails] = useState<TempEmailAccount[]>(() =>
-    readStorage<TempEmailAccount[]>(STORAGE_KEYS.emails, []).filter(isCustomDomainMailbox)
+    readStorage<TempEmailAccount[]>(STORAGE_KEYS.emails, []).filter((a) =>
+      isCustomDomainMailbox(a, CUSTOM_EMAIL_DOMAIN)
+    )
   );
   const [deletedEmails, setDeletedEmails] = useState<TempEmailAccount[]>(() =>
-    readStorage<TempEmailAccount[]>(STORAGE_KEYS.deletedEmails, []).filter(isCustomDomainMailbox)
+    readStorage<TempEmailAccount[]>(STORAGE_KEYS.deletedEmails, []).filter((a) =>
+      isCustomDomainMailbox(a, CUSTOM_EMAIL_DOMAIN)
+    )
   );
   const [activeEmail, setActiveEmail] = useState<TempEmailAccount | null>(() => {
     const stored = readStorage<TempEmailAccount | null>(STORAGE_KEYS.activeEmail, null);
-    return isCustomDomainMailbox(stored) ? stored : null;
+    return isCustomDomainMailbox(stored, CUSTOM_EMAIL_DOMAIN) ? stored : null;
   });
   const [emailMessages, setEmailMessages] = useState<EmailMessageSummary[]>([]);
   const [selectedEmailDetail, setSelectedEmailDetail] = useState<EmailMessageDetail | null>(null);
   const [loadingEmailMessages, setLoadingEmailMessages] = useState<boolean>(false);
   const [loadingEmailDetail, setLoadingEmailDetail] = useState<boolean>(false);
+  const [generatingEmail, setGeneratingEmail] = useState<boolean>(false);
+  const [emailStreamConnected, setEmailStreamConnected] = useState<boolean>(false);
   const [emailError, setEmailError] = useState<string | null>(null);
 
   // Profile / Vault state
@@ -187,6 +198,7 @@ export default function App() {
   );
 
   const lastFetchedAddressRef = useRef<string | null>(null);
+  const knownEmailMsgIdsRef = useRef<Set<string>>(new Set());
   const notifiedSmsOrderIdsRef = useRef<Set<number>>(new Set());
   const autoRefundedOrderIdsRef = useRef<Set<number>>(new Set());
 
@@ -1076,12 +1088,39 @@ export default function App() {
     [services, loadCountriesForService]
   );
 
+  const applyInboxSnapshot = useCallback(
+    (address: string, nextMessages: EmailMessageSummary[], notifyNew = false) => {
+      const normalized = address.toLowerCase();
+      if (lastFetchedAddressRef.current !== normalized) {
+        knownEmailMsgIdsRef.current = new Set(nextMessages.map((m) => m.id));
+        lastFetchedAddressRef.current = normalized;
+      } else if (notifyNew) {
+        const newlyArrived = nextMessages.filter((m) => !knownEmailMsgIdsRef.current.has(m.id));
+        if (newlyArrived.length > 0) {
+          const newest = newlyArrived[0];
+          showToast(
+            newest.otp
+              ? `New email from ${newest.fromName} · Code ${newest.otp}`
+              : `New email: ${newest.subject}`
+          );
+        }
+        for (const m of nextMessages) knownEmailMsgIdsRef.current.add(m.id);
+      } else {
+        for (const m of nextMessages) knownEmailMsgIdsRef.current.add(m.id);
+      }
+      setEmailMessages(nextMessages);
+    },
+    [showToast]
+  );
+
   const refreshEmailInbox = useCallback(
-    async (accountOverride?: TempEmailAccount | null) => {
+    async (accountOverride?: TempEmailAccount | null, silent = false) => {
       const target = accountOverride ?? activeEmail;
       if (!target) return;
-      setLoadingEmailMessages(true);
-      setEmailError(null);
+      if (!silent) {
+        setLoadingEmailMessages(true);
+        setEmailError(null);
+      }
       try {
         const res = await fetch('/api/email/messages', {
           headers: {
@@ -1096,15 +1135,60 @@ export default function App() {
         if (!res.ok) {
           throw new Error(data.error || 'Failed to read email inbox');
         }
-        setEmailMessages(data.messages || []);
+        applyInboxSnapshot(target.address, data.messages || [], silent);
+        setEmailError(null);
       } catch (err) {
-        setEmailError(err instanceof Error ? err.message : 'Failed to load emails');
+        if (!silent) {
+          setEmailError(err instanceof Error ? err.message : 'Failed to load emails');
+        }
       } finally {
-        setLoadingEmailMessages(false);
+        if (!silent) {
+          setLoadingEmailMessages(false);
+        }
       }
     },
-    [activeEmail]
+    [activeEmail, applyInboxSnapshot]
   );
+
+  const handleGenerateCustomEmail = useCallback(async () => {
+    setGeneratingEmail(true);
+    setEmailError(null);
+    try {
+      const res = await fetch('/api/email/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: walletUserId,
+          accountMode: 'personal',
+        }),
+        signal: AbortSignal.timeout(9000),
+      });
+      const data = await parseJsonResponse<TempEmailAccount & { error?: string }>(res);
+      if (!res.ok || !data.address) {
+        throw new Error(data.error || `Could not generate @${emailDomain} email`);
+      }
+
+      lastFetchedAddressRef.current = null;
+      knownEmailMsgIdsRef.current = new Set();
+      setActiveEmail(data);
+      setSavedEmails((prev) =>
+        [data, ...prev.filter((a) => a.address.toLowerCase() !== data.address.toLowerCase())].slice(
+          0,
+          20
+        )
+      );
+      setSelectedEmailDetail(null);
+      setEmailMessages([]);
+      setCountdown(3);
+      showToast(`Generated ${data.address}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : `Could not generate @${emailDomain} email`;
+      setEmailError(msg);
+      showToast(msg);
+    } finally {
+      setGeneratingEmail(false);
+    }
+  }, [walletUserId, emailDomain, showToast]);
 
   const handleOpenEmailDetail = useCallback(
     async (id: string) => {
@@ -1161,6 +1245,19 @@ export default function App() {
   useEffect(() => {
     void loadServices();
     void loadLowestDeals();
+    void (async () => {
+      try {
+        const res = await fetch('/api/email/domains');
+        if (!res.ok) return;
+        const data = await parseJsonResponse<{ domain?: string }>(res);
+        if (data.domain && typeof data.domain === 'string') {
+          const clean = data.domain.trim().toLowerCase().replace(/^@+/, '');
+          if (clean) setEmailDomain(clean);
+        }
+      } catch {
+        // Keep default configured domain
+      }
+    })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -1188,6 +1285,7 @@ export default function App() {
       if (activeEmail?.address.toLowerCase() === lower) {
         const nextActive = remaining[0] || null;
         lastFetchedAddressRef.current = null;
+        knownEmailMsgIdsRef.current = new Set();
         setActiveEmail(nextActive);
         setSelectedEmailDetail(null);
         setEmailMessages([]);
@@ -1199,7 +1297,7 @@ export default function App() {
     [savedEmails, activeEmail, showToast]
   );
 
-  // Sync user's saved @veribox.name.ng mailboxes when signed in
+  // Sync user's saved mailboxes when signed in
   useEffect(() => {
     if (!authUser) return;
     let active = true;
@@ -1211,7 +1309,7 @@ export default function App() {
         if (!res.ok || !active) return;
         const data = await parseJsonResponse<{ accounts?: TempEmailAccount[] }>(res);
         if (!active || !Array.isArray(data.accounts) || data.accounts.length === 0) return;
-        const serverList = data.accounts.filter(isCustomDomainMailbox);
+        const serverList = data.accounts.filter((a) => isCustomDomainMailbox(a, emailDomain));
         if (serverList.length === 0) return;
         setSavedEmails((prev) => {
           const map = new Map<string, TempEmailAccount>();
@@ -1233,25 +1331,63 @@ export default function App() {
     return () => {
       active = false;
     };
-  }, [authUser]);
+  }, [authUser, emailDomain]);
 
-  // Only auto-fetch inbox when the active email address changes (prevents duplicate fetches)
+  // Fetch inbox immediately when active email changes
   useEffect(() => {
-    if (activeEmail && lastFetchedAddressRef.current !== activeEmail.address) {
-      lastFetchedAddressRef.current = activeEmail.address;
-      void refreshEmailInbox(activeEmail);
+    if (activeEmail && lastFetchedAddressRef.current !== activeEmail.address.toLowerCase()) {
+      knownEmailMsgIdsRef.current = new Set();
+      void refreshEmailInbox(activeEmail, false);
     }
   }, [activeEmail, refreshEmailInbox]);
 
+  // Real-time SSE stream for instant incoming emails on active mailbox
   useEffect(() => {
-    if (!autoRefresh) return;
+    if (!autoRefresh || activeTab !== 'home' || !activeEmail) {
+      setEmailStreamConnected(false);
+      return;
+    }
+
+    const params = new URLSearchParams({
+      address: activeEmail.address,
+      token: activeEmail.token,
+    });
+    const es = new EventSource(`/api/email/stream?${params.toString()}`);
+    es.onopen = () => setEmailStreamConnected(true);
+    es.onmessage = (event) => {
+      try {
+        const payload = JSON.parse(event.data) as {
+          type?: string;
+          messages?: EmailMessageSummary[];
+        };
+        if (Array.isArray(payload.messages)) {
+          applyInboxSnapshot(
+            activeEmail.address,
+            payload.messages,
+            payload.type === 'new_email'
+          );
+        }
+      } catch {
+        // Ignore malformed SSE event
+      }
+    };
+    es.onerror = () => setEmailStreamConnected(false);
+
+    return () => {
+      es.close();
+      setEmailStreamConnected(false);
+    };
+  }, [autoRefresh, activeTab, activeEmail?.address, activeEmail?.token, applyInboxSnapshot]);
+
+  // Fast 3-second silent polling fallback (guarantees immediate updates across serverless lambdas too)
+  useEffect(() => {
+    if (!autoRefresh || activeTab !== 'home' || !activeEmail) return;
+    setCountdown(3);
     const timer = window.setInterval(() => {
       setCountdown((prev) => {
         if (prev <= 1) {
-          if (activeTab === 'home' && activeEmail) {
-            void refreshEmailInbox(activeEmail);
-          }
-          return 15;
+          void refreshEmailInbox(activeEmail, true);
+          return 3;
         }
         return prev - 1;
       });
@@ -1367,17 +1503,25 @@ export default function App() {
       <main className="mx-auto w-full max-w-7xl px-3 pb-24 pt-3 sm:px-6 sm:pt-5">
         {activeTab === 'home' && (
           <HomeEmailTab
+            emailDomain={emailDomain}
             activeEmail={activeEmail}
             savedEmails={savedEmails}
             messages={emailMessages}
             selectedMessage={selectedEmailDetail}
             loadingMessages={loadingEmailMessages}
             loadingDetail={loadingEmailDetail}
+            generatingEmail={generatingEmail}
+            emailStreamConnected={emailStreamConnected}
             emailError={emailError}
             countdown={countdown}
             autoRefresh={autoRefresh}
+            onGenerateEmail={() =>
+              requireAuth(`Sign in to generate a live @${emailDomain} email`, () => {
+                void handleGenerateCustomEmail();
+              })
+            }
             onGoToCreate={() =>
-              requireAuth(`Sign in to create an @${CUSTOM_EMAIL_DOMAIN} email`, () =>
+              requireAuth(`Sign in to create an @${emailDomain} email`, () =>
                 setActiveTab('create')
               )
             }
@@ -1396,8 +1540,8 @@ export default function App() {
             }
             onRefreshInbox={() =>
               requireAuth('Sign in to check your email inbox', () => {
-                setCountdown(15);
-                void refreshEmailInbox();
+                setCountdown(3);
+                void refreshEmailInbox(activeEmail, false);
               })
             }
             onOpenMessage={(id) =>
@@ -1417,6 +1561,7 @@ export default function App() {
 
         {activeTab === 'create' && (
           <CreateEmailTab
+            emailDomain={emailDomain}
             isAuthenticated={isAuthenticated}
             onRequireAuth={(reason) =>
               openAuthModal(reason || 'Sign in to create an email', () => setActiveTab('create'))

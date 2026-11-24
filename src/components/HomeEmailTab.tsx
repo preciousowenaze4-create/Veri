@@ -5,24 +5,31 @@ import {
   ChevronDown,
   Copy,
   Inbox,
+  KeyRound,
+  Loader2,
   MailPlus,
   Phone,
   RefreshCw,
+  Sparkles,
   Trash2,
 } from 'lucide-react';
 import type { EmailMessageDetail, EmailMessageSummary, TempEmailAccount } from '../types';
 import { formatRelativeTime } from '../utils/clipboard';
 
 interface HomeEmailTabProps {
+  emailDomain?: string;
   activeEmail: TempEmailAccount | null;
   savedEmails: TempEmailAccount[];
   messages: EmailMessageSummary[];
   selectedMessage: EmailMessageDetail | null;
   loadingMessages: boolean;
   loadingDetail: boolean;
+  generatingEmail?: boolean;
+  emailStreamConnected?: boolean;
   emailError: string | null;
   countdown: number;
   autoRefresh: boolean;
+  onGenerateEmail: () => void;
   onGoToCreate: () => void;
   onGoToNumbers: () => void;
   onSelectAccount: (account: TempEmailAccount) => void;
@@ -38,22 +45,26 @@ interface HomeEmailTabProps {
   ) => void;
 }
 
-function providerName(mode?: string): string {
+function providerName(domain: string, mode?: string): string {
   const modeTag =
     mode === 'business' ? ' · Business' : mode === 'privacy' ? ' · Privacy' : ' · Personal';
-  return `VeriBox Mail · @veribox.name.ng${modeTag}`;
+  return `VeriBox Mail · @${domain}${modeTag}`;
 }
 
 export function HomeEmailTab({
+  emailDomain = 'veribox.name.ng',
   activeEmail,
   savedEmails,
   messages,
   selectedMessage,
   loadingMessages,
   loadingDetail,
+  generatingEmail = false,
+  emailStreamConnected = false,
   emailError,
   countdown,
   autoRefresh,
+  onGenerateEmail,
   onGoToCreate,
   onGoToNumbers,
   onSelectAccount,
@@ -67,6 +78,7 @@ export function HomeEmailTab({
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [switcherOpen, setSwitcherOpen] = useState(false);
   const [confirmDeleteAddress, setConfirmDeleteAddress] = useState<string | null>(null);
+  const [showPasswordChip, setShowPasswordChip] = useState(false);
 
   const handleCopy = (key: string, value: string, label: string, otpSource?: string) => {
     onCopyText(value, label, otpSource ? { source: otpSource, channel: 'Email' } : undefined);
@@ -76,19 +88,19 @@ export function HomeEmailTab({
 
   return (
     <div className="space-y-4">
-      {/* Top Card: Your Active Email + Switch Created Emails */}
+      {/* Top Card: Your Active Email + Generate / Create + Switch Created Emails */}
       <section className="rounded-2xl border border-[#D4AF37]/30 bg-white p-4 sm:p-5 dark:bg-[#14120D]">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
             <p className="text-xs font-bold text-[#8A6208] dark:text-[#D4AF37]">
-              Home · @veribox.name.ng Mail
+              Home · @{emailDomain} Mail
             </p>
             <h1 className="mt-0.5 font-display text-base sm:text-lg font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
               Receive Codes &amp; Emails Here
             </h1>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
               onClick={onGoToNumbers}
@@ -99,8 +111,21 @@ export function HomeEmailTab({
             </button>
             <button
               type="button"
+              onClick={onGenerateEmail}
+              disabled={generatingEmail}
+              className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl bg-[#D4AF37] px-3.5 py-1.5 text-xs font-extrabold text-[#0A0906] hover:bg-[#E5C150] whitespace-nowrap disabled:opacity-60 cursor-pointer shadow-sm"
+            >
+              {generatingEmail ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Sparkles className="h-3.5 w-3.5" />
+              )}
+              <span>{generatingEmail ? 'Generating...' : 'Generate Email'}</span>
+            </button>
+            <button
+              type="button"
               onClick={onGoToCreate}
-              className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl bg-[#D4AF37] px-3.5 py-1.5 text-xs font-bold text-[#0A0906] hover:bg-[#E5C150] whitespace-nowrap cursor-pointer"
+              className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl border border-[#D4AF37]/50 bg-[#D4AF37]/15 px-3 py-1.5 text-xs font-bold text-[#8A6208] hover:bg-[#D4AF37]/25 whitespace-nowrap cursor-pointer dark:text-[#F5D77A]"
             >
               <MailPlus className="h-3.5 w-3.5" />
               <span>Create Email</span>
@@ -108,17 +133,41 @@ export function HomeEmailTab({
           </div>
         </div>
 
-        {activeEmail ? (
+        {generatingEmail ? (
+          <div className="mt-3.5 flex items-center gap-3 rounded-xl border border-[#D4AF37]/35 bg-[#FAF7F0] p-4 dark:bg-[#0B0A07]">
+            <Loader2 className="h-5 w-5 shrink-0 animate-spin text-[#D4AF37]" />
+            <div>
+              <p className="text-sm font-bold text-[#1A160D] dark:text-[#FAF6EC]">
+                Creating your @{emailDomain} mailbox...
+              </p>
+              <p className="mt-0.5 text-xs text-[#6E6552] dark:text-[#A89F8C]">
+                Generating unique address and connecting live inbox
+              </p>
+            </div>
+          </div>
+        ) : activeEmail ? (
           <div className="mt-3.5 rounded-xl border border-[#D4AF37]/25 bg-[#FAF7F0] p-3.5 dark:bg-[#0B0A07]">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="min-w-0 flex-1">
                 <p className="truncate font-mono text-sm sm:text-base font-bold text-[#1A160D] dark:text-[#F5D77A]">
                   {activeEmail.address}
                 </p>
-                <p className="mt-1 text-xs text-[#6E6552] dark:text-[#A89F8C]">
-                  {providerName(activeEmail.accountMode)} · Created{' '}
-                  {formatRelativeTime(activeEmail.createdAt)}
-                </p>
+                <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-[#6E6552] dark:text-[#A89F8C]">
+                  <span>
+                    {providerName(activeEmail.domain || emailDomain, activeEmail.accountMode)} · Created{' '}
+                    {formatRelativeTime(activeEmail.createdAt)}
+                  </span>
+                  {activeEmail.password && (
+                    <button
+                      type="button"
+                      onClick={() => setShowPasswordChip((prev) => !prev)}
+                      className="inline-flex items-center gap-1 rounded-md border border-[#D4AF37]/25 px-1.5 py-0.5 text-[10px] font-bold text-[#8A6208] hover:bg-[#D4AF37]/10 cursor-pointer dark:text-[#F5D77A]"
+                    >
+                      <KeyRound className="h-2.5 w-2.5" />
+                      <span>{showPasswordChip ? activeEmail.password : 'Recovery Key'}</span>
+                    </button>
+                  )}
+                </div>
               </div>
 
               <div className="flex items-center gap-2 shrink-0">
@@ -198,7 +247,7 @@ export function HomeEmailTab({
                   onClick={() => setSwitcherOpen((prev) => !prev)}
                   className="flex w-full items-center justify-between text-xs font-bold text-[#8A6208] dark:text-[#F5D77A]"
                 >
-                  <span>Switch or Manage @veribox.name.ng Emails ({savedEmails.length})</span>
+                  <span>Switch or Manage @{emailDomain} Emails ({savedEmails.length})</span>
                   <ChevronDown
                     className={`h-4 w-4 transition-transform ${switcherOpen ? 'rotate-180' : ''}`}
                   />
@@ -253,10 +302,29 @@ export function HomeEmailTab({
             )}
           </div>
         ) : (
-          <div className="mt-3.5 rounded-xl border border-dashed border-[#D4AF37]/30 p-4 text-center">
+          <div className="mt-3.5 rounded-xl border border-dashed border-[#D4AF37]/30 p-4 text-center space-y-3">
             <p className="text-sm text-[#6E6552] dark:text-[#A89F8C]">
-              No @veribox.name.ng email active yet. Tap <strong>Create Email</strong> above to claim a custom address or sign into an existing one.
+              Generate an instant <strong>@{emailDomain}</strong> address or create a custom username &amp; password mailbox.
             </p>
+            <div className="flex flex-wrap items-center justify-center gap-2">
+              <button
+                type="button"
+                onClick={onGenerateEmail}
+                disabled={generatingEmail}
+                className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl bg-[#D4AF37] px-4 py-1.5 text-xs font-extrabold text-[#0A0906] hover:bg-[#E5C150] cursor-pointer"
+              >
+                <Sparkles className="h-3.5 w-3.5" />
+                <span>Generate Email</span>
+              </button>
+              <button
+                type="button"
+                onClick={onGoToCreate}
+                className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl border border-[#D4AF37]/45 px-4 py-1.5 text-xs font-bold text-[#8A6208] hover:bg-[#D4AF37]/10 cursor-pointer dark:text-[#F5D77A]"
+              >
+                <MailPlus className="h-3.5 w-3.5" />
+                <span>Custom Username</span>
+              </button>
+            </div>
           </div>
         )}
       </section>
@@ -359,15 +427,23 @@ export function HomeEmailTab({
           <div>
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#D4AF37]/15 pb-3.5">
               <div>
-                <h2 className="font-display text-base sm:text-lg font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
-                  Email & Code Inbox
-                </h2>
+                <div className="flex items-center gap-2">
+                  <h2 className="font-display text-base sm:text-lg font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
+                    Email &amp; Code Inbox
+                  </h2>
+                  {activeEmail && autoRefresh && (
+                    <span className="inline-flex items-center gap-1 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-bold text-emerald-700 dark:text-emerald-300">
+                      <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                      <span>{emailStreamConnected ? 'Live' : 'Auto'}</span>
+                    </span>
+                  )}
+                </div>
                 <p className="mt-0.5 text-xs text-[#6E6552] tabular-nums dark:text-[#A89F8C]">
                   {activeEmail
                     ? autoRefresh
-                      ? `Checking automatically in ${countdown}s · Tap code to copy`
+                      ? `Live sync active · Checking every ${countdown}s · Tap code to copy`
                       : 'Tap Check Mail to pull new codes'
-                    : 'Create an email to receive verification codes'}
+                    : `Generate or create an @${emailDomain} email to receive verification codes`}
                 </p>
               </div>
 

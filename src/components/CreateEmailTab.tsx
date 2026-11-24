@@ -28,6 +28,7 @@ import {
 const CREATE_EMAIL_FEE_NGN = 50;
 
 interface CreateEmailTabProps {
+  emailDomain?: string;
   isAuthenticated?: boolean;
   onRequireAuth?: (reason?: string) => void;
   walletBalance?: number;
@@ -75,6 +76,7 @@ function modeLabel(mode: AccountMode): string {
 }
 
 export function CreateEmailTab({
+  emailDomain = CUSTOM_EMAIL_DOMAIN,
   isAuthenticated = true,
   onRequireAuth,
   walletBalance = 0,
@@ -88,6 +90,10 @@ export function CreateEmailTab({
   onCancel,
   onShowToast,
 }: CreateEmailTabProps) {
+  const activeDomain =
+    (emailDomain || CUSTOM_EMAIL_DOMAIN).trim().toLowerCase().replace(/^@+/, '') ||
+    CUSTOM_EMAIL_DOMAIN;
+
   // Navigation State
   const [inBrowser, setInBrowser] = useState(false);
   const [screen, setScreen] = useState<BrowserScreen>('signin');
@@ -291,22 +297,22 @@ export function CreateEmailTab({
       const norm = normalizeCustomUsername(query);
       if (!norm || norm.length < 3) {
         setError(
-          `Enter your @${CUSTOM_EMAIL_DOMAIN} email (e.g. name@${CUSTOM_EMAIL_DOMAIN}) to sign in, or choose an option under Create account below.`
+          `Enter your @${activeDomain} email (e.g. name@${activeDomain}) to sign in, or choose an option under Create account below.`
         );
         return;
       }
-      query = `${norm}@${CUSTOM_EMAIL_DOMAIN}`;
+      query = `${norm}@${activeDomain}`;
     } else {
       const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
       if (!emailPattern.test(query)) {
         setError(
-          `Enter a valid @${CUSTOM_EMAIL_DOMAIN} email address to sign in, or choose an option under Create account below.`
+          `Enter a valid @${activeDomain} email address to sign in, or choose an option under Create account below.`
         );
         return;
       }
-      if (!query.endsWith(`@${CUSTOM_EMAIL_DOMAIN}`)) {
+      if (!query.endsWith(`@${activeDomain}`)) {
         setError(
-          `Only @${CUSTOM_EMAIL_DOMAIN} mailboxes are supported here. Enter your @${CUSTOM_EMAIL_DOMAIN} address or create a new one below.`
+          `Only @${activeDomain} mailboxes are supported here. Enter your @${activeDomain} address or create a new one below.`
         );
         return;
       }
@@ -314,7 +320,7 @@ export function CreateEmailTab({
 
     setIsBrowserLoading(true);
     setBrowserProgress(45);
-    setLoadingMessage(`Checking ${CUSTOM_EMAIL_DOMAIN} directory...`);
+    setLoadingMessage(`Checking ${activeDomain} directory...`);
 
     try {
       const localMatch =
@@ -433,7 +439,7 @@ export function CreateEmailTab({
             password: enteredPass,
             token: data.token,
             provider: 'veribox',
-            domain: data.domain || localMatch?.domain || CUSTOM_EMAIL_DOMAIN,
+            domain: data.domain || localMatch?.domain || activeDomain,
             createdAt: data.createdAt || localMatch?.createdAt || new Date().toISOString(),
             accountMode: data.accountMode || localMatch?.accountMode,
             displayName: data.displayName || localMatch?.displayName,
@@ -524,7 +530,7 @@ export function CreateEmailTab({
       setBrowserProgress(100);
       setScreen('choose');
     } catch {
-      const fallbackOptions = generateCustomDomainSuggestions(cleanFirst, cleanSecond);
+      const fallbackOptions = generateCustomDomainSuggestions(cleanFirst, cleanSecond, activeDomain);
       setOptions(fallbackOptions);
       setSelectedOption(fallbackOptions[0]);
       setCustomUsername('');
@@ -562,7 +568,7 @@ export function CreateEmailTab({
         error?: string;
       }>(res);
 
-      const resolvedAddr = data.address || `${norm}@${CUSTOM_EMAIL_DOMAIN}`;
+      const resolvedAddr = data.address || `${norm}@${activeDomain}`;
       if (!res.ok || !data.available) {
         const msg = data.error || `${resolvedAddr} is already taken.`;
         setCustomStatus({ available: false, address: resolvedAddr, message: msg });
@@ -574,9 +580,9 @@ export function CreateEmailTab({
         id: 'custom',
         address: resolvedAddr,
         username: data.username || norm,
-        domain: CUSTOM_EMAIL_DOMAIN,
+        domain: activeDomain,
         provider: 'veribox',
-        providerLabel: `@${CUSTOM_EMAIL_DOMAIN}`,
+        providerLabel: `@${activeDomain}`,
       };
       setSelectedOption(customOpt);
       setCustomStatus({
@@ -586,14 +592,14 @@ export function CreateEmailTab({
       });
       return customOpt;
     } catch {
-      const fallbackAddr = `${norm}@${CUSTOM_EMAIL_DOMAIN}`;
+      const fallbackAddr = `${norm}@${activeDomain}`;
       const customOpt: EmailSuggestionOption = {
         id: 'custom',
         address: fallbackAddr,
         username: norm,
-        domain: CUSTOM_EMAIL_DOMAIN,
+        domain: activeDomain,
         provider: 'veribox',
-        providerLabel: `@${CUSTOM_EMAIL_DOMAIN}`,
+        providerLabel: `@${activeDomain}`,
       };
       setSelectedOption(customOpt);
       setCustomStatus({
@@ -619,7 +625,7 @@ export function CreateEmailTab({
     }
 
     if (!targetOption) {
-      setError(`Please select or enter a @${CUSTOM_EMAIL_DOMAIN} address`);
+      setError(`Please select or enter a @${activeDomain} address`);
       return;
     }
 
@@ -671,7 +677,7 @@ export function CreateEmailTab({
         const serverBal = typeof data.balance === 'number' ? data.balance : effectiveBalance;
         setLiveServerBalance(serverBal);
         onWalletBalanceChange?.(serverBal);
-        const msg = `Insufficient wallet balance (₦${serverBal.toLocaleString()}). You need ₦${CREATE_EMAIL_FEE_NGN} to create a @${CUSTOM_EMAIL_DOMAIN} email.`;
+        const msg = `Insufficient wallet balance (₦${serverBal.toLocaleString()}). You need ₦${CREATE_EMAIL_FEE_NGN} to create a @${activeDomain} email.`;
         setError(msg);
         onShowToast(msg);
         onOpenDeposit?.();
@@ -690,7 +696,7 @@ export function CreateEmailTab({
       onWalletBalanceChange?.(nextBal);
       paidSessionRefCurrent.current = chargeRef;
       setPaidSessionRef(chargeRef);
-      onShowToast(`₦${CREATE_EMAIL_FEE_NGN} deducted for @${CUSTOM_EMAIL_DOMAIN} email`);
+      onShowToast(`₦${CREATE_EMAIL_FEE_NGN} deducted for @${activeDomain} email`);
       navigateBrowserTo('password', 320);
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Unable to verify wallet balance';
@@ -732,7 +738,7 @@ export function CreateEmailTab({
         body: JSON.stringify({
           provider: 'veribox',
           username: selectedOption.username,
-          domain: CUSTOM_EMAIL_DOMAIN,
+          domain: activeDomain,
           address: selectedOption.address,
           password: finalPassword,
           displayName: fullName || undefined,
@@ -744,7 +750,7 @@ export function CreateEmailTab({
 
       const parsed = await parseJsonResponse<TempEmailAccount & { error?: string }>(res);
       if (!res.ok || !parsed.address) {
-        throw new Error(parsed.error || `Could not activate @${CUSTOM_EMAIL_DOMAIN} mailbox.`);
+        throw new Error(parsed.error || `Could not activate @${activeDomain} mailbox.`);
       }
 
       setBrowserProgress(100);
@@ -757,7 +763,7 @@ export function CreateEmailTab({
         password: parsed.password || finalPassword,
         token: parsed.token,
         provider: 'veribox',
-        domain: parsed.domain || CUSTOM_EMAIL_DOMAIN,
+        domain: parsed.domain || activeDomain,
         createdAt: parsed.createdAt || new Date().toISOString(),
         accountMode,
         displayName: parsed.displayName || fullName || undefined,
@@ -767,7 +773,7 @@ export function CreateEmailTab({
       onComplete(newAccount);
     } catch (err) {
       await refundHeldCreateFee('Activation failed · ₦50 refunded to your wallet');
-      setError(err instanceof Error ? err.message : `Could not finalize @${CUSTOM_EMAIL_DOMAIN} account`);
+      setError(err instanceof Error ? err.message : `Could not finalize @${activeDomain} account`);
       setCreatingFinal(false);
       setIsBrowserLoading(false);
     }
@@ -778,18 +784,18 @@ export function CreateEmailTab({
   // Browser Address Bar Label based on current screen
   const browserUrl =
     screen === 'signin'
-      ? `https://mail.${CUSTOM_EMAIL_DOMAIN}/v3/signin/identifier`
+      ? `https://mail.${activeDomain}/v3/signin/identifier`
       : screen === 'signin-password'
-        ? `https://mail.${CUSTOM_EMAIL_DOMAIN}/v3/signin/challenge/pwd`
+        ? `https://mail.${activeDomain}/v3/signin/challenge/pwd`
         : screen === 'name'
-          ? `https://mail.${CUSTOM_EMAIL_DOMAIN}/v3/signup/name`
+          ? `https://mail.${activeDomain}/v3/signup/name`
           : screen === 'birthdate'
-            ? `https://mail.${CUSTOM_EMAIL_DOMAIN}/v3/signup/basicinfo`
+            ? `https://mail.${activeDomain}/v3/signup/basicinfo`
             : screen === 'choose'
-              ? `https://mail.${CUSTOM_EMAIL_DOMAIN}/v3/signup/webaddress`
+              ? `https://mail.${activeDomain}/v3/signup/webaddress`
               : screen === 'password'
-                ? `https://mail.${CUSTOM_EMAIL_DOMAIN}/v3/signup/passwd`
-                : `https://mail.${CUSTOM_EMAIL_DOMAIN}/v3/signup/privacyterms`;
+                ? `https://mail.${activeDomain}/v3/signup/passwd`
+                : `https://mail.${activeDomain}/v3/signup/privacyterms`;
 
   // 1. INITIAL TRIGGER CARD
   if (!inBrowser) {
@@ -811,7 +817,7 @@ export function CreateEmailTab({
                   VeriBox Mail
                 </h1>
                 <p className="text-xs text-[#6E6552] dark:text-[#A89F8C]">
-                  Custom @{CUSTOM_EMAIL_DOMAIN} Email Hosting
+                  Custom @{activeDomain} Email Hosting
                 </p>
               </div>
             </div>
@@ -827,10 +833,10 @@ export function CreateEmailTab({
 
           <div className="mt-6 text-center">
             <h2 className="font-display text-xl sm:text-2xl font-black tracking-tight text-[#1A160D] dark:text-[#FAF6EC]">
-              Create or Recover @{CUSTOM_EMAIL_DOMAIN}
+              Create or Recover @{activeDomain}
             </h2>
             <p className="mt-1.5 text-xs sm:text-sm text-[#6E6552] dark:text-[#A89F8C]">
-              Claim a custom @{CUSTOM_EMAIL_DOMAIN} address with password protection or sign back into a saved mailbox
+              Claim a custom @{activeDomain} address with password protection or sign back into a saved mailbox
             </p>
           </div>
 
@@ -851,7 +857,7 @@ export function CreateEmailTab({
                 </div>
                 <div className="text-left min-w-0">
                   <p className="font-display text-sm sm:text-base font-extrabold tracking-tight text-[#1A160D] truncate dark:text-[#FAF6EC]">
-                    Continue to @{CUSTOM_EMAIL_DOMAIN}
+                    Continue to @{activeDomain}
                   </p>
                   <p className="text-[11px] text-[#8A7F6A] truncate dark:text-[#A89F8C]">
                     Sign in, recover, or claim new mailbox
@@ -952,7 +958,7 @@ export function CreateEmailTab({
                     VeriBox Mail
                   </p>
                   <p className="text-[10px] text-[#8A7F6A] dark:text-[#A89F8C]">
-                    mail.{CUSTOM_EMAIL_DOMAIN}
+                    mail.{activeDomain}
                   </p>
                 </div>
               </div>
@@ -989,7 +995,7 @@ export function CreateEmailTab({
                     Sign in
                   </h2>
                   <p className="mt-0.5 text-xs text-[#6E6552] dark:text-[#A89F8C]">
-                    to continue to VeriBox Mail (@{CUSTOM_EMAIL_DOMAIN})
+                    to continue to VeriBox Mail (@{activeDomain})
                   </p>
                 </div>
 
@@ -1001,11 +1007,11 @@ export function CreateEmailTab({
                       setUsernameInput(e.target.value);
                       if (error) setError(null);
                     }}
-                    placeholder={`Enter username or name@${CUSTOM_EMAIL_DOMAIN}`}
+                    placeholder={`Enter username or name@${activeDomain}`}
                     className="h-12 w-full rounded-xl border border-[#D4AF37]/35 bg-[#FAF7F0] px-4 font-mono text-sm font-semibold text-[#1A160D] placeholder:text-[#8A7F6A] focus:border-[#D4AF37] focus:outline-none dark:bg-[#0A0906] dark:text-[#FAF6EC]"
                   />
                   <p className="px-1 text-[11px] text-[#8A7F6A] dark:text-[#A89F8C]">
-                    Already created or deleted an @{CUSTOM_EMAIL_DOMAIN} email? Enter it above and tap Next to sign in with your password.
+                    Already created or deleted an @{activeDomain} email? Enter it above and tap Next to sign in with your password.
                   </p>
                 </div>
 
@@ -1353,7 +1359,7 @@ export function CreateEmailTab({
               <div className="mt-6 space-y-4">
                 <div>
                   <h2 className="font-display text-2xl font-black tracking-tight text-[#1A160D] dark:text-[#FAF6EC]">
-                    Choose your @{CUSTOM_EMAIL_DOMAIN} address
+                    Choose your @{activeDomain} address
                   </h2>
                   <p className="mt-0.5 text-xs text-[#6E6552] dark:text-[#A89F8C]">
                     Pick a suggested address or type your own custom username (₦{CREATE_EMAIL_FEE_NGN} fee)
@@ -1453,11 +1459,11 @@ export function CreateEmailTab({
                           if (norm.length >= 3) {
                             setSelectedOption({
                               id: 'custom',
-                              address: `${norm}@${CUSTOM_EMAIL_DOMAIN}`,
+                              address: `${norm}@${activeDomain}`,
                               username: norm,
-                              domain: CUSTOM_EMAIL_DOMAIN,
+                              domain: activeDomain,
                               provider: 'veribox',
-                              providerLabel: `@${CUSTOM_EMAIL_DOMAIN}`,
+                              providerLabel: `@${activeDomain}`,
                             });
                           }
                         }}
@@ -1465,7 +1471,7 @@ export function CreateEmailTab({
                         className="h-10 min-w-0 flex-1 bg-transparent font-mono text-xs font-bold text-[#1A160D] placeholder:text-[#8A7F6A] focus:outline-none dark:text-[#FAF6EC]"
                       />
                       <span className="shrink-0 font-mono text-[11px] font-bold text-[#8A6208] dark:text-[#D4AF37]">
-                        @{CUSTOM_EMAIL_DOMAIN}
+                        @{activeDomain}
                       </span>
                     </div>
                     <button
@@ -1611,11 +1617,11 @@ export function CreateEmailTab({
                 {/* Scrollable Terms & Options Box */}
                 <div className="max-h-48 overflow-y-auto space-y-2 rounded-2xl border border-[#D4AF37]/25 bg-[#FAF7F0]/60 p-3.5 text-xs text-[#3E3522] dark:bg-[#0A0906]/80 dark:text-[#D5CCB8]">
                   <p className="font-bold text-[#1A160D] dark:text-[#FAF6EC]">
-                    Terms of VeriBox Custom Domain Mail (@{CUSTOM_EMAIL_DOMAIN}):
+                    Terms of VeriBox Custom Domain Mail (@{activeDomain}):
                   </p>
                   <p className="leading-relaxed">
-                    By tapping Allow &amp; Confirm, you activate your dedicated @{CUSTOM_EMAIL_DOMAIN} mailbox. Your
-                    inbox receives incoming verification codes and emails routed to {CUSTOM_EMAIL_DOMAIN} in real time.
+                    By tapping Allow &amp; Confirm, you activate your dedicated @{activeDomain} mailbox. Your
+                    inbox receives incoming verification codes and emails routed to {activeDomain} in real time.
                   </p>
 
                   <div className="pt-2 space-y-2">

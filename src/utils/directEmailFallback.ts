@@ -26,8 +26,10 @@ export function normalizeCustomUsername(raw: string): string {
 
 export function generateCustomDomainSuggestions(
   firstName: string,
-  lastName: string
+  lastName: string,
+  domain: string = CUSTOM_EMAIL_DOMAIN
 ): EmailSuggestionOption[] {
+  const cleanDomain = (domain || CUSTOM_EMAIL_DOMAIN).trim().toLowerCase().replace(/^@+/, '') || CUSTOM_EMAIL_DOMAIN;
   const cleanFirst =
     firstName
       .toLowerCase()
@@ -64,10 +66,10 @@ export function generateCustomDomainSuggestions(
 
   return unique.map((username, idx) => ({
     id: `opt-${idx + 1}`,
-    address: `${username}@${CUSTOM_EMAIL_DOMAIN}`,
+    address: `${username}@${cleanDomain}`,
     username,
-    domain: CUSTOM_EMAIL_DOMAIN,
+    domain: cleanDomain,
     provider: 'veribox',
-    providerLabel: `@${CUSTOM_EMAIL_DOMAIN}`,
+    providerLabel: `@${cleanDomain}`,
   }));
 }

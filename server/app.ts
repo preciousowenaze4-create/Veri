@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import crypto from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import vm from 'node:vm';
 import express from 'express';
 import { GoogleGenAI, Type, type GenerateContentResponse } from '@google/genai';
@@ -256,7 +257,15 @@ function decodeHtmlEntities(input: string): string {
 }
 
 function stripTags(html: string): string {
-  return decodeHtmlEntities(html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim());
+  const withoutBlocks = html
+    .replace(/<head[\s\S]*?<\/head>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<(?:br|p|div|li|tr|h[1-6])\b[^>]*>/gi, '\n');
+  return decodeHtmlEntities(withoutBlocks.replace(/<[^>]+>/g, ' '))
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
 export function extractOtpCode(text: string): string | null {
@@ -265,11 +274,11 @@ export function extractOtpCode(text: string): string | null {
   if (prefixed) return prefixed[0].replace(/^[^0-9]+/, '');
 
   const contextual = text.match(
-    /(?:code|otp|pin|verification|verify|passcode|token|confirmation|رمز|código|код)[^\d]{0,24}(\d{4,8})\b/i
+    /(?:code|otp|pin|verification|verify|passcode|token|confirmation|one-time|رمز|código|код)[^\d]{0,28}(\d{4,8})\b/i
   );
   if (contextual) return contextual[1];
 
-  const standalone = text.match(/\b(\d{4,8})\b/);
+  const standalone = text.match(/\b(\d{6})\b/) || text.match(/\b(\d{4,8})\b/);
   if (standalone) return standalone[1];
 
   return null;
@@ -588,15 +597,160 @@ async function fetchSmsMessagesForEntry(
 }
 
 // ==========================================
-// Custom Domain Email Configuration (veribox.name.ng)
+// Custom Domain Email Configuration (process.env.EMAIL_DOMAIN)
 // ==========================================
-const CUSTOM_EMAIL_DOMAIN =
-  (process.env.EMAIL_DOMAIN || 'veribox.name.ng')
+function getCustomEmailDomain(): string {
+  const raw = (process.env.EMAIL_DOMAIN || 'veribox.name.ng')
+    .trim()
+    .replace(/^["']|["']$/g, '')
     .trim()
     .toLowerCase()
-    .replace(/^@+/, '') || 'veribox.name.ng';
+    .replace(/^@+/, '');
+  return raw || 'veribox.name.ng';
+}
+
+function getInboundEmailSecret(): string {
+  const raw = (process.env.INBOUND_EMAIL_SECRET || '')
+    .trim()
+    .replace(/^["']|["']$/g, '')
+    .trim();
+  if (!raw || raw.startsWith('MY_')) return '';
+  return raw;
+}
+
+const CUSTOM_EMAIL_DOMAIN = getCustomEmailDomain();
 
 const RESERVED_EMAIL_USERNAMES = new Set(['postmaster', 'abuse', 'hostmaster', 'mailer-daemon']);
+
+function decodeQuotedPrintable(input: string): string {
+  const softUnwrapped = input.replace(/=\r?\n/g, '');
+  const bytes: number[] = [];
+  for (let i = 0; i < softUnwrapped.length; i++) {
+    const ch = softUnwrapped[i];
+    if (
+      ch === '=' &&
+      i + 2 < softUnwrapped.length &&
+      /^[0-9A-Fa-f]{2}$/.test(softUnwrapped.slice(i + 1, i + 3))
+    ) {
+      bytes.push(parseInt(softUnwrapped.slice(i + 1, i + 3), 16));
+      i += 2;
+    } else {
+      const code = softUnwrapped.charCodeAt(i);
+      if (code <= 0xff) {
+        bytes.push(code);
+      } else {
+        const utf8 = Buffer.from(ch, 'utf8');
+        for (const b of utf8) bytes.push(b);
+      }
+    }
+  }
+  return Buffer.from(bytes).toString('utf8');
+}
+
+function decodeMimeWord(input: string): string {
+  return input.replace(/=\?([^?]+)\?([BQ])\?([^?]*)\?=/gi, (_m, _charset, encoding, data) => {
+    try {
+      if (encoding.toUpperCase() === 'B') {
+        return Buffer.from(data, 'base64').toString('utf8');
+      }
+      return decodeQuotedPrintable(data.replace(/_/g, ' '));
+    } catch {
+      return data;
+    }
+  });
+}
+
+function decodePartTransferEncoding(body: string, encodingHeader: string): string {
+  const enc = encodingHeader.toLowerCase().trim();
+  if (enc === 'base64') {
+    try {
+      return Buffer.from(body.replace(/\s+/g, ''), 'base64').toString('utf8');
+    } catch {
+      return body;
+    }
+  }
+  if (enc === 'quoted-printable') {
+    return decodeQuotedPrintable(body);
+  }
+  return body;
+}
+
+function parseMimeSection(rawSection: string): { textParts: string[]; htmlParts: string[] } {
+  const textParts: string[] = [];
+  const htmlParts: string[] = [];
+
+  const splitMatch = /^([\s\S]*?)\r?\n\r?\n([\s\S]*)$/.exec(rawSection);
+  const headersRaw = splitMatch ? splitMatch[1] : '';
+  const bodyRaw = splitMatch ? splitMatch[2] : rawSection;
+
+  const unfoldedHeaders = headersRaw.replace(/\r?\n[ \t]+/g, ' ');
+  const contentTypeMatch = /^Content-Type:\s*([^\r\n]+)/im.exec(unfoldedHeaders);
+  const encodingMatch = /^Content-Transfer-Encoding:\s*([^\r\n;]+)/im.exec(unfoldedHeaders);
+
+  const contentType = contentTypeMatch ? contentTypeMatch[1].trim() : '';
+  const transferEncoding = encodingMatch ? encodingMatch[1].trim() : '';
+  const boundaryMatch = /boundary=["']?([^"';\s]+)["']?/i.exec(contentType);
+
+  if (boundaryMatch?.[1]) {
+    const boundary = boundaryMatch[1];
+    const marker = `--${boundary}`;
+    const chunks = bodyRaw.split(marker).slice(1);
+    for (const chunk of chunks) {
+      if (chunk.startsWith('--')) break;
+      const trimmed = chunk.replace(/^\r?\n/, '').replace(/\r?\n$/, '');
+      if (!trimmed) continue;
+      const sub = parseMimeSection(trimmed);
+      textParts.push(...sub.textParts);
+      htmlParts.push(...sub.htmlParts);
+    }
+    return { textParts, htmlParts };
+  }
+
+  const decoded = decodePartTransferEncoding(bodyRaw, transferEncoding);
+  if (/text\/html/i.test(contentType)) {
+    htmlParts.push(decoded);
+  } else if (/text\/plain/i.test(contentType) || !contentType) {
+    textParts.push(decoded);
+  }
+  return { textParts, htmlParts };
+}
+
+function parseInboundMimePayload(rawText: string, rawHtml: string): { plainText: string; html: string } {
+  let cleanText = rawText || '';
+  let cleanHtml = rawHtml || '';
+
+  const looksLikeRawMime =
+    /(?:^|\r?\n)Content-Type:\s*(?:multipart|text)\//i.test(cleanText) ||
+    /^(?:--[A-Za-z0-9'()+_,-./:=?]{6,})[\r\n]/.test(cleanText.trimStart());
+
+  if (looksLikeRawMime) {
+    const normalized = cleanText.trimStart();
+    if (/^--[A-Za-z0-9'()+_,-./:=?]{6,}/.test(normalized)) {
+      const firstLine = normalized.split(/\r?\n/, 1)[0];
+      const boundary = firstLine.slice(2).trim();
+      const synthetic = `Content-Type: multipart/mixed; boundary="${boundary}"\r\n\r\n${normalized}`;
+      const parsed = parseMimeSection(synthetic);
+      if (parsed.htmlParts.length > 0) cleanHtml = parsed.htmlParts.join('\n');
+      if (parsed.textParts.length > 0) cleanText = parsed.textParts.join('\n').trim();
+    } else {
+      const parsed = parseMimeSection(cleanText);
+      if (parsed.htmlParts.length > 0) cleanHtml = parsed.htmlParts.join('\n');
+      if (parsed.textParts.length > 0) cleanText = parsed.textParts.join('\n').trim();
+    }
+  }
+
+  if (!cleanText && cleanHtml) {
+    cleanText = stripTags(cleanHtml);
+  } else if (cleanText && /<[a-z][\s\S]*>/i.test(cleanText) && !cleanHtml) {
+    cleanHtml = cleanText;
+    cleanText = stripTags(cleanText);
+  }
+
+  return {
+    plainText: cleanText.trim().slice(0, 40000),
+    html: cleanHtml.trim().slice(0, 120000),
+  };
+}
 
 function normalizeCustomEmailUsername(raw: string): string {
   return raw
@@ -2285,6 +2439,8 @@ export function createApiApp() {
 
   const mailboxRegistry = new Map<string, CustomMailboxRecord>();
   const mailboxMessagesMap = new Map<string, CustomInboxMessageRecord[]>();
+  const emailEvents = new EventEmitter();
+  emailEvents.setMaxListeners(200);
 
   function hashEmailPassword(password: string, salt?: string): { salt: string; hash: string } {
     const useSalt = salt || crypto.randomBytes(16).toString('hex');
@@ -2349,7 +2505,7 @@ export function createApiApp() {
     const sb = getSupabaseServerClient();
     if (sb) {
       try {
-        await sb.from('mailboxes').upsert(
+        const { error } = await sb.from('mailboxes').upsert(
           {
             address: addr,
             id: record.id,
@@ -2366,6 +2522,9 @@ export function createApiApp() {
           },
           { onConflict: 'address' }
         );
+        if (error) {
+          console.warn('[VeriBox Mail] Supabase mailboxes upsert warning:', error.message);
+        }
       } catch {
         // In-memory store remains active
       }
@@ -2425,7 +2584,7 @@ export function createApiApp() {
     const sb = getSupabaseServerClient();
     if (sb) {
       try {
-        await sb.from('mailbox_messages').upsert(
+        const { error } = await sb.from('mailbox_messages').upsert(
           {
             id: msg.id,
             recipient_address: recipient,
@@ -2440,10 +2599,15 @@ export function createApiApp() {
           },
           { onConflict: 'id' }
         );
+        if (error) {
+          console.warn('[VeriBox Mail] Supabase mailbox_messages upsert warning:', error.message);
+        }
       } catch {
         // In-memory store remains active
       }
     }
+
+    emailEvents.emit(`inbound:${recipient}`, msg);
   }
 
   async function listInboxMessages(recipientAddress: string): Promise<CustomInboxMessageRecord[]> {
@@ -2726,6 +2890,19 @@ export function createApiApp() {
     };
   }
 
+  async function generateInstantCustomUsername(): Promise<string> {
+    const prefixes = ['vb', 'mail', 'box', 'user', 'veri', 'inbox'];
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const prefix = prefixes[Math.floor(Math.random() * prefixes.length)];
+      const randPart = crypto.randomBytes(3).toString('hex');
+      const candidate = normalizeCustomEmailUsername(`${prefix}.${randPart}`);
+      if (!isValidCustomEmailUsername(candidate)) continue;
+      const existing = await findMailboxRecord(`${candidate}@${CUSTOM_EMAIL_DOMAIN}`);
+      if (!existing) return candidate;
+    }
+    return `vb${Date.now().toString(36)}${crypto.randomBytes(2).toString('hex')}`;
+  }
+
   app.post('/api/email/create-selected', async (req, res) => {
     try {
       const acct = await createCustomDomainMailbox({
@@ -2745,12 +2922,58 @@ export function createApiApp() {
     }
   });
 
+  app.post('/api/email/generate', async (req, res) => {
+    try {
+      const generatedUsername =
+        typeof req.body?.username === 'string' && req.body.username.trim()
+          ? req.body.username
+          : await generateInstantCustomUsername();
+      const generatedPassword =
+        typeof req.body?.password === 'string' && req.body.password.trim().length >= 6
+          ? req.body.password.trim()
+          : `VB#${crypto.randomBytes(5).toString('hex')}`;
+
+      const acct = await createCustomDomainMailbox({
+        usernameInput: generatedUsername,
+        password: generatedPassword,
+        displayName: typeof req.body?.displayName === 'string' ? req.body.displayName : undefined,
+        accountMode: typeof req.body?.accountMode === 'string' ? req.body.accountMode : 'personal',
+        ownerUserId: typeof req.body?.userId === 'string' ? req.body.userId : undefined,
+      });
+      res.json(acct);
+    } catch (err) {
+      const status = (err as { statusCode?: number }).statusCode || 400;
+      res.status(status).json({
+        error: err instanceof Error ? err.message : `Could not generate @${CUSTOM_EMAIL_DOMAIN} email`,
+      });
+    }
+  });
+
   app.post('/api/email/create', async (req, res) => {
     try {
+      const hasCustomInput =
+        (typeof req.body?.username === 'string' && req.body.username.trim().length > 0) ||
+        (typeof req.body?.address === 'string' && req.body.address.trim().length > 0);
+      const usernameInput = hasCustomInput
+        ? typeof req.body?.username === 'string'
+          ? req.body.username
+          : undefined
+        : await generateInstantCustomUsername();
+      const addressInput =
+        typeof req.body?.address === 'string' && req.body.address.trim()
+          ? req.body.address
+          : undefined;
+      const password =
+        typeof req.body?.password === 'string' && req.body.password.trim().length >= 6
+          ? req.body.password.trim()
+          : !hasCustomInput
+            ? `VB#${crypto.randomBytes(5).toString('hex')}`
+            : undefined;
+
       const acct = await createCustomDomainMailbox({
-        usernameInput: typeof req.body?.username === 'string' ? req.body.username : undefined,
-        addressInput: typeof req.body?.address === 'string' ? req.body.address : undefined,
-        password: typeof req.body?.password === 'string' ? req.body.password : undefined,
+        usernameInput,
+        addressInput,
+        password,
         displayName: typeof req.body?.displayName === 'string' ? req.body.displayName : undefined,
         accountMode: typeof req.body?.accountMode === 'string' ? req.body.accountMode : 'personal',
         ownerUserId: typeof req.body?.userId === 'string' ? req.body.userId : undefined,
@@ -2866,9 +3089,16 @@ export function createApiApp() {
     res.json({ deleted: true, recoverable: true });
   });
 
+  function safeSecretsEqual(provided: string, expected: string): boolean {
+    const a = Buffer.from(provided, 'utf8');
+    const b = Buffer.from(expected, 'utf8');
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+  }
+
   async function handleInboundEmailWebhook(req: express.Request, res: express.Response) {
-    const configuredSecret = (process.env.INBOUND_EMAIL_SECRET || '').trim();
-    if (configuredSecret && !configuredSecret.startsWith('MY_')) {
+    const configuredSecret = getInboundEmailSecret();
+    if (configuredSecret) {
       const provided = String(
         req.params.secret ||
           req.headers['x-inbound-secret'] ||
@@ -2878,7 +3108,8 @@ export function createApiApp() {
           ''
       ).trim();
 
-      if (provided !== configuredSecret) {
+      if (!provided || !safeSecretsEqual(provided, configuredSecret)) {
+        console.warn('[VeriBox Inbound] Rejected request due to invalid or missing x-inbound-secret');
         res.status(401).json({ error: 'Unauthorized inbound email webhook' });
         return;
       }
@@ -2898,46 +3129,78 @@ export function createApiApp() {
       payload.To ??
       body.to;
 
-    const recipients = extractTargetRecipients(rawTo).filter((addr) =>
+    const rawRecipients = extractTargetRecipients(rawTo).filter((addr) =>
       addr.endsWith(`@${CUSTOM_EMAIL_DOMAIN}`)
     );
 
-    if (recipients.length === 0) {
+    if (rawRecipients.length === 0) {
       res.status(400).json({
         error: `No recipient matching @${CUSTOM_EMAIL_DOMAIN} found in payload`,
       });
       return;
     }
 
-    const rawFrom = String(
-      payload.from ||
-        payload.sender ||
-        payload.From ||
-        payload.FromFull ||
-        'sender@external.mail'
+    // Resolve +tag subaddresses (e.g. user+site@veribox.name.ng -> user@veribox.name.ng if base exists)
+    const recipients: string[] = [];
+    const seenRec = new Set<string>();
+    for (const addr of rawRecipients) {
+      let target = addr;
+      const plusIdx = addr.indexOf('+');
+      if (plusIdx > 0) {
+        const exact = await findMailboxRecord(addr);
+        if (!exact) {
+          const base = `${addr.slice(0, plusIdx)}@${CUSTOM_EMAIL_DOMAIN}`;
+          const baseRec = await findMailboxRecord(base);
+          if (baseRec) target = baseRec.address;
+        }
+      }
+      if (!seenRec.has(target)) {
+        seenRec.add(target);
+        recipients.push(target);
+      }
+    }
+
+    const rawFrom = decodeMimeWord(
+      String(
+        payload.from ||
+          payload.sender ||
+          payload.From ||
+          payload.FromFull ||
+          `sender@${CUSTOM_EMAIL_DOMAIN}`
+      )
     );
     const parsedFrom = extractAddressFromHeader(rawFrom);
-    const fromName =
+    const fromName = decodeMimeWord(
       typeof payload.fromName === 'string' && payload.fromName.trim()
         ? payload.fromName.trim()
-        : parsedFrom.name;
-    const subject = String(payload.subject || payload.Subject || '(No subject)').slice(0, 300);
-    const html = String(
+        : parsedFrom.name
+    );
+    const subject = decodeMimeWord(
+      String(payload.subject || payload.Subject || '(No subject)')
+    ).slice(0, 300);
+
+    const rawHtml = String(
       payload.html ||
         payload['body-html'] ||
         payload['stripped-html'] ||
         payload.HtmlBody ||
         ''
-    ).slice(0, 120000);
-    const rawText = String(
+    );
+    let rawText = String(
       payload.text ||
         payload['body-plain'] ||
         payload['stripped-text'] ||
         payload.TextBody ||
         ''
     );
-    const plainText = (rawText || stripTags(html)).slice(0, 40000);
-    const otp = extractOtpCode(`${subject} ${plainText}`);
+    if (!rawText && !rawHtml && typeof payload.raw === 'string' && payload.raw.trim()) {
+      const normalizedRaw = payload.raw.replace(/\r\n/g, '\n');
+      const headerSep = normalizedRaw.indexOf('\n\n');
+      rawText = headerSep !== -1 ? normalizedRaw.slice(headerSep + 2) : normalizedRaw;
+    }
+
+    const { plainText, html } = parseInboundMimePayload(rawText, rawHtml);
+    const otp = extractOtpCode(`${subject}\n${plainText}\n${html ? stripTags(html) : ''}`);
     const createdAt = new Date().toISOString();
 
     const storedIds: string[] = [];
@@ -2963,6 +3226,7 @@ export function createApiApp() {
       domain: CUSTOM_EMAIL_DOMAIN,
       recipients,
       messageIds: storedIds,
+      otpDetected: otp,
     });
   }
 
@@ -2976,8 +3240,13 @@ export function createApiApp() {
 
   async function verifyMailboxRequest(req: express.Request): Promise<string | null> {
     const auth = req.headers.authorization || '';
-    const token = auth.replace(/^Bearer\s+/i, '').trim();
-    const emailAddress = String(req.headers['x-email-address'] || '')
+    const token = (
+      auth.replace(/^Bearer\s+/i, '').trim() ||
+      (typeof req.query.token === 'string' ? req.query.token.trim() : '')
+    );
+    const emailAddress = String(
+      req.headers['x-email-address'] || req.query.address || ''
+    )
       .trim()
       .toLowerCase();
 
@@ -2993,9 +3262,81 @@ export function createApiApp() {
       return reg.address;
     }
 
-    // Require non-empty token when checking an inbox
+    // Require non-empty token when checking an inbox across serverless cold starts
     return token ? emailAddress : null;
   }
+
+  app.get('/api/email/stream', async (req, res) => {
+    const verifiedAddress = await verifyMailboxRequest(req);
+    if (!verifiedAddress) {
+      res.status(401).json({ error: 'Unauthorized mailbox stream' });
+      return;
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+
+    let closed = false;
+    req.on('close', () => {
+      closed = true;
+    });
+
+    const formatRows = (rows: CustomInboxMessageRecord[]) =>
+      rows.map((m) => ({
+        id: m.id,
+        fromName: m.fromName,
+        fromAddress: m.fromAddress,
+        subject: m.subject,
+        intro: m.text.slice(0, 180),
+        seen: m.seen,
+        createdAt: m.createdAt,
+        otp: m.otp,
+      }));
+
+    try {
+      const initial = await listInboxMessages(verifiedAddress);
+      if (!closed) {
+        res.write(`data: ${JSON.stringify({ type: 'snapshot', messages: formatRows(initial) })}\n\n`);
+      }
+    } catch {
+      // Non-blocking initial snapshot
+    }
+
+    const onInbound = (msg: CustomInboxMessageRecord) => {
+      if (closed) return;
+      void (async () => {
+        try {
+          const rows = await listInboxMessages(verifiedAddress);
+          if (!closed) {
+            res.write(
+              `data: ${JSON.stringify({
+                type: 'new_email',
+                messageId: msg.id,
+                otp: msg.otp,
+                messages: formatRows(rows),
+              })}\n\n`
+            );
+          }
+        } catch {
+          // Ignore write errors on closed stream
+        }
+      })();
+    };
+
+    const eventKey = `inbound:${verifiedAddress}`;
+    emailEvents.on(eventKey, onInbound);
+
+    const keepAliveId = setInterval(() => {
+      if (!closed) res.write(': ping\n\n');
+    }, 15000);
+
+    req.on('close', () => {
+      emailEvents.off(eventKey, onInbound);
+      clearInterval(keepAliveId);
+    });
+  });
 
   app.get('/api/email/messages', async (req, res) => {
     const verifiedAddress = await verifyMailboxRequest(req);

@@ -1,7 +1,9 @@
 import { useState } from 'react';
 import {
+  ArrowRight,
   Check,
   Copy,
+  LogOut,
   Mail,
   MailPlus,
   MessageSquareText,
@@ -15,6 +17,10 @@ import { formatRelativeTime } from '../utils/clipboard';
 import { PWAInstallButton } from './PWAInstallButton';
 
 interface ProfileTabProps {
+  isAuthenticated: boolean;
+  userEmail?: string | null;
+  userName?: string | null;
+  avatarUrl?: string | null;
   activeEmail: TempEmailAccount | null;
   savedEmails: TempEmailAccount[];
   savedNumbers: PhoneNumberEntry[];
@@ -30,9 +36,15 @@ interface ProfileTabProps {
   onToggleTheme: () => void;
   onClearHistory: () => void;
   onCopyText: (value: string, label: string) => void;
+  onOpenAuth: () => void;
+  onSignOut: () => void;
 }
 
 export function ProfileTab({
+  isAuthenticated,
+  userEmail,
+  userName,
+  avatarUrl,
   activeEmail,
   savedEmails,
   savedNumbers,
@@ -48,6 +60,8 @@ export function ProfileTab({
   onToggleTheme,
   onClearHistory,
   onCopyText,
+  onOpenAuth,
+  onSignOut,
 }: ProfileTabProps) {
   const [confirmClear, setConfirmClear] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
@@ -64,13 +78,29 @@ export function ProfileTab({
       <section className="rounded-2xl border border-[#D4AF37]/30 bg-white p-5 dark:bg-[#14120D]">
         <div className="flex flex-wrap items-center justify-between gap-4">
           <div className="flex items-center gap-3.5 min-w-0">
-            <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-[#D4AF37] text-[#0A0906]">
-              <User className="h-6 w-6" />
+            <div className="flex h-12 w-12 shrink-0 items-center justify-center overflow-hidden rounded-2xl border border-[#D4AF37]/50 bg-[#D4AF37] text-[#0A0906]">
+              {isAuthenticated && avatarUrl ? (
+                <img
+                  src={avatarUrl}
+                  alt={userName || 'User avatar'}
+                  className="h-full w-full object-cover"
+                  referrerPolicy="no-referrer"
+                />
+              ) : (
+                <User className="h-6 w-6" />
+              )}
             </div>
             <div className="min-w-0">
-              <h1 className="font-display text-xl font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
-                Your Verification Profile
+              <h1 className="font-display text-xl font-extrabold text-[#1A160D] truncate dark:text-[#FAF6EC]">
+                {isAuthenticated
+                  ? userName || userEmail || 'Your Verification Profile'
+                  : 'Guest Preview Profile'}
               </h1>
+              {isAuthenticated && userEmail ? (
+                <p className="font-mono text-xs text-[#8A6208] truncate dark:text-[#F5D77A]">
+                  {userEmail}
+                </p>
+              ) : null}
               <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-[#6E6552] tabular-nums dark:text-[#A89F8C]">
                 <span>{savedEmails.length} emails</span>
                 <span aria-hidden="true">·</span>
@@ -83,14 +113,35 @@ export function ProfileTab({
 
           <div className="flex flex-wrap items-center gap-2.5">
             <PWAInstallButton />
-            <button
-              type="button"
-              onClick={onCreateEmail}
-              className="inline-flex min-h-[40px] items-center gap-2 rounded-xl bg-[#D4AF37] px-4 py-2 text-xs font-bold text-[#0A0906] transition-colors hover:bg-[#E5C150] whitespace-nowrap"
-            >
-              <MailPlus className="h-4 w-4" />
-              <span>Create Email</span>
-            </button>
+            {isAuthenticated ? (
+              <>
+                <button
+                  type="button"
+                  onClick={onCreateEmail}
+                  className="inline-flex min-h-[40px] items-center gap-2 rounded-xl bg-[#D4AF37] px-4 py-2 text-xs font-bold text-[#0A0906] transition-colors hover:bg-[#E5C150] whitespace-nowrap"
+                >
+                  <MailPlus className="h-4 w-4" />
+                  <span>Create Email</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={onSignOut}
+                  className="inline-flex min-h-[40px] items-center gap-1.5 rounded-xl border border-rose-500/35 px-3.5 py-2 text-xs font-bold text-rose-600 transition-colors hover:bg-rose-500/10 whitespace-nowrap dark:text-rose-400"
+                >
+                  <LogOut className="h-3.5 w-3.5" />
+                  <span>Sign Out</span>
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                onClick={onOpenAuth}
+                className="inline-flex min-h-[40px] items-center gap-2 rounded-xl bg-[#D4AF37] px-4 py-2 text-xs font-black text-[#0A0906] transition-colors hover:bg-[#E5C150] whitespace-nowrap cursor-pointer"
+              >
+                <span>Get Started</span>
+                <ArrowRight className="h-4 w-4" />
+              </button>
+            )}
           </div>
         </div>
       </section>

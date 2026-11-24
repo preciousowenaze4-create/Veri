@@ -909,16 +909,23 @@ function getPaystackSecretKey(): string {
   return cleaned;
 }
 
+function normalizeSupabaseUrl(raw?: string): string {
+  const cleaned = (raw || '').trim().replace(/^["']|["']$/g, '').trim();
+  if (!cleaned) return '';
+  try {
+    const parsed = new URL(cleaned);
+    return parsed.origin;
+  } catch {
+    return cleaned.replace(/\/+(rest|auth|storage|functions)\/v\d+\/*$/i, '').replace(/\/+$/, '');
+  }
+}
+
 function getSupabaseServerConfig(): { url: string; key: string } {
-  const url = (
+  const url = normalizeSupabaseUrl(
     process.env.SUPABASE_URL ||
-    process.env.VITE_SUPABASE_URL ||
-    process.env.NEXT_PUBLIC_SUPABASE_URL ||
-    ''
-  )
-    .trim()
-    .replace(/^["']|["']$/g, '')
-    .trim();
+      process.env.VITE_SUPABASE_URL ||
+      process.env.NEXT_PUBLIC_SUPABASE_URL
+  );
   const key = (
     process.env.SUPABASE_SERVICE_ROLE_KEY ||
     process.env.SUPABASE_SECRET_KEY ||
@@ -932,6 +939,24 @@ function getSupabaseServerConfig(): { url: string; key: string } {
     .replace(/^["']|["']$/g, '')
     .trim();
   return { url, key };
+}
+
+function getSupabasePublicConfig(): { url: string; anonKey: string } {
+  const clean = (val?: string) => (val || '').trim().replace(/^["']|["']$/g, '').trim();
+  const url = normalizeSupabaseUrl(
+    process.env.VITE_SUPABASE_URL ||
+      process.env.SUPABASE_URL ||
+      process.env.NEXT_PUBLIC_SUPABASE_URL
+  );
+  const anonKey = clean(
+    process.env.VITE_SUPABASE_ANON_KEY ||
+      process.env.SUPABASE_ANON_KEY ||
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+  );
+  return {
+    url,
+    anonKey: anonKey.length > 10 && !anonKey.startsWith('MY_') ? anonKey : '',
+  };
 }
 
 let cachedSupabaseClient: SupabaseClient | null = null;
@@ -3852,6 +3877,15 @@ export function createApiApp() {
 
     return { balance: null, supabasePersisted: false };
   }
+
+  app.get('/api/auth/public-config', (_req, res) => {
+    const { url, anonKey } = getSupabasePublicConfig();
+    res.json({
+      configured: Boolean(url && anonKey),
+      url: url || null,
+      anonKey: anonKey || null,
+    });
+  });
 
   app.get('/api/wallet/status', (_req, res) => {
     const key = getPaystackSecretKey();

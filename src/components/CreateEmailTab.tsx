@@ -25,6 +25,8 @@ import {
 } from '../utils/directEmailFallback';
 
 interface CreateEmailTabProps {
+  isAuthenticated?: boolean;
+  onRequireAuth?: (reason?: string) => void;
   savedEmails: TempEmailAccount[];
   onComplete: (account: TempEmailAccount) => void;
   onSelectExisting: (account: TempEmailAccount) => void;
@@ -58,6 +60,8 @@ function modeLabel(mode: AccountMode): string {
 }
 
 export function CreateEmailTab({
+  isAuthenticated = true,
+  onRequireAuth,
   savedEmails,
   onComplete,
   onSelectExisting,
@@ -115,6 +119,10 @@ export function CreateEmailTab({
   };
 
   const handleLaunchBrowser = () => {
+    if (!isAuthenticated) {
+      onRequireAuth?.('Sign in to create a private temporary email');
+      return;
+    }
     setInBrowser(true);
     navigateBrowserTo('signin', 300);
   };

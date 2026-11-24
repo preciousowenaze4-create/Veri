@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import type { User as SupabaseUser } from '@supabase/supabase-js';
 import { WifiOff } from 'lucide-react';
+import { AuthModal } from './components/AuthModal';
 import { BottomNav } from './components/BottomNav';
 import { CornerDrawer } from './components/CornerDrawer';
 import { CreateEmailTab } from './components/CreateEmailTab';
@@ -33,7 +35,7 @@ import {
   fetchDirectGuerrillaMessageDetail,
   fetchDirectGuerrillaMessages,
 } from './utils/directEmailFallback';
-import { supabase } from './utils/supabase';
+import { ensureSupabaseClient, getActiveSupabaseClient } from './utils/supabase';
 
 const STORAGE_KEYS = {
   emails: 'veribox_saved_emails_v2',
@@ -112,8 +114,16 @@ export default function App() {
   );
   const [countdown, setCountdown] = useState<number>(15);
 
-  // Naira Wallet Balance state (starts at 0 NGN, synced with Supabase & Paystack webhook)
-  const [walletUserId] = useState<string>(() => getOrCreateWalletUserId());
+  // Supabase Auth & Naira Wallet Balance state (synced with Supabase & Paystack webhook)
+  const [authUser, setAuthUser] = useState<SupabaseUser | null>(null);
+  const [authModalOpen, setAuthModalOpen] = useState<boolean>(false);
+  const [authActionReason, setAuthActionReason] = useState<string | null>(null);
+  const pendingAuthActionRef = useRef<(() => void) | null>(null);
+  const handledManualAuthRef = useRef<boolean>(false);
+
+  const [guestWalletId] = useState<string>(() => getOrCreateWalletUserId());
+  const isAuthenticated = Boolean(authUser);
+  const walletUserId = authUser?.id || guestWalletId;
   const [walletBalance, setWalletBalance] = useState<number>(() =>
     readStorage<number>(STORAGE_KEYS.walletBalance, 0)
   );
@@ -217,6 +227,110 @@ export default function App() {
     }, 2400);
   }, []);
 
+  const openAuthModal = useCallback((reason?: string, pendingAction?: () => void) => {
+    pendingAuthActionRef.current = pendingAction || null;
+    setAuthActionReason(reason || null);
+    setAuthModalOpen(true);
+  }, []);
+
+  const requireAuth = useCallback(
+    (reason: string, action: () => void) => {
+      if (authUser) {
+        action();
+        return;
+      }
+      openAuthModal(reason, action);
+    },
+    [authUser, openAuthModal]
+  );
+
+  const handleSignOut = useCallback(async () => {
+    const client = getActiveSupabaseClient() || (await ensureSupabaseClient());
+    if (client) {
+      await client.auth.signOut().catch(() => undefined);
+    }
+    pendingAuthActionRef.current = null;
+    setAuthUser(null);
+    setWalletBalance(0);
+    setAuthModalOpen(false);
+    setAuthActionReason(null);
+    showToast('Signed out');
+  }, [showToast]);
+
+  // Hydrate Supabase Auth session and listen for Google OAuth / Email Sign-In events
+  useEffect(() => {
+    let active = true;
+    let unsubscribe: (() => void) | null = null;
+
+    const params = new URLSearchParams(window.location.search);
+    const oauthError = params.get('error_description') || params.get('error');
+    if (oauthError) {
+      showToast(oauthError);
+      const clean = new URL(window.location.href);
+      clean.searchParams.delete('error');
+      clean.searchParams.delete('error_description');
+      clean.searchParams.delete('error_code');
+      window.history.replaceState({}, document.title, `${clean.pathname}${clean.search}`);
+    }
+
+    void ensureSupabaseClient().then(async (client) => {
+      if (!active || !client) return;
+
+      try {
+        const { data } = await client.auth.getSession();
+        if (active && data.session?.user) {
+          setAuthUser(data.session.user);
+        }
+      } catch {
+        // Non-blocking
+      }
+
+      const { data: listener } = client.auth.onAuthStateChange((event, session) => {
+        if (!active) return;
+        const nextUser = session?.user ?? null;
+        setAuthUser(nextUser);
+
+        if (nextUser && (event === 'SIGNED_IN' || event === 'USER_UPDATED')) {
+          setAuthModalOpen(false);
+          setAuthActionReason(null);
+
+          const url = new URL(window.location.href);
+          if (url.searchParams.has('code') || url.hash.includes('access_token')) {
+            url.searchParams.delete('code');
+            url.searchParams.delete('state');
+            window.history.replaceState({}, document.title, `${url.pathname}${url.search}`);
+          }
+
+          if (handledManualAuthRef.current) {
+            return;
+          }
+
+          const pending = pendingAuthActionRef.current;
+          pendingAuthActionRef.current = null;
+          if (pending) {
+            pending();
+          } else if (event === 'SIGNED_IN') {
+            const label =
+              (nextUser.user_metadata?.full_name as string | undefined) ||
+              nextUser.email ||
+              'your account';
+            showToast(`Signed in as ${label}`);
+          }
+        } else if (event === 'SIGNED_OUT') {
+          pendingAuthActionRef.current = null;
+          setWalletBalance(0);
+        }
+      });
+
+      unsubscribe = () => listener.subscription.unsubscribe();
+    });
+
+    return () => {
+      active = false;
+      unsubscribe?.();
+    };
+  }, [showToast]);
+
   const syncServerWalletBalance = useCallback(async () => {
     try {
       const res = await fetch(
@@ -279,43 +393,56 @@ export default function App() {
     [walletUserId, showToast]
   );
 
-  // Sync wallet balance from server/Supabase + subscribe to Supabase Realtime updates
+  // Sync wallet balance from server/Supabase + subscribe to Supabase Realtime updates when signed in
   useEffect(() => {
+    if (!authUser) {
+      return;
+    }
+
     void syncServerWalletBalance();
 
-    const sb = supabase;
-    if (!sb) return;
-    const channel = sb
-      .channel(`wallet-sync-${walletUserId}`)
-      .on(
-        'postgres_changes',
-        {
-          event: '*',
-          schema: 'public',
-          table: 'wallets',
-          filter: `user_id=eq.${walletUserId}`,
-        },
-        (payload) => {
-          const nextRow = payload.new as { balance?: number | string } | undefined;
-          if (nextRow && typeof nextRow.balance !== 'undefined') {
-            const numeric = Math.max(0, Number(nextRow.balance) || 0);
-            setWalletBalance((prev) => {
-              if (numeric > prev) {
-                showToast(
-                  `Wallet updated: +₦${(numeric - prev).toLocaleString()} received!`
-                );
-              }
-              return numeric;
-            });
+    let active = true;
+    let cleanupChannel: (() => void) | null = null;
+
+    void ensureSupabaseClient().then((sb) => {
+      if (!active || !sb) return;
+      const channel = sb
+        .channel(`wallet-sync-${walletUserId}`)
+        .on(
+          'postgres_changes',
+          {
+            event: '*',
+            schema: 'public',
+            table: 'wallets',
+            filter: `user_id=eq.${walletUserId}`,
+          },
+          (payload) => {
+            const nextRow = payload.new as { balance?: number | string } | undefined;
+            if (nextRow && typeof nextRow.balance !== 'undefined') {
+              const numeric = Math.max(0, Number(nextRow.balance) || 0);
+              setWalletBalance((prev) => {
+                if (numeric > prev) {
+                  showToast(
+                    `Wallet updated: +₦${(numeric - prev).toLocaleString()} received!`
+                  );
+                }
+                return numeric;
+              });
+            }
           }
-        }
-      )
-      .subscribe();
+        )
+        .subscribe();
+
+      cleanupChannel = () => {
+        void sb.removeChannel(channel);
+      };
+    });
 
     return () => {
-      void sb.removeChannel(channel);
+      active = false;
+      cleanupChannel?.();
     };
-  }, [walletUserId, syncServerWalletBalance, showToast]);
+  }, [authUser, walletUserId, syncServerWalletBalance, showToast]);
 
   // Automatically verify payment redirect / pending Paystack reference on mount & tab focus
   useEffect(() => {
@@ -1014,7 +1141,8 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!activeEmail && savedEmails.length === 0) {
+    if (!authUser) return;
+    if (!activeEmail && savedEmails.length === 0 && !pendingAuthActionRef.current) {
       void (async () => {
         try {
           const res = await fetch('/api/email/create', {
@@ -1043,8 +1171,7 @@ export default function App() {
         }
       })();
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [authUser, activeEmail, savedEmails.length]);
 
   // Only auto-fetch inbox when the active email address changes (prevents duplicate fetches)
   useEffect(() => {
@@ -1075,29 +1202,79 @@ export default function App() {
   return (
     <div className="min-h-dvh w-full bg-[#FAF7F0] text-[#1A160D] dark:bg-[#0A0906] dark:text-[#FAF6EC]">
       <TopBar
+        isAuthenticated={isAuthenticated}
+        userEmail={authUser?.email ?? null}
+        userName={
+          (authUser?.user_metadata?.full_name as string | undefined) ||
+          (authUser?.user_metadata?.name as string | undefined) ||
+          null
+        }
+        avatarUrl={(authUser?.user_metadata?.avatar_url as string | undefined) || null}
         walletBalance={walletBalance}
         onOpenDrawer={() => setDrawerOpen(true)}
-        onOpenDeposit={() => setDepositModalOpen(true)}
+        onOpenDeposit={() =>
+          requireAuth('Sign in to fund your Naira wallet', () => setDepositModalOpen(true))
+        }
+        onOpenProfile={() => setActiveTab('profile')}
+        onOpenAuth={() => openAuthModal()}
       />
 
       <CornerDrawer
         open={drawerOpen}
+        isAuthenticated={isAuthenticated}
+        userEmail={authUser?.email ?? null}
+        userName={
+          (authUser?.user_metadata?.full_name as string | undefined) ||
+          (authUser?.user_metadata?.name as string | undefined) ||
+          null
+        }
         activeTab={activeTab}
         activeEmailAddress={activeEmail?.address ?? null}
         walletBalance={walletBalance}
         isDark={isDark}
         onClose={() => setDrawerOpen(false)}
         onNavigate={(tab) => setActiveTab(tab)}
-        onSelectPlatform={handlePickPlatformFromDrawer}
+        onSelectPlatform={(p) =>
+          requireAuth('Sign in to get a dedicated phone number', () =>
+            handlePickPlatformFromDrawer(p)
+          )
+        }
         onToggleTheme={() => setIsDark((prev) => !prev)}
-        onOpenDeposit={() => setDepositModalOpen(true)}
+        onOpenDeposit={() =>
+          requireAuth('Sign in to fund your Naira wallet', () => setDepositModalOpen(true))
+        }
+        onOpenAuth={() => openAuthModal()}
+        onSignOut={() => void handleSignOut()}
+      />
+
+      <AuthModal
+        open={authModalOpen}
+        actionReason={authActionReason}
+        onClose={() => {
+          pendingAuthActionRef.current = null;
+          setAuthModalOpen(false);
+          setAuthActionReason(null);
+        }}
+        onAuthSuccess={(user, msg) => {
+          handledManualAuthRef.current = true;
+          window.setTimeout(() => {
+            handledManualAuthRef.current = false;
+          }, 1500);
+          setAuthUser(user);
+          setAuthModalOpen(false);
+          setAuthActionReason(null);
+          showToast(msg);
+          const pending = pendingAuthActionRef.current;
+          pendingAuthActionRef.current = null;
+          pending?.();
+        }}
       />
 
       <DepositModal
         open={depositModalOpen}
         walletBalance={walletBalance}
         walletUserId={walletUserId}
-        userEmail={activeEmail?.address ?? null}
+        userEmail={authUser?.email || activeEmail?.address || null}
         onClose={() => setDepositModalOpen(false)}
         onCreditSuccess={(creditedAmount, message, serverBalance) => {
           if (typeof serverBalance === 'number') {
@@ -1137,28 +1314,50 @@ export default function App() {
             emailError={emailError}
             countdown={countdown}
             autoRefresh={autoRefresh}
-            onGoToCreate={() => setActiveTab('create')}
+            onGoToCreate={() =>
+              requireAuth('Sign in to create a custom email address', () => setActiveTab('create'))
+            }
             onGoToNumbers={() => setActiveTab('numbers')}
-            onGenerateEmail={handleGenerateInstantEmail}
+            onGenerateEmail={() =>
+              requireAuth('Sign in to generate a live temporary email', () => {
+                void handleGenerateInstantEmail();
+              })
+            }
             generatingEmail={generatingEmail}
-            onSelectAccount={(acct) => {
-              setActiveEmail(acct);
-              setSelectedEmailDetail(null);
-              showToast(`Switched to ${acct.address}`);
-            }}
-            onRefreshInbox={() => {
-              setCountdown(15);
-              void refreshEmailInbox();
-            }}
-            onOpenMessage={(id) => void handleOpenEmailDetail(id)}
+            onSelectAccount={(acct) =>
+              requireAuth('Sign in to switch email accounts', () => {
+                setActiveEmail(acct);
+                setSelectedEmailDetail(null);
+                showToast(`Switched to ${acct.address}`);
+              })
+            }
+            onRefreshInbox={() =>
+              requireAuth('Sign in to check your email inbox', () => {
+                setCountdown(15);
+                void refreshEmailInbox();
+              })
+            }
+            onOpenMessage={(id) =>
+              requireAuth('Sign in to read inbox messages', () => {
+                void handleOpenEmailDetail(id);
+              })
+            }
             onCloseMessage={() => setSelectedEmailDetail(null)}
-            onDeleteMessage={(id) => void handleDeleteEmailMessage(id)}
+            onDeleteMessage={(id) =>
+              requireAuth('Sign in to manage inbox messages', () => {
+                void handleDeleteEmailMessage(id);
+              })
+            }
             onCopyText={handleCopyText}
           />
         )}
 
         {activeTab === 'create' && (
           <CreateEmailTab
+            isAuthenticated={isAuthenticated}
+            onRequireAuth={(reason) =>
+              openAuthModal(reason || 'Sign in to create an email', () => setActiveTab('create'))
+            }
             savedEmails={savedEmails}
             onComplete={(newAccount) => {
               setActiveEmail(newAccount);
@@ -1202,11 +1401,13 @@ export default function App() {
             numberHistory={numberHistory}
             viewMode={numbersViewMode}
             onChangeViewMode={(mode) => setNumbersViewMode(mode)}
-            onSelectService={(svc) => {
-              setSelectedService(svc);
-              setAcquireError(null);
-              void loadCountriesForService(svc.id, false);
-            }}
+            onSelectService={(svc) =>
+              requireAuth(`Sign in to get a ${svc.name} phone number`, () => {
+                setSelectedService(svc);
+                setAcquireError(null);
+                void loadCountriesForService(svc.id, false);
+              })
+            }
             onSelectCountry={(c) => {
               setSelectedCountry(c);
               setSelectedProviderQuote(pickBestProviderForCountry(c));
@@ -1216,16 +1417,21 @@ export default function App() {
               setSelectedProviderQuote(quote);
               setAcquireError(null);
             }}
-            onSelectLowestDeal={(deal) => {
-              const svcMatch = services.find((s) => s.id === deal.serviceId) || {
-                id: deal.serviceId,
-                name: deal.serviceName,
-                popular: true,
-              };
-              setSelectedService(svcMatch);
-              setAcquireError(null);
-              void loadCountriesForService(deal.serviceId, false, deal.slug, deal.provider);
-            }}
+            onSelectLowestDeal={(deal) =>
+              requireAuth(
+                `Sign in to get a ${deal.serviceName} number (${deal.country})`,
+                () => {
+                  const svcMatch = services.find((s) => s.id === deal.serviceId) || {
+                    id: deal.serviceId,
+                    name: deal.serviceName,
+                    popular: true,
+                  };
+                  setSelectedService(svcMatch);
+                  setAcquireError(null);
+                  void loadCountriesForService(deal.serviceId, false, deal.slug, deal.provider);
+                }
+              )
+            }
             onRefreshLowestDeals={() => void loadLowestDeals(true)}
             onRefreshCountries={() => {
               if (selectedService) {
@@ -1233,7 +1439,11 @@ export default function App() {
               }
             }}
             onChangeQuantity={(qty) => setQuantity(qty)}
-            onAcquireNumbers={() => void handleAcquireNumbers()}
+            onAcquireNumbers={() =>
+              requireAuth('Sign in to acquire dedicated phone numbers', () => {
+                void handleAcquireNumbers();
+              })
+            }
             onSelectOrder={(ord) => setSelectedOrderId(ord.id)}
             onCheckOrder={(id) => void handleCheckOrder(id)}
             onCancelOrder={(id) => void handleCancelOrder(id)}
@@ -1246,6 +1456,10 @@ export default function App() {
 
         {activeTab === 'images' && (
           <ImageGenTab
+            isAuthenticated={isAuthenticated}
+            onRequireAuth={(reason) =>
+              openAuthModal(reason || 'Sign in to generate free AI images')
+            }
             onCopyText={(val, label) => void handleCopyText(val, label)}
             onShowToast={showToast}
           />
@@ -1253,13 +1467,23 @@ export default function App() {
 
         {activeTab === 'profile' && (
           <ProfileTab
+            isAuthenticated={isAuthenticated}
+            userEmail={authUser?.email ?? null}
+            userName={
+              (authUser?.user_metadata?.full_name as string | undefined) ||
+              (authUser?.user_metadata?.name as string | undefined) ||
+              null
+            }
+            avatarUrl={(authUser?.user_metadata?.avatar_url as string | undefined) || null}
             activeEmail={activeEmail}
             savedEmails={savedEmails}
             savedNumbers={savedNumbers}
             otpHistory={otpHistory}
             autoRefresh={autoRefresh}
             isDark={isDark}
-            onCreateEmail={() => setActiveTab('create')}
+            onCreateEmail={() =>
+              requireAuth('Sign in to create an email', () => setActiveTab('create'))
+            }
             onSelectEmail={(acct) => {
               setActiveEmail(acct);
               setSelectedEmailDetail(null);
@@ -1293,6 +1517,8 @@ export default function App() {
               showToast('OTP history cleared');
             }}
             onCopyText={(val, label) => void handleCopyText(val, label)}
+            onOpenAuth={() => openAuthModal()}
+            onSignOut={() => void handleSignOut()}
           />
         )}
       </main>

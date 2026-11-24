@@ -14,6 +14,8 @@ import type { GeneratedImageItem } from '../types';
 import { parseJsonResponse } from '../utils/apiFetch';
 
 interface ImageGenTabProps {
+  isAuthenticated?: boolean;
+  onRequireAuth?: (reason?: string) => void;
   onCopyText: (value: string, label: string) => void;
   onShowToast: (message: string) => void;
 }
@@ -129,7 +131,12 @@ async function generateDirectPollinationsFallback(
   return blobToDataUrl(blob);
 }
 
-export function ImageGenTab({ onCopyText, onShowToast }: ImageGenTabProps) {
+export function ImageGenTab({
+  isAuthenticated = true,
+  onRequireAuth,
+  onCopyText,
+  onShowToast,
+}: ImageGenTabProps) {
   const [prompt, setPrompt] = useState<string>('');
   const [style, setStyle] = useState<string>('photorealistic');
   const [aspectRatio, setAspectRatio] = useState<string>('1:1');
@@ -159,6 +166,10 @@ export function ImageGenTab({ onCopyText, onShowToast }: ImageGenTabProps) {
   };
 
   const handleGenerate = async (overridePrompt?: string) => {
+    if (!isAuthenticated) {
+      onRequireAuth?.('Sign in to generate free AI images');
+      return;
+    }
     const finalPrompt = (overridePrompt ?? prompt).trim();
     if (finalPrompt.length < 3) {
       setError('Please enter a prompt with at least 3 characters.');
@@ -473,7 +484,7 @@ export function ImageGenTab({ onCopyText, onShowToast }: ImageGenTabProps) {
           <div className="flex items-center gap-2.5">
             <button
               type="button"
-              disabled={generating || prompt.trim().length < 3}
+              disabled={generating || (isAuthenticated && prompt.trim().length < 3)}
               onClick={() => void handleGenerate()}
               className="inline-flex min-h-[48px] flex-1 items-center justify-center gap-2 rounded-2xl bg-[#D4AF37] px-5 py-3 text-sm font-extrabold text-[#0A0906] shadow-lg shadow-[#D4AF37]/20 transition-all hover:bg-[#E5C150] active:scale-[0.98] disabled:opacity-60 cursor-pointer"
             >

@@ -1,5 +1,7 @@
 import {
+  ArrowRight,
   Home,
+  LogOut,
   MailPlus,
   Moon,
   Phone,
@@ -14,6 +16,9 @@ import { PWAInstallButton } from './PWAInstallButton';
 
 interface CornerDrawerProps {
   open: boolean;
+  isAuthenticated: boolean;
+  userEmail?: string | null;
+  userName?: string | null;
   activeTab: TabId;
   activeEmailAddress: string | null;
   walletBalance?: number;
@@ -23,10 +28,15 @@ interface CornerDrawerProps {
   onSelectPlatform: (platform: PlatformFilter) => void;
   onToggleTheme: () => void;
   onOpenDeposit?: () => void;
+  onOpenAuth?: () => void;
+  onSignOut?: () => void;
 }
 
 export function CornerDrawer({
   open,
+  isAuthenticated,
+  userEmail,
+  userName,
   activeTab,
   activeEmailAddress,
   walletBalance = 0,
@@ -36,6 +46,8 @@ export function CornerDrawer({
   onSelectPlatform,
   onToggleTheme,
   onOpenDeposit,
+  onOpenAuth,
+  onSignOut,
 }: CornerDrawerProps) {
   if (!open) return null;
 
@@ -80,29 +92,63 @@ export function CornerDrawer({
         </div>
 
         <div className="flex-1 overflow-y-auto px-3 py-4 space-y-5">
-          {/* Wallet Balance & Deposit Quick Card */}
-          <div className="rounded-2xl border border-[#D4AF37]/35 bg-[#FAF7F0] p-3.5 dark:bg-[#0B0A07]">
-            <div className="flex items-center justify-between gap-2">
-              <div>
-                <span className="text-[11px] font-bold text-[#6E6552] dark:text-[#A89F8C]">
-                  Wallet Balance
-                </span>
-                <p className="font-mono text-xl font-black text-[#8A6208] dark:text-[#F5D77A]">
-                  ₦{walletBalance === 0 ? '00' : walletBalance.toLocaleString('en-US')}
-                </p>
+          {/* Wallet Balance or Get Started Auth Card */}
+          {isAuthenticated ? (
+            <div className="rounded-2xl border border-[#D4AF37]/35 bg-[#FAF7F0] p-3.5 space-y-2.5 dark:bg-[#0B0A07]">
+              {(userName || userEmail) && (
+                <div className="border-b border-[#D4AF37]/15 pb-2">
+                  <p className="text-xs font-extrabold text-[#1A160D] truncate dark:text-[#FAF6EC]">
+                    {userName || 'VeriBox Member'}
+                  </p>
+                  {userEmail && (
+                    <p className="font-mono text-[11px] text-[#6E6552] truncate dark:text-[#A89F8C]">
+                      {userEmail}
+                    </p>
+                  )}
+                </div>
+              )}
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <span className="text-[11px] font-bold text-[#6E6552] dark:text-[#A89F8C]">
+                    Wallet Balance
+                  </span>
+                  <p className="font-mono text-xl font-black text-[#8A6208] dark:text-[#F5D77A]">
+                    ₦{walletBalance === 0 ? '00' : walletBalance.toLocaleString('en-US')}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onClose();
+                    onOpenDeposit?.();
+                  }}
+                  className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl bg-[#D4AF37] px-3.5 py-1.5 text-xs font-black text-[#0A0906] hover:bg-[#E5C150] shadow-sm active:scale-95 cursor-pointer"
+                >
+                  <span>Deposit</span>
+                </button>
               </div>
+            </div>
+          ) : (
+            <div className="rounded-2xl border border-[#D4AF37]/35 bg-[#FAF7F0] p-3.5 dark:bg-[#0B0A07]">
+              <p className="text-xs font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
+                Sign in to unlock all features
+              </p>
+              <p className="mt-0.5 text-[11px] text-[#6E6552] dark:text-[#A89F8C]">
+                Create temp emails, get private OTP numbers, and manage your wallet.
+              </p>
               <button
                 type="button"
                 onClick={() => {
                   onClose();
-                  onOpenDeposit?.();
+                  onOpenAuth?.();
                 }}
-                className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl bg-[#D4AF37] px-3.5 py-1.5 text-xs font-black text-[#0A0906] hover:bg-[#E5C150] shadow-sm active:scale-95 cursor-pointer"
+                className="mt-3 inline-flex min-h-[40px] w-full items-center justify-center gap-1.5 rounded-xl bg-[#D4AF37] px-3.5 py-2 text-xs font-black text-[#0A0906] hover:bg-[#E5C150] shadow-sm cursor-pointer"
               >
-                <span>Deposit</span>
+                <span>Get Started</span>
+                <ArrowRight className="h-3.5 w-3.5" />
               </button>
             </div>
-          </div>
+          )}
 
           <div>
             <p className="px-3 pb-2 text-xs font-semibold text-[#6E6552] dark:text-[#A89F8C]">
@@ -213,7 +259,7 @@ export function CornerDrawer({
           </div>
         </div>
 
-        <div className="border-t border-[#D4AF37]/20 p-3">
+        <div className="border-t border-[#D4AF37]/20 p-3 space-y-2">
           <button
             type="button"
             onClick={onToggleTheme}
@@ -222,6 +268,20 @@ export function CornerDrawer({
             <span>{isDark ? 'Warm Ivory Mode' : 'Obsidian Gold Mode'}</span>
             {isDark ? <Sun className="h-4 w-4 text-[#F5D77A]" /> : <Moon className="h-4 w-4 text-[#8A6208]" />}
           </button>
+
+          {isAuthenticated && onSignOut && (
+            <button
+              type="button"
+              onClick={() => {
+                onClose();
+                onSignOut();
+              }}
+              className="flex min-h-[44px] w-full items-center justify-between rounded-xl border border-rose-500/30 px-3.5 py-2 text-sm font-bold text-rose-600 transition-colors hover:bg-rose-500/10 dark:text-rose-400"
+            >
+              <span>Sign Out</span>
+              <LogOut className="h-4 w-4" />
+            </button>
+          )}
         </div>
       </aside>
     </div>

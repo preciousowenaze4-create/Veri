@@ -2491,6 +2491,54 @@ export function createApiApp() {
     }
   });
 
+  interface EmailRegistryRecord {
+    id: string;
+    address: string;
+    provider: 'mailtm' | 'tempmailio' | 'tempmail' | 'guerrilla';
+    token: string;
+    passwordHash: string;
+    salt: string;
+    createdAt: string;
+  }
+
+  const emailRecoveryRegistry = new Map<string, EmailRegistryRecord>();
+
+  function hashEmailPassword(password: string, salt?: string): { salt: string; hash: string } {
+    const useSalt = salt || crypto.randomBytes(16).toString('hex');
+    const derived = crypto.scryptSync(password, useSalt, 32).toString('hex');
+    return { salt: useSalt, hash: derived };
+  }
+
+  function verifyEmailPassword(password: string, record: EmailRegistryRecord): boolean {
+    try {
+      const { hash } = hashEmailPassword(password, record.salt);
+      const a = Buffer.from(hash, 'hex');
+      const b = Buffer.from(record.passwordHash, 'hex');
+      return a.length === b.length && crypto.timingSafeEqual(a, b);
+    } catch {
+      return false;
+    }
+  }
+
+  function registerCreatedEmail(
+    acct: { id: string; address: string; token: string; provider: EmailRegistryRecord['provider']; createdAt: string },
+    rawPassword?: string
+  ) {
+    const cleanAddr = (acct.address || '').trim().toLowerCase();
+    const cleanPass = (rawPassword || '').trim();
+    if (!cleanAddr || cleanPass.length < 4) return;
+    const { salt, hash } = hashEmailPassword(cleanPass);
+    emailRecoveryRegistry.set(cleanAddr, {
+      id: acct.id,
+      address: acct.address,
+      provider: acct.provider,
+      token: acct.token,
+      passwordHash: hash,
+      salt,
+      createdAt: acct.createdAt,
+    });
+  }
+
   app.post('/api/email/create-selected', async (req, res) => {
     const provider = String(req.body?.provider || 'tempmailio').toLowerCase();
     const username = typeof req.body?.username === 'string' ? req.body.username : undefined;
@@ -2503,35 +2551,42 @@ export function createApiApp() {
     try {
       if (provider === 'tempmailio') {
         const acct = await createTempMailIoAccount(username, domain, password);
+        registerCreatedEmail(acct, password);
         res.json(acct);
         return;
       }
 
       if (provider === 'mailtm') {
         const acct = await createMailTmAccount(username, domain, password);
+        registerCreatedEmail(acct, acct.password || password);
         res.json(acct);
         return;
       }
 
       if (provider === 'tempmail' && precreatedToken && address) {
-        res.json({
+        const acct = {
           id: precreatedToken,
           address,
           password: password || '',
           token: precreatedToken,
-          provider: 'tempmail',
+          provider: 'tempmail' as const,
           createdAt: new Date().toISOString(),
-        });
+        };
+        registerCreatedEmail(acct, password);
+        res.json(acct);
         return;
       }
 
       if (provider === 'guerrilla') {
         const acct = await createGuerrillaAccount(username);
-        res.json({ ...acct, password: password || '' });
+        const fullAcct = { ...acct, password: password || '' };
+        registerCreatedEmail(fullAcct, password);
+        res.json(fullAcct);
         return;
       }
 
       const acct = await createTempMailIoAccount(username, domain, password);
+      registerCreatedEmail(acct, password);
       res.json(acct);
     } catch (err) {
       const fallbacks: Array<'mailtm' | 'tempmailio' | 'tempmail' | 'guerrilla'> =
@@ -2550,7 +2605,9 @@ export function createApiApp() {
                 : fb === 'tempmail'
                   ? await createTempMailLolAccount()
                   : await createGuerrillaAccount(username);
-          res.json(fallback);
+          const withPass = { ...fallback, password: fallback.password || password || '' };
+          registerCreatedEmail(withPass, withPass.password);
+          res.json(withPass);
           return;
         } catch {
           // Try next fallback
@@ -2584,21 +2641,25 @@ export function createApiApp() {
       try {
         if (candidate === 'tempmailio') {
           const acct = await createTempMailIoAccount(username, domain, password);
+          registerCreatedEmail(acct, password);
           res.json(acct);
           return;
         }
         if (candidate === 'mailtm') {
           const acct = await createMailTmAccount(username, domain, password);
+          registerCreatedEmail(acct, acct.password || password);
           res.json(acct);
           return;
         }
         if (candidate === 'tempmail') {
           const acct = await createTempMailLolAccount();
+          registerCreatedEmail(acct, password);
           res.json(acct);
           return;
         }
         if (candidate === 'guerrilla') {
           const acct = await createGuerrillaAccount(username);
+          registerCreatedEmail(acct, password);
           res.json(acct);
           return;
         }
@@ -2610,13 +2671,82 @@ export function createApiApp() {
     res.status(502).json({ error: lastError });
   });
 
-  app.post('/api/email/login', async (req, res) => {
+  app.post('/api/email/check-exists', async (req, res) => {
+    const rawAddress = typeof req.body?.address === 'string' ? req.body.address.trim().toLowerCase() : '';
+    if (!rawAddress || !rawAddress.includes('@')) {
+      res.status(400).json({ exists: false, error: 'Enter a valid email address' });
+      return;
+    }
+
+    const reg = emailRecoveryRegistry.get(rawAddress);
+    if (reg) {
+      res.json({ exists: true, provider: reg.provider });
+      return;
+    }
+
+    const domain = rawAddress.split('@')[1] || '';
     try {
-      const { address, password } = req.body || {};
-      if (!address || !password) {
-        res.status(400).json({ error: 'Address and password required' });
+      const mailTmDomains = await getMailTmDomains().catch((): string[] => []);
+      if (domain && mailTmDomains.includes(domain)) {
+        res.json({ exists: true, provider: 'mailtm', verifyViaPassword: true });
         return;
       }
+    } catch {
+      // Non-blocking
+    }
+
+    res.json({ exists: false });
+  });
+
+  app.post('/api/email/login', async (req, res) => {
+    try {
+      const address = typeof req.body?.address === 'string' ? req.body.address.trim() : '';
+      const password = typeof req.body?.password === 'string' ? req.body.password.trim() : '';
+      if (!address || !password) {
+        res.status(400).json({ error: 'Email address and password are required' });
+        return;
+      }
+
+      const reg = emailRecoveryRegistry.get(address.toLowerCase());
+      if (reg) {
+        if (!verifyEmailPassword(password, reg)) {
+          res.status(401).json({ error: 'Incorrect password for this email address' });
+          return;
+        }
+        if (reg.provider === 'mailtm') {
+          try {
+            const tokenRes = await fetch('https://api.mail.tm/token', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+              body: JSON.stringify({ address: reg.address, password }),
+              signal: AbortSignal.timeout(5000),
+            });
+            if (tokenRes.ok) {
+              const tokenJson = (await tokenRes.json()) as { token: string; id: string };
+              reg.token = tokenJson.token;
+              res.json({
+                token: tokenJson.token,
+                id: tokenJson.id,
+                address: reg.address,
+                provider: 'mailtm',
+                createdAt: reg.createdAt,
+              });
+              return;
+            }
+          } catch {
+            // Fall back to cached token below
+          }
+        }
+        res.json({
+          token: reg.token,
+          id: reg.id,
+          address: reg.address,
+          provider: reg.provider,
+          createdAt: reg.createdAt,
+        });
+        return;
+      }
+
       const tokenRes = await fetch('https://api.mail.tm/token', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
@@ -2624,11 +2754,22 @@ export function createApiApp() {
         signal: AbortSignal.timeout(5000),
       });
       if (!tokenRes.ok) {
-        res.status(tokenRes.status).json({ error: 'Session expired for this email' });
+        res.status(tokenRes.status === 401 ? 401 : 404).json({
+          error:
+            tokenRes.status === 401
+              ? 'Incorrect password or email not found on VeriBox'
+              : 'No active VeriBox inbox found for this email and password',
+        });
         return;
       }
       const tokenJson = (await tokenRes.json()) as { token: string; id: string };
-      res.json({ token: tokenJson.token, id: tokenJson.id });
+      res.json({
+        token: tokenJson.token,
+        id: tokenJson.id,
+        address,
+        provider: 'mailtm',
+        createdAt: new Date().toISOString(),
+      });
     } catch (error) {
       res.status(500).json({ error: error instanceof Error ? error.message : 'Login failed' });
     }

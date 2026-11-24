@@ -30,6 +30,7 @@ interface HomeEmailTabProps {
   onGenerateEmail: () => void;
   generatingEmail?: boolean;
   onSelectAccount: (account: TempEmailAccount) => void;
+  onDeleteAccount: (address: string) => void;
   onRefreshInbox: () => void;
   onOpenMessage: (id: string) => void;
   onCloseMessage: () => void;
@@ -65,6 +66,7 @@ export function HomeEmailTab({
   onGenerateEmail,
   generatingEmail = false,
   onSelectAccount,
+  onDeleteAccount,
   onRefreshInbox,
   onOpenMessage,
   onCloseMessage,
@@ -73,6 +75,7 @@ export function HomeEmailTab({
 }: HomeEmailTabProps) {
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [switcherOpen, setSwitcherOpen] = useState(false);
+  const [confirmDeleteAddress, setConfirmDeleteAddress] = useState<string | null>(null);
 
   const handleCopy = (key: string, value: string, label: string, otpSource?: string) => {
     onCopyText(value, label, otpSource ? { source: otpSource, channel: 'Email' } : undefined);
@@ -152,26 +155,75 @@ export function HomeEmailTab({
                 </p>
               </div>
 
-              <button
-                type="button"
-                onClick={() =>
-                  handleCopy('active-email', activeEmail.address, 'Email address copied')
-                }
-                className="inline-flex min-h-[42px] items-center gap-2 rounded-xl bg-[#D4AF37] px-4 py-2 text-xs font-bold text-[#0A0906] hover:bg-[#E5C150] whitespace-nowrap shrink-0"
-              >
-                {copiedKey === 'active-email' ? (
-                  <>
-                    <Check className="h-4 w-4" />
-                    <span>Copied</span>
-                  </>
-                ) : (
-                  <>
-                    <Copy className="h-4 w-4" />
-                    <span>Copy Email</span>
-                  </>
-                )}
-              </button>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() =>
+                    handleCopy('active-email', activeEmail.address, 'Email address copied')
+                  }
+                  className="inline-flex min-h-[42px] items-center gap-2 rounded-xl bg-[#D4AF37] px-4 py-2 text-xs font-bold text-[#0A0906] hover:bg-[#E5C150] whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  {copiedKey === 'active-email' ? (
+                    <>
+                      <Check className="h-4 w-4" />
+                      <span>Copied</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="h-4 w-4" />
+                      <span>Copy Email</span>
+                    </>
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() =>
+                    setConfirmDeleteAddress((prev) =>
+                      prev === activeEmail.address ? null : activeEmail.address
+                    )
+                  }
+                  aria-label="Delete active email"
+                  title="Delete email from Home"
+                  className="flex min-h-[42px] min-w-[42px] items-center justify-center rounded-xl border border-rose-500/30 text-rose-600 transition-colors hover:bg-rose-500/10 cursor-pointer dark:text-rose-400"
+                >
+                  <Trash2 className="h-4 w-4" />
+                </button>
+              </div>
             </div>
+
+            {confirmDeleteAddress === activeEmail.address && (
+              <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-rose-500/30 bg-rose-500/10 px-3.5 py-2.5">
+                <div className="min-w-0">
+                  <p className="text-xs font-bold text-rose-700 dark:text-rose-200">
+                    Delete {activeEmail.address} from Home?
+                  </p>
+                  <p className="text-[11px] text-rose-600/85 dark:text-rose-200/80">
+                    You can recover it anytime in Create using its password.
+                  </p>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setConfirmDeleteAddress(null)}
+                    className="min-h-[34px] rounded-lg px-2.5 text-xs font-bold text-[#4F4736] hover:bg-black/5 dark:text-[#D5CCB8]"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const targetAddr = activeEmail.address;
+                      setConfirmDeleteAddress(null);
+                      onDeleteAccount(targetAddr);
+                    }}
+                    className="min-h-[34px] rounded-lg bg-rose-600 px-3 text-xs font-bold text-white hover:bg-rose-500 cursor-pointer"
+                  >
+                    Delete Email
+                  </button>
+                </div>
+              </div>
+            )}
 
             {savedEmails.length > 1 && (
               <div className="mt-3 border-t border-[#D4AF37]/15 pt-3">
@@ -180,37 +232,53 @@ export function HomeEmailTab({
                   onClick={() => setSwitcherOpen((prev) => !prev)}
                   className="flex w-full items-center justify-between text-xs font-bold text-[#8A6208] dark:text-[#F5D77A]"
                 >
-                  <span>Switch Created Emails ({savedEmails.length})</span>
+                  <span>Switch or Manage Created Emails ({savedEmails.length})</span>
                   <ChevronDown
                     className={`h-4 w-4 transition-transform ${switcherOpen ? 'rotate-180' : ''}`}
                   />
                 </button>
 
                 {switcherOpen && (
-                  <div className="mt-2 max-h-48 space-y-1.5 overflow-y-auto">
+                  <div className="mt-2 max-h-56 space-y-1.5 overflow-y-auto">
                     {savedEmails.map((acct) => {
                       const isCurrent = activeEmail.address === acct.address;
                       return (
-                        <button
+                        <div
                           key={acct.address}
-                          type="button"
-                          onClick={() => {
-                            onSelectAccount(acct);
-                            setSwitcherOpen(false);
-                          }}
-                          className={`flex min-h-[42px] w-full items-center justify-between gap-2 rounded-xl border px-3 py-2 text-left transition-colors ${
+                          className={`flex min-h-[42px] w-full items-center justify-between gap-2 rounded-xl border px-3 py-2 transition-colors ${
                             isCurrent
                               ? 'border-[#D4AF37] bg-[#D4AF37]/15'
                               : 'border-[#D4AF37]/15 hover:bg-[#D4AF37]/10'
                           }`}
                         >
-                          <span className="font-mono text-xs font-bold text-[#1A160D] truncate dark:text-[#FAF6EC]">
-                            {acct.address}
-                          </span>
-                          <span className="text-xs font-bold text-[#9A6F09] shrink-0 dark:text-[#F5D77A]">
-                            {isCurrent ? 'Active' : 'Switch'}
-                          </span>
-                        </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              onSelectAccount(acct);
+                              setSwitcherOpen(false);
+                            }}
+                            className="flex min-w-0 flex-1 items-center justify-between gap-2 text-left cursor-pointer"
+                          >
+                            <span className="font-mono text-xs font-bold text-[#1A160D] truncate dark:text-[#FAF6EC]">
+                              {acct.address}
+                            </span>
+                            <span className="text-xs font-bold text-[#9A6F09] shrink-0 dark:text-[#F5D77A]">
+                              {isCurrent ? 'Active' : 'Switch'}
+                            </span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => {
+                              onDeleteAccount(acct.address);
+                            }}
+                            aria-label={`Delete ${acct.address}`}
+                            title="Delete email"
+                            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-[#6E6552] hover:bg-rose-500/15 hover:text-rose-500 cursor-pointer dark:text-[#A89F8C]"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
                       );
                     })}
                   </div>

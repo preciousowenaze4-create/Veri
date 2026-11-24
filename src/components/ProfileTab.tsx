@@ -8,6 +8,7 @@ import {
   MailPlus,
   MessageSquareText,
   Moon,
+  ShieldCheck,
   Sun,
   Trash2,
   User,
@@ -29,7 +30,6 @@ interface ProfileTabProps {
   isDark: boolean;
   onCreateEmail: () => void;
   onSelectEmail: (account: TempEmailAccount) => void;
-  onRemoveEmail: (address: string) => void;
   onOpenSmsNumber: (entry: PhoneNumberEntry) => void;
   onRemoveSavedNumber: (digits: string) => void;
   onToggleAutoRefresh: () => void;
@@ -53,7 +53,6 @@ export function ProfileTab({
   isDark,
   onCreateEmail,
   onSelectEmail,
-  onRemoveEmail,
   onOpenSmsNumber,
   onRemoveSavedNumber,
   onToggleAutoRefresh,
@@ -147,14 +146,14 @@ export function ProfileTab({
       </section>
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-12 lg:items-start">
-        {/* Saved Emails */}
+        {/* Saved Emails (Read/Switch/Copy only — deletion is managed on Home) */}
         <section className="rounded-2xl border border-[#D4AF37]/20 bg-white p-5 lg:col-span-6 dark:bg-[#14120D]">
           <div className="flex items-center justify-between border-b border-[#D4AF37]/15 pb-3">
             <h2 className="font-display text-base font-bold text-[#1A160D] dark:text-[#FAF6EC]">
               Created Emails
             </h2>
-            <span className="text-xs text-[#6E6552] dark:text-[#A89F8C]">
-              Switch back anytime
+            <span className="text-[11px] font-medium text-[#6E6552] dark:text-[#A89F8C]">
+              Manage or delete on Home
             </span>
           </div>
 
@@ -188,7 +187,7 @@ export function ProfileTab({
                       <button
                         type="button"
                         onClick={() => onSelectEmail(acct)}
-                        className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg bg-[#D4AF37] px-3 py-1.5 text-xs font-bold text-[#0A0906] hover:bg-[#E5C150]"
+                        className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg bg-[#D4AF37] px-3 py-1.5 text-xs font-bold text-[#0A0906] hover:bg-[#E5C150] cursor-pointer"
                       >
                         <Mail className="h-3.5 w-3.5" />
                         <span>{isActive ? 'Open Inbox' : 'Receive Here'}</span>
@@ -197,21 +196,13 @@ export function ProfileTab({
                         type="button"
                         onClick={() => handleCopy(acct.address, acct.address, 'Email copied')}
                         aria-label="Copy email"
-                        className="flex min-h-[38px] min-w-[38px] items-center justify-center rounded-lg border border-[#D4AF37]/25 text-[#6E6552] hover:bg-[#D4AF37]/10 dark:text-[#D5CCB8]"
+                        className="flex min-h-[38px] min-w-[38px] items-center justify-center rounded-lg border border-[#D4AF37]/25 text-[#6E6552] hover:bg-[#D4AF37]/10 cursor-pointer dark:text-[#D5CCB8]"
                       >
                         {copiedId === acct.address ? (
                           <Check className="h-3.5 w-3.5 text-[#D4AF37]" />
                         ) : (
                           <Copy className="h-3.5 w-3.5" />
                         )}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => onRemoveEmail(acct.address)}
-                        aria-label="Delete saved email"
-                        className="flex min-h-[38px] min-w-[38px] items-center justify-center rounded-lg border border-[#D4AF37]/25 text-[#6E6552] hover:border-rose-400 hover:text-rose-500 dark:text-[#A89F8C]"
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
                       </button>
                     </div>
                   </div>
@@ -342,15 +333,23 @@ export function ProfileTab({
         </section>
 
         <section className="rounded-2xl border border-[#D4AF37]/20 bg-white p-5 lg:col-span-5 dark:bg-[#14120D]">
-          <h2 className="font-display text-base font-bold text-[#1A160D] dark:text-[#FAF6EC]">
-            App Preferences
-          </h2>
+          <div className="flex items-center justify-between border-b border-[#D4AF37]/15 pb-3">
+            <h2 className="font-display text-base font-bold text-[#1A160D] dark:text-[#FAF6EC]">
+              Account &amp; App Settings
+            </h2>
+            <span className="inline-flex items-center gap-1 text-[11px] font-bold text-[#8A6208] dark:text-[#F5D77A]">
+              <ShieldCheck className="h-3.5 w-3.5" />
+              <span>{isAuthenticated ? 'Verified' : 'Preview'}</span>
+            </span>
+          </div>
 
           <div className="mt-4 space-y-3">
             <button
               type="button"
+              role="switch"
+              aria-checked={autoRefresh}
               onClick={onToggleAutoRefresh}
-              className="flex min-h-[48px] w-full items-center justify-between rounded-xl border border-[#D4AF37]/20 px-4 py-3 text-left transition-colors hover:bg-[#D4AF37]/10"
+              className="flex min-h-[54px] w-full items-center justify-between gap-3 rounded-xl border border-[#D4AF37]/20 px-4 py-3 text-left transition-colors hover:bg-[#D4AF37]/10 cursor-pointer"
             >
               <div>
                 <p className="text-sm font-bold text-[#1A160D] dark:text-[#FAF6EC]">
@@ -360,30 +359,64 @@ export function ProfileTab({
                   Real-time SMS stream and live Email polling
                 </p>
               </div>
-              <span className="font-mono text-xs font-bold text-[#9A6F09] dark:text-[#F5D77A]">
-                {autoRefresh ? 'ON' : 'OFF'}
+              <span
+                className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${
+                  autoRefresh ? 'bg-[#D4AF37]' : 'bg-[#6E6552]/30 dark:bg-[#2A2418]'
+                }`}
+              >
+                <span
+                  className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${
+                    autoRefresh ? 'translate-x-6' : 'translate-x-1'
+                  }`}
+                />
               </span>
             </button>
 
             <button
               type="button"
+              role="switch"
+              aria-checked={isDark}
               onClick={onToggleTheme}
-              className="flex min-h-[48px] w-full items-center justify-between rounded-xl border border-[#D4AF37]/20 px-4 py-3 text-left transition-colors hover:bg-[#D4AF37]/10"
+              className="flex min-h-[54px] w-full items-center justify-between gap-3 rounded-xl border border-[#D4AF37]/20 px-4 py-3 text-left transition-colors hover:bg-[#D4AF37]/10 cursor-pointer"
             >
-              <div>
-                <p className="text-sm font-bold text-[#1A160D] dark:text-[#FAF6EC]">
-                  Gold Appearance
-                </p>
-                <p className="text-xs text-[#6E6552] dark:text-[#A89F8C]">
-                  Switch between Obsidian Gold and Warm Ivory
-                </p>
+              <div className="flex items-center gap-3">
+                <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-[#D4AF37]/15">
+                  {isDark ? (
+                    <Moon className="h-4 w-4 text-[#F5D77A]" />
+                  ) : (
+                    <Sun className="h-4 w-4 text-[#8A6208]" />
+                  )}
+                </div>
+                <div>
+                  <p className="text-sm font-bold text-[#1A160D] dark:text-[#FAF6EC]">
+                    {isDark ? 'Obsidian Gold Theme' : 'Warm Ivory Theme'}
+                  </p>
+                  <p className="text-xs text-[#6E6552] dark:text-[#A89F8C]">
+                    Switch between dark &amp; light mode
+                  </p>
+                </div>
               </div>
-              {isDark ? (
-                <Sun className="h-4 w-4 text-[#F5D77A]" />
-              ) : (
-                <Moon className="h-4 w-4 text-[#8A6208]" />
-              )}
+              <span
+                className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${
+                  isDark ? 'bg-[#D4AF37]' : 'bg-[#6E6552]/30'
+                }`}
+              >
+                <span
+                  className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${
+                    isDark ? 'translate-x-6' : 'translate-x-1'
+                  }`}
+                />
+              </span>
             </button>
+
+            <div className="rounded-xl border border-[#D4AF37]/20 bg-[#FAF7F0] p-3.5 text-xs dark:bg-[#0B0A07]">
+              <p className="font-bold text-[#1A160D] dark:text-[#FAF6EC]">
+                Email Deletion &amp; Password Recovery
+              </p>
+              <p className="mt-1 leading-relaxed text-[#6E6552] dark:text-[#A89F8C]">
+                Emails are managed and deleted exclusively from the <strong>Home</strong> tab. Deleted addresses can be recovered anytime in <strong>Create → VeriBox Mail</strong> using their password.
+              </p>
+            </div>
 
             {confirmClear ? (
               <div className="flex items-center justify-between gap-2 rounded-xl border border-rose-500/30 bg-rose-500/10 p-3">
@@ -404,7 +437,7 @@ export function ProfileTab({
                       onClearHistory();
                       setConfirmClear(false);
                     }}
-                    className="min-h-[36px] rounded-lg bg-rose-600 px-3 text-xs font-bold text-white"
+                    className="min-h-[36px] rounded-lg bg-rose-600 px-3 text-xs font-bold text-white cursor-pointer"
                   >
                     Confirm
                   </button>
@@ -414,7 +447,7 @@ export function ProfileTab({
               <button
                 type="button"
                 onClick={() => setConfirmClear(true)}
-                className="flex min-h-[48px] w-full items-center justify-between rounded-xl border border-[#D4AF37]/20 px-4 py-3 text-left text-sm font-bold text-rose-600 transition-colors hover:bg-rose-500/10 dark:text-rose-400"
+                className="flex min-h-[48px] w-full items-center justify-between rounded-xl border border-[#D4AF37]/20 px-4 py-3 text-left text-sm font-bold text-rose-600 transition-colors hover:bg-rose-500/10 cursor-pointer dark:text-rose-400"
               >
                 <span>Clear Copied OTP Log</span>
                 <Trash2 className="h-4 w-4" />

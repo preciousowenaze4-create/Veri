@@ -39,6 +39,7 @@ import { ensureSupabaseClient, getActiveSupabaseClient } from './utils/supabase'
 
 const STORAGE_KEYS = {
   emails: 'veribox_saved_emails_v2',
+  deletedEmails: 'veribox_deleted_emails_v2',
   activeEmail: 'veribox_active_email_v2',
   savedNumbers: 'veribox_saved_numbers_v2',
   otpHistory: 'veribox_otp_history_v2',
@@ -161,6 +162,9 @@ export default function App() {
   const [savedEmails, setSavedEmails] = useState<TempEmailAccount[]>(() =>
     readStorage<TempEmailAccount[]>(STORAGE_KEYS.emails, [])
   );
+  const [deletedEmails, setDeletedEmails] = useState<TempEmailAccount[]>(() =>
+    readStorage<TempEmailAccount[]>(STORAGE_KEYS.deletedEmails, [])
+  );
   const [activeEmail, setActiveEmail] = useState<TempEmailAccount | null>(() =>
     readStorage<TempEmailAccount | null>(STORAGE_KEYS.activeEmail, null)
   );
@@ -180,6 +184,7 @@ export default function App() {
   );
 
   const lastFetchedAddressRef = useRef<string | null>(null);
+  const hasAutoCreatedInitialEmailRef = useRef<boolean>(false);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -195,6 +200,10 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(STORAGE_KEYS.emails, JSON.stringify(savedEmails));
   }, [savedEmails]);
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEYS.deletedEmails, JSON.stringify(deletedEmails));
+  }, [deletedEmails]);
 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEYS.activeEmail, JSON.stringify(activeEmail));
@@ -1140,9 +1149,41 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const handleDeleteEmailAccount = useCallback(
+    (address: string) => {
+      const lower = address.toLowerCase();
+      const target =
+        savedEmails.find((e) => e.address.toLowerCase() === lower) ||
+        (activeEmail?.address.toLowerCase() === lower ? activeEmail : null);
+
+      if (target) {
+        setDeletedEmails((prev) =>
+          [target, ...prev.filter((d) => d.address.toLowerCase() !== lower)].slice(0, 25)
+        );
+      }
+
+      const remaining = savedEmails.filter((e) => e.address.toLowerCase() !== lower);
+      setSavedEmails(remaining);
+
+      if (activeEmail?.address.toLowerCase() === lower) {
+        const nextActive = remaining[0] || null;
+        lastFetchedAddressRef.current = null;
+        setActiveEmail(nextActive);
+        setSelectedEmailDetail(null);
+        setEmailMessages([]);
+        setEmailError(null);
+      }
+
+      showToast('Email deleted from Home · Recover anytime in Create with its password');
+    },
+    [savedEmails, activeEmail, showToast]
+  );
+
   useEffect(() => {
     if (!authUser) return;
+    if (hasAutoCreatedInitialEmailRef.current) return;
     if (!activeEmail && savedEmails.length === 0 && !pendingAuthActionRef.current) {
+      hasAutoCreatedInitialEmailRef.current = true;
       void (async () => {
         try {
           const res = await fetch('/api/email/create', {
@@ -1331,6 +1372,11 @@ export default function App() {
                 showToast(`Switched to ${acct.address}`);
               })
             }
+            onDeleteAccount={(address) =>
+              requireAuth('Sign in to manage email addresses', () => {
+                handleDeleteEmailAccount(address);
+              })
+            }
             onRefreshInbox={() =>
               requireAuth('Sign in to check your email inbox', () => {
                 setCountdown(15);
@@ -1359,7 +1405,11 @@ export default function App() {
               openAuthModal(reason || 'Sign in to create an email', () => setActiveTab('create'))
             }
             savedEmails={savedEmails}
+            deletedEmails={deletedEmails}
             onComplete={(newAccount) => {
+              setDeletedEmails((prev) =>
+                prev.filter((d) => d.address.toLowerCase() !== newAccount.address.toLowerCase())
+              );
               setActiveEmail(newAccount);
               setSavedEmails((prev) =>
                 [newAccount, ...prev.filter((a) => a.address !== newAccount.address)].slice(0, 12)
@@ -1369,10 +1419,19 @@ export default function App() {
               setActiveTab('home');
             }}
             onSelectExisting={(acct) => {
+              lastFetchedAddressRef.current = null;
+              setDeletedEmails((prev) =>
+                prev.filter((d) => d.address.toLowerCase() !== acct.address.toLowerCase())
+              );
+              setSavedEmails((prev) =>
+                [acct, ...prev.filter((a) => a.address.toLowerCase() !== acct.address.toLowerCase())].slice(
+                  0,
+                  12
+                )
+              );
               setActiveEmail(acct);
               setSelectedEmailDetail(null);
               setActiveTab('home');
-              showToast(`Signed in as ${acct.address}`);
             }}
             onCancel={() => setActiveTab('home')}
             onShowToast={showToast}
@@ -1488,14 +1547,6 @@ export default function App() {
               setActiveEmail(acct);
               setSelectedEmailDetail(null);
               setActiveTab('home');
-            }}
-            onRemoveEmail={(address) => {
-              const remaining = savedEmails.filter((e) => e.address !== address);
-              setSavedEmails(remaining);
-              if (activeEmail?.address === address) {
-                setActiveEmail(remaining[0] || null);
-              }
-              showToast('Email removed');
             }}
             onOpenSmsNumber={(entry) => {
               const matched = numberHistory.find((h) => h.digits === entry.digits);

@@ -633,7 +633,10 @@ function getCustomEmailDomain(): string {
 function getInboundEmailSecret(): string {
   const raw = (process.env.INBOUND_EMAIL_SECRET || '')
     .trim()
-    .replace(/^["']|["']$/g, '')
+    .replace(/^["'`]|["'`]$/g, '')
+    .replace(/^INBOUND_EMAIL_SECRET\s*=\s*/i, '')
+    .trim()
+    .replace(/^["'`]|["'`]$/g, '')
     .trim();
   if (!raw || raw.startsWith('MY_')) return '';
   return raw;
@@ -3602,14 +3605,17 @@ export function createApiApp() {
     const attemptId = `att_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`;
     const receivedAtIso = new Date().toISOString();
 
+    const firstHeader = (val: string | string[] | undefined): string =>
+      Array.isArray(val) ? String(val[0] || '') : String(val || '');
+
     // 1. Validate x-inbound-secret immediately before any body normalization or DB work
     const configuredSecret = getInboundEmailSecret();
     if (configuredSecret) {
       const provided = String(
         req.params.secret ||
-          req.headers['x-inbound-secret'] ||
-          req.headers['x-webhook-secret'] ||
-          (req.headers.authorization || '').replace(/^Bearer\s+/i, '') ||
+          firstHeader(req.headers['x-inbound-secret']) ||
+          firstHeader(req.headers['x-webhook-secret']) ||
+          firstHeader(req.headers.authorization).replace(/^Bearer\s+/i, '') ||
           req.query.secret ||
           ''
       ).trim();
@@ -4332,6 +4338,13 @@ export function createApiApp() {
     }
   }
 
+  let cachedDnsProbe: { expiresAt: number; value: Awaited<ReturnType<typeof checkDomainDns>> } | null =
+    null;
+  let cachedLiveDomainProbe: {
+    expiresAt: number;
+    value: Awaited<ReturnType<typeof checkLiveDomainConnection>>;
+  } | null = null;
+
   app.get('/api/admin/diagnostics', async (req, res) => {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.setHeader('Pragma', 'no-cache');
@@ -4340,6 +4353,7 @@ export function createApiApp() {
     const verified = await verifyOwnerAdminRequest(req, res);
     if (!verified) return;
     const sb = verified.supabase;
+    const forceProbe = req.query.force === '1' || req.query.force === 'true';
 
     const inboundSecretConfigured = Boolean(getInboundEmailSecret());
     const supabaseConfigured = Boolean(getSupabaseServerConfig().url);
@@ -4407,6 +4421,25 @@ export function createApiApp() {
       }
     };
 
+    const nowMs = Date.now();
+    const getDnsCheckCached = async () => {
+      if (!forceProbe && cachedDnsProbe && cachedDnsProbe.expiresAt > nowMs) {
+        return cachedDnsProbe.value;
+      }
+      const value = await checkDomainDns(CUSTOM_EMAIL_DOMAIN);
+      cachedDnsProbe = { expiresAt: Date.now() + 25000, value };
+      return value;
+    };
+
+    const getDomainConnectionCached = async () => {
+      if (!forceProbe && cachedLiveDomainProbe && cachedLiveDomainProbe.expiresAt > nowMs) {
+        return cachedLiveDomainProbe.value;
+      }
+      const value = await checkLiveDomainConnection(CUSTOM_EMAIL_DOMAIN);
+      cachedLiveDomainProbe = { expiresAt: Date.now() + 25000, value };
+      return value;
+    };
+
     const [mailboxesProbe, messagesProbe, persistedAuditLogs, dnsCheck, domainConnection] =
       await Promise.all([
         probeTable('mailboxes', 'address, username, domain, account_mode, created_at, is_deleted'),
@@ -4415,8 +4448,8 @@ export function createApiApp() {
           'id, recipient_address, from_name, from_address, subject, otp, seen, created_at'
         ),
         fetchPersistedAuditLogs(),
-        checkDomainDns(CUSTOM_EMAIL_DOMAIN),
-        checkLiveDomainConnection(CUSTOM_EMAIL_DOMAIN),
+        getDnsCheckCached(),
+        getDomainConnectionCached(),
       ]);
 
     const mergedAttemptsMap = new Map<string, InboundAttemptLog>();
@@ -4460,13 +4493,15 @@ export function createApiApp() {
       );
     }
 
-    const recentFailedCutoff = Date.now() - 15 * 60 * 1000;
-    const latestRecentFailure = mergedAttempts.find(
-      (a) => a.status !== 'stored' && Date.parse(a.timestamp) >= recentFailedCutoff
-    );
-    if (latestRecentFailure) {
+    const recentFailedCutoff = Date.now() - 10 * 60 * 1000;
+    const latestAttempt = mergedAttempts[0] || null;
+    if (
+      latestAttempt &&
+      latestAttempt.status !== 'stored' &&
+      Date.parse(latestAttempt.timestamp) >= recentFailedCutoff
+    ) {
       connectionErrors.push(
-        `Recent inbound webhook failure (${latestRecentFailure.status} · HTTP ${latestRecentFailure.httpStatus}): ${latestRecentFailure.error || latestRecentFailure.subject}`
+        `Recent inbound webhook failure (${latestAttempt.status} · HTTP ${latestAttempt.httpStatus}): ${latestAttempt.error || latestAttempt.subject}`
       );
     }
 
@@ -4589,6 +4624,23 @@ export function createApiApp() {
     });
   });
 
+  app.post('/api/admin/diagnostics/clear-alerts', async (req, res) => {
+    const verified = await verifyOwnerAdminRequest(req, res);
+    if (!verified) return;
+
+    inboundAttemptLogs.length = 0;
+    try {
+      await verified.supabase
+        .from('mailbox_messages')
+        .delete()
+        .eq('recipient_address', INBOUND_AUDIT_ADDRESS)
+        .neq('otp', 'STORED');
+    } catch {
+      // Non-blocking
+    }
+    res.json({ cleared: true });
+  });
+
   app.post('/api/admin/test-inbound', async (req, res) => {
     const verified = await verifyOwnerAdminRequest(req, res);
     if (!verified) return;
@@ -4629,12 +4681,37 @@ export function createApiApp() {
     const prodProbePromise =
       origin !== prodDomainUrl
         ? (async () => {
+            // Only POST to production /api/email/inbound if this environment also has the inbound secret;
+            // otherwise probe GET /api/email/domains so preview tests never inject 401 audit errors.
+            if (!secret) {
+              try {
+                const healthRes = await fetch(`${prodDomainUrl}/api/email/domains`, {
+                  headers: { accept: 'application/json' },
+                  signal: AbortSignal.timeout(3000),
+                });
+                return {
+                  url: `${prodDomainUrl}/api/email/domains`,
+                  httpStatus: healthRes.status,
+                  reachable: healthRes.ok,
+                  detail: healthRes.ok
+                    ? 'Production domain API reachable (secret not set in local preview, skipped remote POST)'
+                    : `HTTP ${healthRes.status} from production domain API`,
+                };
+              } catch (err) {
+                return {
+                  url: `${prodDomainUrl}/api/email/domains`,
+                  httpStatus: null,
+                  reachable: false,
+                  detail: err instanceof Error ? err.message : 'Production domain unreachable',
+                };
+              }
+            }
             try {
               const r = await fetch(`${prodDomainUrl}/api/email/inbound`, {
                 method: 'POST',
                 headers: {
                   'content-type': 'application/json',
-                  ...(secret ? { 'x-inbound-secret': secret } : {}),
+                  'x-inbound-secret': secret,
                 },
                 body: JSON.stringify({
                   to: targetAddress,

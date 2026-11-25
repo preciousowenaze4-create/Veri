@@ -36,20 +36,20 @@ export function TopBar({
 
   return (
     <header className="sticky top-0 z-30 w-full border-b border-[#D4AF37]/20 bg-[#FAF7F0]/95 pt-[env(safe-area-inset-top)] backdrop-blur-md dark:border-[#D4AF37]/20 dark:bg-[#0A0906]/95">
-      <div className="mx-auto flex h-[58px] w-full max-w-7xl items-center justify-between gap-3 px-3 sm:px-6">
+      <div className="mx-auto flex h-[58px] w-full max-w-7xl items-center justify-between gap-2 px-3 sm:px-6">
         {/* Left: Menu Hamburger + Bold App Logo + Brand Wordmark */}
-        <div className="flex items-center gap-2.5 min-w-0">
+        <div className="flex items-center gap-2 min-w-0">
           <button
             type="button"
             onClick={onOpenDrawer}
             aria-label="Open left corner menu"
-            className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-xl text-[#3E3522] transition-colors hover:bg-[#D4AF37]/15 focus-visible:outline-2 focus-visible:outline-[#D4AF37] dark:text-[#F5D77A] dark:hover:bg-[#D4AF37]/15"
+            className="flex min-h-[42px] min-w-[42px] shrink-0 items-center justify-center rounded-xl text-[#3E3522] transition-colors hover:bg-[#D4AF37]/15 focus-visible:outline-2 focus-visible:outline-[#D4AF37] dark:text-[#F5D77A] dark:hover:bg-[#D4AF37]/15"
           >
             <Menu className="h-5 w-5" />
           </button>
 
           {/* Bold VeriBox Crest Badge */}
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 min-w-0">
             <div className="relative flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-xl border-2 border-[#D4AF37] bg-[#14120D] shadow-md shadow-[#D4AF37]/25">
               <img
                 src="/pwa-192x192.png"
@@ -57,7 +57,7 @@ export function TopBar({
                 className="h-full w-full object-cover scale-105"
               />
             </div>
-            <span className="font-display text-lg font-black tracking-tight text-[#1A160D] whitespace-nowrap dark:text-[#F5D77A]">
+            <span className="font-display text-base sm:text-lg font-black tracking-tight text-[#1A160D] whitespace-nowrap truncate dark:text-[#F5D77A]">
               VeriBox
             </span>
           </div>
@@ -74,7 +74,7 @@ export function TopBar({
             <ArrowRight className="h-3.5 w-3.5 stroke-[2.5] transition-transform group-hover:translate-x-0.5" />
           </button>
         ) : (
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
             {isOwnerAdmin && onToggleAdmin && (
               <button
                 type="button"
@@ -84,16 +84,14 @@ export function TopBar({
                     ? 'Switch to User Dashboard'
                     : 'Open Owner Admin Diagnostics'
                 }
-                className={`inline-flex min-h-[38px] items-center gap-1.5 rounded-xl border px-2.5 py-1.5 text-xs font-extrabold transition-colors cursor-pointer ${
+                className={`hidden sm:inline-flex min-h-[38px] items-center gap-1.5 rounded-xl border px-2.5 py-1.5 text-xs font-extrabold transition-colors cursor-pointer ${
                   activeTab === 'admin'
                     ? 'border-[#D4AF37] bg-[#D4AF37] text-[#0A0906]'
                     : 'border-[#D4AF37]/45 bg-[#D4AF37]/15 text-[#8A6208] hover:bg-[#D4AF37]/25 dark:text-[#F5D77A]'
                 }`}
               >
                 <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
-                <span className="hidden xs:inline sm:inline">
-                  {activeTab === 'admin' ? 'User View' : 'Admin'}
-                </span>
+                <span>{activeTab === 'admin' ? 'User View' : 'Admin'}</span>
               </button>
             )}
 

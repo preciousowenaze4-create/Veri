@@ -32,7 +32,7 @@ interface HomeEmailTabProps {
   dailyGenerateUsed?: number;
   dailyGenerateLimit?: number;
   emailError: string | null;
-  countdown: number;
+  countdown?: number;
   autoRefresh: boolean;
   onGenerateEmail: () => void;
   onGoToCreate: () => void;
@@ -71,7 +71,7 @@ export function HomeEmailTab({
   dailyGenerateUsed = 0,
   dailyGenerateLimit = 5,
   emailError,
-  countdown,
+  countdown = 3,
   autoRefresh,
   onGenerateEmail,
   onGoToCreate,

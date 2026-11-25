@@ -188,7 +188,7 @@ export default function App() {
   const [autoRefresh, setAutoRefresh] = useState<boolean>(() =>
     readStorage<boolean>(STORAGE_KEYS.autoRefresh, true)
   );
-  const [countdown, setCountdown] = useState<number>(2);
+  const countdown = 3;
 
   // Supabase Auth & Naira Wallet Balance state (synced with Supabase & Paystack webhook)
   const [authUser, setAuthUser] = useState<SupabaseUser | null>(null);
@@ -223,6 +223,7 @@ export default function App() {
   const autoSwitchedAdminUserIdRef = useRef<string | null>(null);
   const adminDiagnosticsInFlightRef = useRef<boolean>(false);
   const lastAlertedSignatureRef = useRef<string>('');
+  const dismissedAlertSignatureRef = useRef<string>('');
 
   // Private Numbers Flow state (Setup -> Active Receiver -> History)
   const [services, setServices] = useState<NumberServiceOption[]>(DEFAULT_SERVICES);
@@ -416,7 +417,8 @@ export default function App() {
         if (!token) {
           throw new Error('HTTP 401: Missing active Supabase session token for admin diagnostics.');
         }
-        const res = await fetch('/api/admin/diagnostics', {
+        const res = await fetch(silent ? '/api/admin/diagnostics' : '/api/admin/diagnostics?force=1', {
+          cache: 'no-store',
           headers: {
             Authorization: `Bearer ${token}`,
           },
@@ -444,7 +446,10 @@ export default function App() {
 
         if (activeIssues.length > 0) {
           const signature = activeIssues.join('||');
-          if (signature !== lastAlertedSignatureRef.current) {
+          if (
+            signature !== lastAlertedSignatureRef.current &&
+            signature !== dismissedAlertSignatureRef.current
+          ) {
             lastAlertedSignatureRef.current = signature;
             setDomainErrorPopup({
               title: `${data.environment?.emailDomain || emailDomain} Connection Alert`,
@@ -454,6 +459,7 @@ export default function App() {
           }
         } else {
           lastAlertedSignatureRef.current = '';
+          dismissedAlertSignatureRef.current = '';
           setDomainErrorPopup(null);
         }
       } catch (err) {
@@ -464,7 +470,10 @@ export default function App() {
               : err.message
             : 'Failed to load admin diagnostics';
         setAdminError(message);
-        if (message !== lastAlertedSignatureRef.current) {
+        if (
+          message !== lastAlertedSignatureRef.current &&
+          message !== dismissedAlertSignatureRef.current
+        ) {
           lastAlertedSignatureRef.current = message;
           setDomainErrorPopup({
             title: `${emailDomain} Diagnostics Connection Error`,
@@ -481,6 +490,24 @@ export default function App() {
     },
     [isOwnerAdmin, getAuthAccessToken, emailDomain]
   );
+
+  const dismissDomainErrorPopup = useCallback(async () => {
+    if (domainErrorPopup) {
+      dismissedAlertSignatureRef.current = domainErrorPopup.errors.join('||');
+    }
+    setDomainErrorPopup(null);
+    if (!isOwnerAdmin) return;
+    try {
+      const token = await getAuthAccessToken();
+      if (!token) return;
+      await fetch('/api/admin/diagnostics/clear-alerts', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+    } catch {
+      // Non-blocking
+    }
+  }, [domainErrorPopup, isOwnerAdmin, getAuthAccessToken]);
 
   const handleTestInboundPipeline = useCallback(
     async (targetAddress: string) => {
@@ -617,7 +644,7 @@ export default function App() {
     window.addEventListener('focus', handleResume);
     document.addEventListener('visibilitychange', handleResume);
 
-    const intervalMs = activeTab === 'admin' ? 4000 : 20000;
+    const intervalMs = activeTab === 'admin' ? 4000 : 45000;
     const intervalId = window.setInterval(() => {
       if (document.visibilityState === 'hidden') return;
       void fetchAdminDiagnostics(true);
@@ -638,6 +665,7 @@ export default function App() {
     pendingAuthActionRef.current = null;
     autoSwitchedAdminUserIdRef.current = null;
     lastAlertedSignatureRef.current = '';
+    dismissedAlertSignatureRef.current = '';
     lastFetchedAddressRef.current = null;
     knownEmailMsgIdsRef.current = new Set();
     setEmailMessages([]);
@@ -1595,7 +1623,6 @@ export default function App() {
       );
       setSelectedEmailDetail(null);
       setEmailMessages([]);
-      setCountdown(3);
       showToast(
         unlimited
           ? `Generated ${data.address} · Owner Unlimited`
@@ -1822,7 +1849,6 @@ export default function App() {
             ].slice(0, 50);
             applyInboxSnapshot(targetAddr, nextList, true);
             setLastEmailCheckedAt(new Date().toISOString());
-            setCountdown(3);
           }
         )
         .subscribe((status) => {
@@ -1843,9 +1869,12 @@ export default function App() {
     };
   }, [autoRefresh, activeEmail?.address, applyInboxSnapshot]);
 
-  // 2. Real-time SSE stream for instant incoming emails on active mailbox
+  // 2. Real-time SSE stream for instant incoming emails on persistent local server
   useEffect(() => {
-    if (!autoRefresh || activeTab !== 'home' || !activeEmail) {
+    const isLocalHost =
+      typeof window !== 'undefined' &&
+      (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
+    if (!isLocalHost || !autoRefresh || activeTab !== 'home' || !activeEmail) {
       setEmailStreamConnected(false);
       return;
     }
@@ -1882,23 +1911,16 @@ export default function App() {
     };
   }, [autoRefresh, activeTab, activeEmail?.address, activeEmail?.token, applyInboxSnapshot]);
 
-  // 3. Lightweight 3-second polling + immediate refresh when returning from another app/tab (never backs off)
+  // 3. Lightweight 3-second polling + immediate refresh when returning from another app/tab (zero 1Hz re-renders)
   useEffect(() => {
     if (!autoRefresh || activeTab !== 'home' || !activeEmail) return;
-    setCountdown(3);
     const timer = window.setInterval(() => {
-      setCountdown((prev) => {
-        if (prev <= 1) {
-          void refreshEmailInbox(activeEmail, true);
-          return 3;
-        }
-        return prev - 1;
-      });
-    }, 1000);
+      if (document.visibilityState === 'hidden') return;
+      void refreshEmailInbox(activeEmail, true);
+    }, 3000);
 
     const handleResume = () => {
       if (document.visibilityState === 'hidden') return;
-      setCountdown(3);
       void refreshEmailInbox(activeEmail, true);
     };
 
@@ -2068,7 +2090,7 @@ export default function App() {
               </div>
               <button
                 type="button"
-                onClick={() => setDomainErrorPopup(null)}
+                onClick={() => void dismissDomainErrorPopup()}
                 aria-label="Dismiss domain error popup"
                 className="rounded-lg p-1.5 text-rose-200 hover:bg-rose-500/20 cursor-pointer"
               >
@@ -2111,7 +2133,7 @@ export default function App() {
               )}
               <button
                 type="button"
-                onClick={() => setDomainErrorPopup(null)}
+                onClick={() => void dismissDomainErrorPopup()}
                 className="rounded-xl px-2.5 py-1.5 text-xs font-bold text-rose-200 hover:bg-white/10 cursor-pointer"
               >
                 Dismiss
@@ -2165,7 +2187,6 @@ export default function App() {
             }
             onRefreshInbox={() =>
               requireAuth('Sign in to check your email inbox', () => {
-                setCountdown(3);
                 void refreshEmailInbox(activeEmail, false);
               })
             }

@@ -2462,10 +2462,34 @@ export function createApiApp() {
     createdAt: string;
   }
 
+  const OWNER_ADMIN_EMAIL = 'preciousddkid@gmail.com';
+
+  interface InboundAttemptLog {
+    id: string;
+    timestamp: string;
+    status: 'stored' | 'rejected_secret' | 'unmatched_recipient' | 'db_error' | 'invalid_payload';
+    httpStatus: number;
+    recipients: string[];
+    rawToPreview: string;
+    fromAddress: string;
+    subject: string;
+    otpDetected: string | null;
+    supabaseStored: boolean;
+    error: string | null;
+  }
+
   const mailboxRegistry = new Map<string, CustomMailboxRecord>();
   const mailboxMessagesMap = new Map<string, CustomInboxMessageRecord[]>();
+  const inboundAttemptLogs: InboundAttemptLog[] = [];
   const emailEvents = new EventEmitter();
   emailEvents.setMaxListeners(200);
+
+  function recordInboundAttempt(entry: InboundAttemptLog): void {
+    inboundAttemptLogs.unshift(entry);
+    if (inboundAttemptLogs.length > 50) {
+      inboundAttemptLogs.length = 50;
+    }
+  }
 
   function hashEmailPassword(password: string, salt?: string): { salt: string; hash: string } {
     const useSalt = salt || crypto.randomBytes(16).toString('hex');
@@ -2600,7 +2624,14 @@ export function createApiApp() {
       .slice(0, 20);
   }
 
-  async function saveInboxMessage(msg: CustomInboxMessageRecord): Promise<void> {
+  interface InboxSaveResult {
+    supabaseAttempted: boolean;
+    supabaseStored: boolean;
+    errorCode: string | null;
+    errorMessage: string | null;
+  }
+
+  async function saveInboxMessage(msg: CustomInboxMessageRecord): Promise<InboxSaveResult> {
     const cleanStr = (v: string) => v.replace(/\u0000/g, '');
     const sanitizedMsg: CustomInboxMessageRecord = {
       ...msg,
@@ -2615,8 +2646,14 @@ export function createApiApp() {
     const next = [sanitizedMsg, ...existing.filter((m) => m.id !== sanitizedMsg.id)].slice(0, 100);
     mailboxMessagesMap.set(recipient, next);
 
+    let supabaseAttempted = false;
+    let supabaseStored = false;
+    let errorCode: string | null = null;
+    let errorMessage: string | null = null;
+
     const sb = getSupabaseServerClient();
     if (sb) {
+      supabaseAttempted = true;
       try {
         const { error } = await sb.from('mailbox_messages').upsert(
           {
@@ -2634,22 +2671,36 @@ export function createApiApp() {
           { onConflict: 'id' }
         );
         if (error) {
+          errorCode = error.code || null;
+          errorMessage = error.message || 'Supabase mailbox_messages upsert error';
           console.warn('[VeriBox Mail] Supabase mailbox_messages upsert warning:', error.message);
+        } else {
+          supabaseStored = true;
         }
-      } catch {
-        // In-memory store remains active
+      } catch (err) {
+        errorMessage = err instanceof Error ? err.message : 'Supabase upsert exception';
       }
+    } else {
+      errorMessage = 'Supabase client not configured on backend';
     }
 
     emailEvents.emit(`inbound:${recipient}`, sanitizedMsg);
+    return { supabaseAttempted, supabaseStored, errorCode, errorMessage };
   }
 
-  async function listInboxMessages(recipientAddress: string): Promise<CustomInboxMessageRecord[]> {
+  interface InboxListResult {
+    rows: CustomInboxMessageRecord[];
+    supabaseError: string | null;
+    supabaseCode: string | null;
+    supabaseStatus: number | null;
+  }
+
+  async function listInboxMessagesWithStatus(recipientAddress: string): Promise<InboxListResult> {
     const recipient = recipientAddress.trim().toLowerCase();
     const sb = getSupabaseServerClient();
     if (sb) {
       try {
-        const { data, error } = await sb
+        const { data, error, status } = await sb
           .from('mailbox_messages')
           .select('*')
           .eq('recipient_address', recipient)
@@ -2669,14 +2720,37 @@ export function createApiApp() {
             createdAt: String(row.created_at || new Date().toISOString()),
           }));
           mailboxMessagesMap.set(recipient, rows);
-          return rows;
+          return { rows, supabaseError: null, supabaseCode: null, supabaseStatus: status || 200 };
         }
-      } catch {
-        // Fallback to memory
+        if (error) {
+          return {
+            rows: mailboxMessagesMap.get(recipient) || [],
+            supabaseError: error.message || 'Supabase query failed',
+            supabaseCode: error.code || null,
+            supabaseStatus: typeof status === 'number' && status >= 400 ? status : 502,
+          };
+        }
+      } catch (err) {
+        return {
+          rows: mailboxMessagesMap.get(recipient) || [],
+          supabaseError: err instanceof Error ? err.message : 'Supabase connection error',
+          supabaseCode: 'NETWORK_ERROR',
+          supabaseStatus: 502,
+        };
       }
     }
 
-    return mailboxMessagesMap.get(recipient) || [];
+    return {
+      rows: mailboxMessagesMap.get(recipient) || [],
+      supabaseError: null,
+      supabaseCode: null,
+      supabaseStatus: null,
+    };
+  }
+
+  async function listInboxMessages(recipientAddress: string): Promise<CustomInboxMessageRecord[]> {
+    const res = await listInboxMessagesWithStatus(recipientAddress);
+    return res.rows;
   }
 
   async function findInboxMessage(
@@ -3147,6 +3221,9 @@ export function createApiApp() {
   }
 
   async function handleInboundEmailWebhook(req: express.Request, res: express.Response) {
+    const attemptId = `att_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`;
+    const attemptTime = new Date().toISOString();
+
     const configuredSecret = getInboundEmailSecret();
     if (configuredSecret) {
       const provided = String(
@@ -3160,6 +3237,19 @@ export function createApiApp() {
 
       if (!provided || !safeSecretsEqual(provided, configuredSecret)) {
         console.warn('[VeriBox Inbound] Rejected request due to invalid or missing x-inbound-secret');
+        recordInboundAttempt({
+          id: attemptId,
+          timestamp: attemptTime,
+          status: 'rejected_secret',
+          httpStatus: 401,
+          recipients: [],
+          rawToPreview: '',
+          fromAddress: '',
+          subject: '(Blocked before body parse)',
+          otpDetected: null,
+          supabaseStored: false,
+          error: 'HTTP 401: Invalid or missing x-inbound-secret header',
+        });
         res.status(401).json({ error: 'Unauthorized inbound email webhook' });
         return;
       }
@@ -3224,15 +3314,29 @@ export function createApiApp() {
       rawHeaderValue('To'),
     ];
 
-    const rawRecipients = extractTargetRecipients(candidateRecipients).filter((addr) =>
+    const allExtractedTos = extractTargetRecipients(candidateRecipients);
+    const rawToPreview = allExtractedTos.slice(0, 3).join(', ') || String(payload.to || '').slice(0, 120);
+    const rawRecipients = allExtractedTos.filter((addr) =>
       addr.endsWith(`@${CUSTOM_EMAIL_DOMAIN}`)
     );
 
     if (rawRecipients.length === 0) {
-      console.warn('[VeriBox Inbound] Dropped webhook: no recipient matching @' + CUSTOM_EMAIL_DOMAIN);
-      res.status(400).json({
-        error: `No recipient matching @${CUSTOM_EMAIL_DOMAIN} found in payload`,
+      const msg = `No recipient matching @${CUSTOM_EMAIL_DOMAIN} found in payload (received to: ${rawToPreview || 'empty'})`;
+      console.warn('[VeriBox Inbound] Dropped webhook:', msg);
+      recordInboundAttempt({
+        id: attemptId,
+        timestamp: attemptTime,
+        status: 'unmatched_recipient',
+        httpStatus: 400,
+        recipients: [],
+        rawToPreview,
+        fromAddress: String(payload.from || envelopeObj?.from || '').slice(0, 120),
+        subject: String(payload.subject || '(No subject)').slice(0, 150),
+        otpDetected: null,
+        supabaseStored: false,
+        error: `HTTP 400: ${msg}`,
       });
+      res.status(400).json({ error: msg });
       return;
     }
 
@@ -3329,9 +3433,11 @@ export function createApiApp() {
     );
 
     const storedIds: string[] = [];
+    let allSupabaseStored = true;
+    let firstDbError: string | null = null;
     for (const recipient of recipients) {
       const msgId = `in_${Date.now().toString(36)}_${crypto.randomBytes(6).toString('hex')}`;
-      await saveInboxMessage({
+      const saveRes = await saveInboxMessage({
         id: msgId,
         recipientAddress: recipient,
         fromName,
@@ -3343,8 +3449,30 @@ export function createApiApp() {
         seen: false,
         createdAt,
       });
+      if (saveRes.supabaseAttempted && !saveRes.supabaseStored) {
+        allSupabaseStored = false;
+        if (!firstDbError) {
+          firstDbError = saveRes.errorCode
+            ? `${saveRes.errorCode}: ${saveRes.errorMessage || 'Supabase insert error'}`
+            : saveRes.errorMessage;
+        }
+      }
       storedIds.push(msgId);
     }
+
+    recordInboundAttempt({
+      id: attemptId,
+      timestamp: attemptTime,
+      status: firstDbError ? 'db_error' : 'stored',
+      httpStatus: firstDbError ? 502 : 200,
+      recipients,
+      rawToPreview,
+      fromAddress: parsedFrom.address,
+      subject,
+      otpDetected: otp,
+      supabaseStored: allSupabaseStored && !firstDbError,
+      error: firstDbError,
+    });
 
     res.status(200).json({
       received: true,
@@ -3352,6 +3480,8 @@ export function createApiApp() {
       recipients,
       messageIds: storedIds,
       otpDetected: otp,
+      supabaseStored: allSupabaseStored && !firstDbError,
+      supabaseError: firstDbError,
     });
   }
 
@@ -3471,7 +3601,22 @@ export function createApiApp() {
     }
 
     try {
-      const rows = await listInboxMessages(verifiedAddress);
+      const { rows, supabaseError, supabaseCode, supabaseStatus } =
+        await listInboxMessagesWithStatus(verifiedAddress);
+      if (supabaseError && rows.length === 0) {
+        const httpStatus =
+          supabaseCode === '42501'
+            ? 403
+            : supabaseCode === 'PGRST205'
+              ? 503
+              : supabaseStatus || 502;
+        res.status(httpStatus).json({
+          error: `Inbox query error (${supabaseCode || `HTTP ${httpStatus}`}): ${supabaseError}`,
+          code: supabaseCode,
+          messages: [],
+        });
+        return;
+      }
       const messages = rows.map((m) => ({
         id: m.id,
         fromName: m.fromName,
@@ -3482,13 +3627,290 @@ export function createApiApp() {
         createdAt: m.createdAt,
         otp: m.otp,
       }));
-      res.json({ messages });
+      res.json({
+        messages,
+        warning: supabaseError ? `${supabaseCode || 'DB_WARN'}: ${supabaseError}` : undefined,
+      });
     } catch (error) {
       res.status(502).json({
         error: error instanceof Error ? error.message : 'Failed to fetch emails',
         messages: [],
       });
     }
+  });
+
+  // ==========================================
+  // Owner-Only Admin Diagnostics (preciousddkid@gmail.com)
+  // ==========================================
+  async function verifyOwnerAdminRequest(
+    req: express.Request,
+    res: express.Response
+  ): Promise<{ email: string; supabase: SupabaseClient } | null> {
+    const authHeader = req.headers.authorization || '';
+    const jwt = authHeader.replace(/^Bearer\s+/i, '').trim();
+    if (!jwt) {
+      res.status(401).json({ error: 'Missing Supabase session token' });
+      return null;
+    }
+
+    const sb = getSupabaseServerClient();
+    if (!sb) {
+      res.status(503).json({ error: 'Supabase is not configured on the backend server' });
+      return null;
+    }
+
+    try {
+      const { data, error } = await sb.auth.getUser(jwt);
+      if (error || !data?.user) {
+        res.status(401).json({ error: error?.message || 'Invalid or expired Supabase session token' });
+        return null;
+      }
+      const userEmail = (data.user.email || '').trim().toLowerCase();
+      if (userEmail !== OWNER_ADMIN_EMAIL) {
+        res.status(403).json({ error: 'Forbidden: Owner admin access required' });
+        return null;
+      }
+      return { email: userEmail, supabase: sb };
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to verify admin token' });
+      return null;
+    }
+  }
+
+  app.get('/api/admin/diagnostics', async (req, res) => {
+    const verified = await verifyOwnerAdminRequest(req, res);
+    if (!verified) return;
+    const sb = verified.supabase;
+
+    const serviceRoleConfigured = Boolean(
+      (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY || '').trim()
+    );
+
+    const probeTable = async (
+      table: 'mailboxes' | 'mailbox_messages',
+      columns: string
+    ) => {
+      try {
+        const { data, error, status, count } = await sb
+          .from(table)
+          .select(columns, { count: 'exact' })
+          .order('created_at', { ascending: false })
+          .limit(30);
+        return {
+          ok: !error,
+          httpStatus: typeof status === 'number' ? status : error ? 500 : 200,
+          rowCount: typeof count === 'number' ? count : Array.isArray(data) ? data.length : null,
+          errorCode: error?.code || null,
+          errorMessage: error?.message || null,
+          errorHint: error?.hint || null,
+          rows: Array.isArray(data) ? data : [],
+        };
+      } catch (err) {
+        return {
+          ok: false,
+          httpStatus: 500,
+          rowCount: null,
+          errorCode: 'EXCEPTION',
+          errorMessage: err instanceof Error ? err.message : 'Table probe threw exception',
+          errorHint: null,
+          rows: [],
+        };
+      }
+    };
+
+    const [mailboxesProbe, messagesProbe] = await Promise.all([
+      probeTable('mailboxes', 'address, username, domain, account_mode, created_at, is_deleted'),
+      probeTable(
+        'mailbox_messages',
+        'id, recipient_address, from_name, from_address, subject, otp, seen, created_at'
+      ),
+    ]);
+
+    const latestMessagesFromDb = (
+      messagesProbe.rows as unknown as Array<Record<string, unknown>>
+    ).map((row) => ({
+      id: String(row.id || ''),
+      recipientAddress: String(row.recipient_address || ''),
+      fromName: String(row.from_name || ''),
+      fromAddress: String(row.from_address || ''),
+      subject: String(row.subject || '(No subject)'),
+      otp: row.otp ? String(row.otp) : null,
+      seen: Boolean(row.seen),
+      createdAt: String(row.created_at || ''),
+    }));
+
+    const memMessages = Array.from(mailboxMessagesMap.values())
+      .flat()
+      .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
+      .slice(0, 30)
+      .map((m) => ({
+        id: m.id,
+        recipientAddress: m.recipientAddress,
+        fromName: m.fromName,
+        fromAddress: m.fromAddress,
+        subject: m.subject,
+        otp: m.otp,
+        seen: m.seen,
+        createdAt: m.createdAt,
+      }));
+
+    const latestMailboxesFromDb = (
+      mailboxesProbe.rows as unknown as Array<Record<string, unknown>>
+    ).map((row) => ({
+        address: String(row.address || ''),
+        username: String(row.username || ''),
+        domain: String(row.domain || CUSTOM_EMAIL_DOMAIN),
+        accountMode: String(row.account_mode || 'personal'),
+        createdAt: String(row.created_at || ''),
+        isDeleted: Boolean(row.is_deleted),
+      })
+    );
+
+    const memMailboxes = Array.from(mailboxRegistry.values())
+      .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
+      .slice(0, 20)
+      .map((m) => ({
+        address: m.address,
+        username: m.username,
+        domain: m.domain,
+        accountMode: m.accountMode || 'personal',
+        createdAt: m.createdAt,
+        isDeleted: m.isDeleted,
+      }));
+
+    res.json({
+      checkedAt: new Date().toISOString(),
+      ownerEmail: verified.email,
+      environment: {
+        emailDomain: CUSTOM_EMAIL_DOMAIN,
+        inboundSecretConfigured: Boolean(getInboundEmailSecret()),
+        supabaseConfigured: Boolean(getSupabaseServerConfig().url),
+        supabaseServiceRoleConfigured: serviceRoleConfigured,
+      },
+      probes: {
+        mailboxes: {
+          ok: mailboxesProbe.ok,
+          httpStatus: mailboxesProbe.httpStatus,
+          rowCount: mailboxesProbe.rowCount,
+          errorCode: mailboxesProbe.errorCode,
+          errorMessage: mailboxesProbe.errorMessage,
+          errorHint: mailboxesProbe.errorHint,
+        },
+        mailboxMessages: {
+          ok: messagesProbe.ok,
+          httpStatus: messagesProbe.httpStatus,
+          rowCount: messagesProbe.rowCount,
+          errorCode: messagesProbe.errorCode,
+          errorMessage: messagesProbe.errorMessage,
+          errorHint: messagesProbe.errorHint,
+        },
+      },
+      recentInboundAttempts: inboundAttemptLogs,
+      latestMessages: latestMessagesFromDb.length > 0 ? latestMessagesFromDb : memMessages,
+      latestMailboxes: latestMailboxesFromDb.length > 0 ? latestMailboxesFromDb : memMailboxes,
+    });
+  });
+
+  app.post('/api/admin/test-inbound', async (req, res) => {
+    const verified = await verifyOwnerAdminRequest(req, res);
+    if (!verified) return;
+
+    const rawTarget =
+      typeof req.body?.recipientAddress === 'string'
+        ? req.body.recipientAddress
+        : typeof req.body?.targetAddress === 'string'
+          ? req.body.targetAddress
+          : '';
+    const requestedAddr = rawTarget.trim().toLowerCase();
+    const targetAddress = requestedAddr.endsWith(`@${CUSTOM_EMAIL_DOMAIN}`)
+      ? requestedAddr
+      : `diag.test@${CUSTOM_EMAIL_DOMAIN}`;
+
+    const testCode = String(Math.floor(100000 + Math.random() * 899999));
+    const startedAt = Date.now();
+    const secret = getInboundEmailSecret();
+
+    let httpStatus = 500;
+    let mockStatusCode = 200;
+    let responseBody: unknown = null;
+
+    const mockReq = {
+      params: {},
+      headers: {
+        'content-type': 'application/json',
+        ...(secret ? { 'x-inbound-secret': secret } : {}),
+      },
+      query: {},
+      body: {
+        to: targetAddress,
+        from: `VeriBox Diagnostic <diag@${CUSTOM_EMAIL_DOMAIN}>`,
+        subject: `Pipeline Test Code ${testCode}`,
+        text: `Your VeriBox inbound pipeline diagnostic code is ${testCode}.`,
+        html: `<p>Your VeriBox inbound pipeline diagnostic code is <strong>${testCode}</strong>.</p>`,
+      },
+    } as unknown as express.Request;
+
+    const mockResObj = {
+      status(code: number) {
+        mockStatusCode = code;
+        httpStatus = code;
+        return mockResObj;
+      },
+      json(data: unknown) {
+        responseBody = data;
+        return mockResObj;
+      },
+    };
+    const mockRes = mockResObj as unknown as express.Response;
+
+    await handleInboundEmailWebhook(mockReq, mockRes);
+    if (httpStatus === 500 && responseBody) {
+      httpStatus = mockStatusCode || 200;
+    }
+
+    const parsedResp = (responseBody && typeof responseBody === 'object'
+      ? responseBody
+      : {}) as {
+      messageIds?: string[];
+      otpDetected?: string | null;
+      supabaseStored?: boolean;
+      supabaseError?: string | null;
+    };
+
+    const insertedId = Array.isArray(parsedResp.messageIds) ? parsedResp.messageIds[0] : null;
+    let supabaseReadbackOk = false;
+    let readbackError: string | null = parsedResp.supabaseError || null;
+
+    if (insertedId) {
+      try {
+        const { data, error } = await verified.supabase
+          .from('mailbox_messages')
+          .select('id, otp, recipient_address')
+          .eq('id', insertedId)
+          .maybeSingle();
+        if (error) {
+          readbackError = `${error.code || 'READBACK_ERR'}: ${error.message}`;
+        } else if (data?.id === insertedId) {
+          supabaseReadbackOk = true;
+        } else if (!readbackError) {
+          readbackError = 'Inserted row not returned during Supabase readback (check RLS policies or SUPABASE_SERVICE_ROLE_KEY)';
+        }
+      } catch (err) {
+        readbackError = err instanceof Error ? err.message : 'Readback failed';
+      }
+    }
+
+    res.json({
+      testedAt: new Date().toISOString(),
+      targetAddress,
+      httpStatus,
+      latencyMs: Date.now() - startedAt,
+      responseBody,
+      supabaseWriteOk: Boolean(parsedResp.supabaseStored),
+      supabaseReadbackOk,
+      supabaseError: readbackError,
+      otpDetected: parsedResp.otpDetected || null,
+    });
   });
 
   app.get('/api/email/messages/:id', async (req, res) => {

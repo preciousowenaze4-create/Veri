@@ -1,7 +1,10 @@
-import { ArrowRight, Menu, Plus, User as UserIcon } from 'lucide-react';
+import { ArrowRight, Menu, Plus, ShieldCheck, User as UserIcon } from 'lucide-react';
+import type { TabId } from '../types';
 
 interface TopBarProps {
   isAuthenticated: boolean;
+  isOwnerAdmin?: boolean;
+  activeTab?: TabId;
   userEmail?: string | null;
   userName?: string | null;
   avatarUrl?: string | null;
@@ -10,10 +13,13 @@ interface TopBarProps {
   onOpenDeposit: () => void;
   onOpenProfile: () => void;
   onOpenAuth: () => void;
+  onToggleAdmin?: () => void;
 }
 
 export function TopBar({
   isAuthenticated,
+  isOwnerAdmin = false,
+  activeTab,
   userEmail,
   userName,
   avatarUrl,
@@ -22,6 +28,7 @@ export function TopBar({
   onOpenDeposit,
   onOpenProfile,
   onOpenAuth,
+  onToggleAdmin,
 }: TopBarProps) {
   const displayBalance =
     walletBalance === 0 ? '00' : walletBalance.toLocaleString('en-US');
@@ -68,6 +75,28 @@ export function TopBar({
           </button>
         ) : (
           <div className="flex items-center gap-2 shrink-0">
+            {isOwnerAdmin && onToggleAdmin && (
+              <button
+                type="button"
+                onClick={onToggleAdmin}
+                title={
+                  activeTab === 'admin'
+                    ? 'Switch to User Dashboard'
+                    : 'Open Owner Admin Diagnostics'
+                }
+                className={`inline-flex min-h-[38px] items-center gap-1.5 rounded-xl border px-2.5 py-1.5 text-xs font-extrabold transition-colors cursor-pointer ${
+                  activeTab === 'admin'
+                    ? 'border-[#D4AF37] bg-[#D4AF37] text-[#0A0906]'
+                    : 'border-[#D4AF37]/45 bg-[#D4AF37]/15 text-[#8A6208] hover:bg-[#D4AF37]/25 dark:text-[#F5D77A]'
+                }`}
+              >
+                <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
+                <span className="hidden xs:inline sm:inline">
+                  {activeTab === 'admin' ? 'User View' : 'Admin'}
+                </span>
+              </button>
+            )}
+
             <button
               type="button"
               onClick={onOpenDeposit}

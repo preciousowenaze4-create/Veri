@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { User as SupabaseUser } from '@supabase/supabase-js';
 import { WifiOff } from 'lucide-react';
+import { AdminDiagnosticsTab } from './components/AdminDiagnosticsTab';
 import { AuthModal } from './components/AuthModal';
 import { BottomNav } from './components/BottomNav';
 import { CornerDrawer } from './components/CornerDrawer';
@@ -13,6 +14,8 @@ import { SmsTab } from './components/SmsTab';
 import { TopBar } from './components/TopBar';
 import { useOnlineStatus } from './hooks/usePWAInstall';
 import type {
+  AdminDiagnosticsResponse,
+  AdminInboundTestResult,
   CopiedOtpRecord,
   EmailMessageDetail,
   EmailMessageSummary,
@@ -50,6 +53,7 @@ const STORAGE_KEYS = {
 };
 
 const FREE_DAILY_EMAIL_LIMIT = 5;
+const OWNER_ADMIN_EMAIL = 'preciousddkid@gmail.com';
 
 function getLocalDateKey(): string {
   const now = new Date();
@@ -170,11 +174,22 @@ export default function App() {
 
   const [guestWalletId] = useState<string>(() => getOrCreateWalletUserId());
   const isAuthenticated = Boolean(authUser);
+  const isOwnerAdmin =
+    (authUser?.email || '').trim().toLowerCase() === OWNER_ADMIN_EMAIL;
   const walletUserId = authUser?.id || guestWalletId;
   const [walletBalance, setWalletBalance] = useState<number>(() =>
     readStorage<number>(STORAGE_KEYS.walletBalance, 0)
   );
   const [depositModalOpen, setDepositModalOpen] = useState<boolean>(false);
+
+  // Owner Admin Diagnostics state (only active when signed in as preciousddkid@gmail.com)
+  const [adminDiagnostics, setAdminDiagnostics] = useState<AdminDiagnosticsResponse | null>(null);
+  const [adminLoading, setAdminLoading] = useState<boolean>(false);
+  const [adminError, setAdminError] = useState<string | null>(null);
+  const [testingInbound, setTestingInbound] = useState<boolean>(false);
+  const [adminTestResult, setAdminTestResult] = useState<AdminInboundTestResult | null>(null);
+  const [adminTestError, setAdminTestError] = useState<string | null>(null);
+  const autoSwitchedAdminUserIdRef = useRef<string | null>(null);
 
   // Private Numbers Flow state (Setup -> Active Receiver -> History)
   const [services, setServices] = useState<NumberServiceOption[]>(DEFAULT_SERVICES);
@@ -317,14 +332,127 @@ export default function App() {
     [authUser, openAuthModal]
   );
 
+  const getAuthAccessToken = useCallback(async (): Promise<string | null> => {
+    const client = getActiveSupabaseClient() || (await ensureSupabaseClient());
+    if (!client) return null;
+    try {
+      const { data } = await client.auth.getSession();
+      return data.session?.access_token || null;
+    } catch {
+      return null;
+    }
+  }, []);
+
+  const fetchAdminDiagnostics = useCallback(async () => {
+    if (!isOwnerAdmin) return;
+    setAdminLoading(true);
+    setAdminError(null);
+    try {
+      const token = await getAuthAccessToken();
+      if (!token) {
+        throw new Error('HTTP 401: Missing active Supabase session token for admin diagnostics.');
+      }
+      const res = await fetch('/api/admin/diagnostics', {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+        signal: AbortSignal.timeout(10000),
+      });
+      const data = await parseJsonResponse<AdminDiagnosticsResponse & { error?: string }>(res);
+      if (!res.ok) {
+        throw new Error(
+          `HTTP ${res.status}: ${data.error || res.statusText || 'Failed to load diagnostics'}`
+        );
+      }
+      setAdminDiagnostics(data);
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.name === 'TimeoutError' || err.name === 'AbortError'
+            ? 'Request timed out while loading admin diagnostics'
+            : err.message
+          : 'Failed to load admin diagnostics';
+      setAdminError(message);
+    } finally {
+      setAdminLoading(false);
+    }
+  }, [isOwnerAdmin, getAuthAccessToken]);
+
+  const handleTestInboundPipeline = useCallback(
+    async (targetAddress: string) => {
+      if (!isOwnerAdmin) return;
+      setTestingInbound(true);
+      setAdminTestError(null);
+      try {
+        const token = await getAuthAccessToken();
+        if (!token) {
+          throw new Error('HTTP 401: Missing active Supabase session token.');
+        }
+        const res = await fetch('/api/admin/test-inbound', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ targetAddress }),
+          signal: AbortSignal.timeout(12000),
+        });
+        const data = await parseJsonResponse<AdminInboundTestResult & { error?: string }>(res);
+        if (!res.ok && typeof data.httpStatus !== 'number') {
+          throw new Error(
+            `HTTP ${res.status}: ${data.error || res.statusText || 'Inbound test request failed'}`
+          );
+        }
+        setAdminTestResult(data);
+        void fetchAdminDiagnostics();
+      } catch (err) {
+        const message =
+          err instanceof Error
+            ? err.name === 'TimeoutError' || err.name === 'AbortError'
+              ? 'Request timed out while testing inbound pipeline'
+              : err.message
+            : 'Inbound pipeline test failed';
+        setAdminTestError(message);
+      } finally {
+        setTestingInbound(false);
+      }
+    },
+    [isOwnerAdmin, getAuthAccessToken, fetchAdminDiagnostics]
+  );
+
+  // Auto-switch owner account (preciousddkid@gmail.com) to Owner Admin Diagnostics on sign-in,
+  // and immediately lock out non-owner accounts if activeTab was ever 'admin'.
+  useEffect(() => {
+    if (isOwnerAdmin && authUser?.id) {
+      if (autoSwitchedAdminUserIdRef.current !== authUser.id) {
+        autoSwitchedAdminUserIdRef.current = authUser.id;
+        setActiveTab('admin');
+        void fetchAdminDiagnostics();
+      }
+    } else {
+      autoSwitchedAdminUserIdRef.current = null;
+      setAdminDiagnostics(null);
+      setAdminError(null);
+      setAdminTestResult(null);
+      setAdminTestError(null);
+      setActiveTab((prev) => (prev === 'admin' ? 'home' : prev));
+    }
+  }, [isOwnerAdmin, authUser?.id, fetchAdminDiagnostics]);
+
   const handleSignOut = useCallback(async () => {
     const client = getActiveSupabaseClient() || (await ensureSupabaseClient());
     if (client) {
       await client.auth.signOut().catch(() => undefined);
     }
     pendingAuthActionRef.current = null;
+    autoSwitchedAdminUserIdRef.current = null;
     setAuthUser(null);
     setWalletBalance(0);
+    setAdminDiagnostics(null);
+    setAdminError(null);
+    setAdminTestResult(null);
+    setAdminTestError(null);
+    setActiveTab((prev) => (prev === 'admin' ? 'home' : prev));
     setAuthModalOpen(false);
     setAuthActionReason(null);
     showToast('Signed out');
@@ -1177,16 +1305,28 @@ export default function App() {
           signal: AbortSignal.timeout(8000),
         });
 
-        const data = await parseJsonResponse<{ messages?: EmailMessageSummary[]; error?: string }>(res);
+        const data = await parseJsonResponse<{
+          messages?: EmailMessageSummary[];
+          error?: string;
+          warning?: string;
+          code?: string;
+        }>(res);
         if (!res.ok) {
-          throw new Error(data.error || 'Failed to read email inbox');
+          const codeSuffix = data.code ? ` [${data.code}]` : '';
+          throw new Error(
+            `HTTP ${res.status}${codeSuffix}: ${data.error || res.statusText || 'Failed to read email inbox'}`
+          );
         }
         applyInboxSnapshot(target.address, data.messages || [], silent);
-        setEmailError(null);
+        setEmailError(data.warning ? `Sync warning: ${data.warning}` : null);
       } catch (err) {
-        if (!silent) {
-          setEmailError(err instanceof Error ? err.message : 'Failed to load emails');
-        }
+        const message =
+          err instanceof Error
+            ? err.name === 'TimeoutError' || err.name === 'AbortError'
+              ? 'Request timed out while checking email inbox (8s timeout)'
+              : err.message
+            : 'Failed to load emails';
+        setEmailError(message);
       } finally {
         if (!silent) {
           setLoadingEmailMessages(false);
@@ -1264,13 +1404,21 @@ export default function App() {
         });
         const data = await parseJsonResponse<EmailMessageDetail & { error?: string }>(res);
         if (!res.ok || !data.id) {
-          throw new Error(data.error || 'Could not load email');
+          throw new Error(`HTTP ${res.status}: ${data.error || res.statusText || 'Could not load email'}`);
         }
 
         setSelectedEmailDetail(data);
         setEmailMessages((prev) => prev.map((m) => (m.id === id ? { ...m, seen: true } : m)));
+        setEmailError(null);
       } catch (err) {
-        showToast(err instanceof Error ? err.message : 'Failed to open email');
+        const msg =
+          err instanceof Error
+            ? err.name === 'TimeoutError' || err.name === 'AbortError'
+              ? 'Request timed out while opening email'
+              : err.message
+            : 'Failed to open email';
+        setEmailError(msg);
+        showToast(msg);
       } finally {
         setLoadingEmailDetail(false);
       }
@@ -1476,6 +1624,8 @@ export default function App() {
     <div className="min-h-dvh w-full bg-[#FAF7F0] text-[#1A160D] dark:bg-[#0A0906] dark:text-[#FAF6EC]">
       <TopBar
         isAuthenticated={isAuthenticated}
+        isOwnerAdmin={isOwnerAdmin}
+        activeTab={activeTab}
         userEmail={authUser?.email ?? null}
         userName={
           (authUser?.user_metadata?.full_name as string | undefined) ||
@@ -1490,11 +1640,21 @@ export default function App() {
         }
         onOpenProfile={() => setActiveTab('profile')}
         onOpenAuth={() => openAuthModal()}
+        onToggleAdmin={() => {
+          if (!isOwnerAdmin) return;
+          if (activeTab === 'admin') {
+            setActiveTab('home');
+          } else {
+            setActiveTab('admin');
+            void fetchAdminDiagnostics();
+          }
+        }}
       />
 
       <CornerDrawer
         open={drawerOpen}
         isAuthenticated={isAuthenticated}
+        isOwnerAdmin={isOwnerAdmin}
         userEmail={authUser?.email ?? null}
         userName={
           (authUser?.user_metadata?.full_name as string | undefined) ||
@@ -1506,7 +1666,15 @@ export default function App() {
         walletBalance={walletBalance}
         isDark={isDark}
         onClose={() => setDrawerOpen(false)}
-        onNavigate={(tab) => setActiveTab(tab)}
+        onNavigate={(tab) => {
+          if (tab === 'admin') {
+            if (!isOwnerAdmin) return;
+            setActiveTab('admin');
+            void fetchAdminDiagnostics();
+            return;
+          }
+          setActiveTab(tab);
+        }}
         onSelectPlatform={(p) =>
           requireAuth('Sign in to get a dedicated phone number', () =>
             handlePickPlatformFromDrawer(p)
@@ -1539,7 +1707,12 @@ export default function App() {
           showToast(msg);
           const pending = pendingAuthActionRef.current;
           pendingAuthActionRef.current = null;
-          pending?.();
+          if (pending) {
+            if ((user.email || '').trim().toLowerCase() === OWNER_ADMIN_EMAIL) {
+              autoSwitchedAdminUserIdRef.current = user.id;
+            }
+            pending();
+          }
         }}
       />
 
@@ -1817,6 +1990,23 @@ export default function App() {
             onCopyText={(val, label) => void handleCopyText(val, label)}
             onOpenAuth={() => openAuthModal()}
             onSignOut={() => void handleSignOut()}
+          />
+        )}
+
+        {isOwnerAdmin && activeTab === 'admin' && (
+          <AdminDiagnosticsTab
+            ownerEmail={authUser?.email || OWNER_ADMIN_EMAIL}
+            emailDomain={emailDomain}
+            activeEmailAddress={activeEmail?.address ?? null}
+            diagnostics={adminDiagnostics}
+            loading={adminLoading}
+            error={adminError}
+            testingInbound={testingInbound}
+            testResult={adminTestResult}
+            testError={adminTestError}
+            onRefresh={() => void fetchAdminDiagnostics()}
+            onTestInbound={(addr) => void handleTestInboundPipeline(addr)}
+            onSwitchToUserView={() => setActiveTab('home')}
           />
         )}
       </main>

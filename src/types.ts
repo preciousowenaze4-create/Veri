@@ -1,4 +1,4 @@
-export type TabId = 'home' | 'create' | 'numbers' | 'images' | 'profile';
+export type TabId = 'home' | 'create' | 'numbers' | 'images' | 'profile' | 'admin';
 
 export type PlatformFilter =
   | 'all'
@@ -189,5 +189,75 @@ export interface GeneratedImageItem {
   createdAt: string;
 }
 
+export interface AdminTableProbe {
+  ok: boolean;
+  httpStatus: number | null;
+  rowCount: number | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+  errorHint: string | null;
+}
 
+export interface AdminInboundAttempt {
+  id: string;
+  timestamp: string;
+  status: 'stored' | 'rejected_secret' | 'unmatched_recipient' | 'db_error' | 'invalid_payload';
+  httpStatus: number;
+  recipients: string[];
+  rawToPreview: string;
+  fromAddress: string;
+  subject: string;
+  otpDetected: string | null;
+  supabaseStored: boolean;
+  error: string | null;
+}
 
+export interface AdminInboundMessageRow {
+  id: string;
+  recipientAddress: string;
+  fromName: string;
+  fromAddress: string;
+  subject: string;
+  otp: string | null;
+  seen: boolean;
+  createdAt: string;
+}
+
+export interface AdminMailboxRow {
+  address: string;
+  username: string;
+  domain: string;
+  accountMode: string;
+  createdAt: string;
+  isDeleted: boolean;
+}
+
+export interface AdminDiagnosticsResponse {
+  checkedAt: string;
+  ownerEmail: string;
+  environment: {
+    emailDomain: string;
+    inboundSecretConfigured: boolean;
+    supabaseConfigured: boolean;
+    supabaseServiceRoleConfigured: boolean;
+  };
+  probes: {
+    mailboxes: AdminTableProbe;
+    mailboxMessages: AdminTableProbe;
+  };
+  recentInboundAttempts: AdminInboundAttempt[];
+  latestMessages: AdminInboundMessageRow[];
+  latestMailboxes: AdminMailboxRow[];
+}
+
+export interface AdminInboundTestResult {
+  testedAt: string;
+  targetAddress: string;
+  httpStatus: number;
+  latencyMs: number;
+  responseBody: unknown;
+  supabaseWriteOk: boolean;
+  supabaseReadbackOk: boolean;
+  supabaseError: string | null;
+  otpDetected: string | null;
+}

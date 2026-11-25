@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import {
+  AlertTriangle,
   ArrowLeft,
   Check,
   ChevronDown,
@@ -484,8 +485,26 @@ export function HomeEmailTab({
             </div>
 
             {emailError && (
-              <div className="mt-4 rounded-xl border border-rose-500/30 bg-rose-500/10 p-3.5 text-xs text-rose-700 dark:text-rose-200">
-                {emailError}
+              <div
+                role="alert"
+                className="mt-4 flex flex-wrap items-start justify-between gap-3 rounded-xl border border-rose-500/40 bg-rose-500/10 p-3.5 text-xs text-rose-700 dark:text-rose-200"
+              >
+                <div className="flex min-w-0 flex-1 items-start gap-2.5">
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-rose-500" />
+                  <div className="min-w-0">
+                    <p className="font-extrabold">Could not load inbox emails</p>
+                    <p className="mt-0.5 font-mono text-[11px] break-words">{emailError}</p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={onRefreshInbox}
+                  disabled={loadingMessages || !activeEmail}
+                  className="inline-flex min-h-[34px] shrink-0 items-center gap-1.5 rounded-lg bg-rose-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-rose-500 disabled:opacity-50 cursor-pointer"
+                >
+                  <RefreshCw className={`h-3.5 w-3.5 ${loadingMessages ? 'animate-spin' : ''}`} />
+                  <span>Retry</span>
+                </button>
               </div>
             )}
 
@@ -498,6 +517,12 @@ export function HomeEmailTab({
                       className="h-20 rounded-xl border border-[#D4AF37]/15 bg-[#FAF7F0] dark:bg-[#0B0A07]"
                     />
                   ))}
+                </div>
+              ) : messages.length === 0 && emailError ? (
+                <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-rose-500/30 py-8 text-center px-4">
+                  <p className="text-xs font-semibold text-[#6E6552] dark:text-[#A89F8C]">
+                    Inbox sync paused due to the error above. Tap <strong>Retry</strong> to check again.
+                  </p>
                 </div>
               ) : messages.length === 0 ? (
                 <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-[#D4AF37]/30 py-12 text-center px-4">

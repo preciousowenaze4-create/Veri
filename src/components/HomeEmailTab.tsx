@@ -28,6 +28,7 @@ interface HomeEmailTabProps {
   loadingDetail: boolean;
   generatingEmail?: boolean;
   emailStreamConnected?: boolean;
+  lastCheckedAt?: string | null;
   dailyGenerateUsed?: number;
   dailyGenerateLimit?: number;
   emailError: string | null;
@@ -66,6 +67,7 @@ export function HomeEmailTab({
   loadingDetail,
   generatingEmail = false,
   emailStreamConnected = false,
+  lastCheckedAt = null,
   dailyGenerateUsed = 0,
   dailyGenerateLimit = 5,
   emailError,
@@ -484,8 +486,24 @@ export function HomeEmailTab({
                 <p className="mt-0.5 text-xs text-[#6E6552] tabular-nums dark:text-[#A89F8C]">
                   {activeEmail
                     ? autoRefresh
-                      ? `Live sync active · Checking every ${countdown}s · Tap code to copy`
-                      : 'Tap Check Mail to pull new codes'
+                      ? `Live sync (${countdown}s) · Last checked ${
+                          lastCheckedAt
+                            ? new Date(lastCheckedAt).toLocaleTimeString([], {
+                                hour: '2-digit',
+                                minute: '2-digit',
+                                second: '2-digit',
+                              })
+                            : 'just now'
+                        }`
+                      : `Tap Refresh to pull new codes${
+                          lastCheckedAt
+                            ? ` · Last checked ${new Date(lastCheckedAt).toLocaleTimeString([], {
+                                hour: '2-digit',
+                                minute: '2-digit',
+                                second: '2-digit',
+                              })}`
+                            : ''
+                        }`
                     : `Generate or create an @${emailDomain} email to receive verification codes`}
                 </p>
               </div>
@@ -494,10 +512,10 @@ export function HomeEmailTab({
                 type="button"
                 onClick={onRefreshInbox}
                 disabled={loadingMessages || !activeEmail}
-                className="inline-flex min-h-[38px] items-center gap-2 rounded-xl bg-[#D4AF37]/15 px-3.5 py-1.5 text-xs font-bold text-[#8A6208] transition-colors hover:bg-[#D4AF37]/25 disabled:opacity-50 whitespace-nowrap shrink-0 dark:text-[#F5D77A]"
+                className="inline-flex min-h-[38px] items-center gap-2 rounded-xl bg-[#D4AF37]/15 px-3.5 py-1.5 text-xs font-bold text-[#8A6208] transition-colors hover:bg-[#D4AF37]/25 disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer dark:text-[#F5D77A]"
               >
                 <RefreshCw className={`h-3.5 w-3.5 ${loadingMessages ? 'animate-spin' : ''}`} />
-                <span>Check Mail</span>
+                <span>Refresh</span>
               </button>
             </div>
 

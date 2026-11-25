@@ -210,6 +210,25 @@ export interface AdminInboundAttempt {
   otpDetected: string | null;
   supabaseStored: boolean;
   error: string | null;
+  totalMs?: number | null;
+  dbInsertMs?: number | null;
+  parseMs?: number | null;
+  matchedMailbox?: boolean | null;
+  receivedAt?: string | null;
+  storedAt?: string | null;
+  deliveryGapMs?: number | null;
+}
+
+export interface AdminTimingSummary {
+  latestTotalMs: number | null;
+  latestDbInsertMs: number | null;
+  latestParseMs: number | null;
+  latestDeliveryGapMs: number | null;
+  latestReceivedAt: string | null;
+  latestStoredAt: string | null;
+  latestMatchedMailbox: boolean | null;
+  avgTotalMs: number | null;
+  avgDbInsertMs: number | null;
 }
 
 export interface AdminInboundMessageRow {
@@ -268,6 +287,7 @@ export interface AdminDiagnosticsResponse {
   dnsCheck?: AdminDnsCheck;
   domainConnection?: AdminDomainConnectionCheck;
   connectionErrors?: string[];
+  timingSummary?: AdminTimingSummary;
   probes: {
     mailboxes: AdminTableProbe;
     mailboxMessages: AdminTableProbe;

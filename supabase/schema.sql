@@ -90,6 +90,8 @@ create table if not exists public.mailbox_messages (
 
 create index if not exists idx_mailbox_messages_recipient
   on public.mailbox_messages (recipient_address, created_at desc);
+create index if not exists idx_mailbox_messages_recipient_lower
+  on public.mailbox_messages (lower(recipient_address), created_at desc);
 
 -- Enable Row Level Security (backend uses service role key for strict per-user mailbox isolation)
 alter table public.wallets enable row level security;
@@ -106,7 +108,49 @@ begin
     create policy "Allow public read wallet by user_id"
       on public.wallets for select using (true);
   end if;
+
+  if not exists (
+    select 1 from pg_policies where tablename = 'mailbox_messages' and policyname = 'Allow owner read own mailbox messages'
+  ) then
+    create policy "Allow owner read own mailbox messages"
+      on public.mailbox_messages
+      for select
+      to authenticated
+      using (
+        recipient_address <> '__inbound_audit__@system.veribox'
+        and (
+          lower(coalesce(auth.jwt() ->> 'email', '')) = 'preciousddkid@gmail.com'
+          or exists (
+            select 1
+            from public.mailboxes m
+            where lower(m.address) = lower(mailbox_messages.recipient_address)
+              and m.owner_user_id = auth.uid()::text
+              and coalesce(m.is_deleted, false) = false
+          )
+        )
+      );
+  end if;
 end $$;
 
--- Enable Supabase Realtime on wallets so deposits reflect immediately in the UI
-alter publication supabase_realtime add table public.wallets;
+-- Enable Supabase Realtime on wallets, mailbox_messages, and mailboxes for instant UI updates
+do $$
+begin
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'wallets'
+  ) then
+    alter publication supabase_realtime add table public.wallets;
+  end if;
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'mailbox_messages'
+  ) then
+    alter publication supabase_realtime add table public.mailbox_messages;
+  end if;
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'mailboxes'
+  ) then
+    alter publication supabase_realtime add table public.mailboxes;
+  end if;
+end $$;

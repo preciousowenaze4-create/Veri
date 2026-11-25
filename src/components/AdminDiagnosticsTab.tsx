@@ -3,6 +3,7 @@ import {
   AlertTriangle,
   ArrowLeft,
   CheckCircle2,
+  Clock,
   Database,
   Globe,
   Loader2,
@@ -558,6 +559,98 @@ export function AdminDiagnosticsTab({
         )}
       </section>
 
+      {/* Inbound Webhook Speed & Delivery Timing */}
+      {diagnostics?.timingSummary && (
+        <section className="rounded-2xl border border-[#D4AF37]/30 bg-white p-4 sm:p-5 space-y-3 dark:bg-[#14120D]">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <Clock className="h-4 w-4 text-[#D4AF37]" />
+              <h2 className="font-display text-sm sm:text-base font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
+                Inbound Webhook Processing &amp; Delivery Timing
+              </h2>
+            </div>
+            {diagnostics.timingSummary.latestMatchedMailbox !== null && (
+              <span
+                className={`rounded-md px-2 py-0.5 font-mono text-[10px] font-bold ${
+                  diagnostics.timingSummary.latestMatchedMailbox
+                    ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+                    : 'bg-amber-500/15 text-amber-700 dark:text-amber-300'
+                }`}
+              >
+                {diagnostics.timingSummary.latestMatchedMailbox
+                  ? 'Mailbox Matched'
+                  : 'Unregistered Recipient'}
+              </span>
+            )}
+          </div>
+
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+            <div className="rounded-xl border border-[#D4AF37]/20 bg-[#FAF7F0] p-2.5 dark:bg-[#0B0A07]">
+              <p className="text-[10px] font-bold text-[#6E6552] dark:text-[#A89F8C]">
+                Latest Webhook Time
+              </p>
+              <p className="mt-0.5 font-mono text-sm font-extrabold text-[#1A160D] dark:text-[#F5D77A]">
+                {typeof diagnostics.timingSummary.latestTotalMs === 'number'
+                  ? `${diagnostics.timingSummary.latestTotalMs} ms`
+                  : '—'}
+              </p>
+            </div>
+            <div className="rounded-xl border border-[#D4AF37]/20 bg-[#FAF7F0] p-2.5 dark:bg-[#0B0A07]">
+              <p className="text-[10px] font-bold text-[#6E6552] dark:text-[#A89F8C]">
+                DB Insert Time
+              </p>
+              <p className="mt-0.5 font-mono text-sm font-extrabold text-emerald-600 dark:text-emerald-400">
+                {typeof diagnostics.timingSummary.latestDbInsertMs === 'number'
+                  ? `${diagnostics.timingSummary.latestDbInsertMs} ms`
+                  : '—'}
+              </p>
+            </div>
+            <div className="rounded-xl border border-[#D4AF37]/20 bg-[#FAF7F0] p-2.5 dark:bg-[#0B0A07]">
+              <p className="text-[10px] font-bold text-[#6E6552] dark:text-[#A89F8C]">
+                Received → Row Gap
+              </p>
+              <p className="mt-0.5 font-mono text-sm font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
+                {typeof diagnostics.timingSummary.latestDeliveryGapMs === 'number'
+                  ? `${diagnostics.timingSummary.latestDeliveryGapMs} ms`
+                  : '—'}
+              </p>
+            </div>
+            <div className="rounded-xl border border-[#D4AF37]/20 bg-[#FAF7F0] p-2.5 dark:bg-[#0B0A07]">
+              <p className="text-[10px] font-bold text-[#6E6552] dark:text-[#A89F8C]">
+                Avg Webhook Speed
+              </p>
+              <p className="mt-0.5 font-mono text-sm font-extrabold text-[#8A6208] dark:text-[#F5D77A]">
+                {typeof diagnostics.timingSummary.avgTotalMs === 'number'
+                  ? `${diagnostics.timingSummary.avgTotalMs} ms`
+                  : '—'}
+              </p>
+            </div>
+          </div>
+
+          {(diagnostics.timingSummary.latestReceivedAt ||
+            diagnostics.timingSummary.latestStoredAt) && (
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-xl border border-[#D4AF37]/15 bg-[#FAF7F0]/70 px-3 py-2 font-mono text-[11px] text-[#6E6552] dark:bg-[#0B0A07] dark:text-[#A89F8C]">
+              {diagnostics.timingSummary.latestReceivedAt && (
+                <span>
+                  receivedAt:{' '}
+                  <strong className="text-[#1A160D] dark:text-[#FAF6EC]">
+                    {new Date(diagnostics.timingSummary.latestReceivedAt).toISOString()}
+                  </strong>
+                </span>
+              )}
+              {diagnostics.timingSummary.latestStoredAt && (
+                <span>
+                  mailbox_messages row:{' '}
+                  <strong className="text-[#1A160D] dark:text-[#FAF6EC]">
+                    {new Date(diagnostics.timingSummary.latestStoredAt).toISOString()}
+                  </strong>
+                </span>
+              )}
+            </div>
+          )}
+        </section>
+      )}
+
       {/* Raw Inbound Webhook Attempts / Unmatched Logs */}
       <section className="rounded-2xl border border-[#D4AF37]/30 bg-white p-4 sm:p-5 space-y-3 dark:bg-[#14120D]">
         <div className="flex items-center justify-between gap-2">
@@ -586,7 +679,7 @@ export function AdminDiagnosticsTab({
                 className="rounded-xl border border-[#D4AF37]/20 bg-[#FAF7F0] p-3 text-xs dark:bg-[#0B0A07]"
               >
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     <span
                       className={`rounded-md px-2 py-0.5 font-mono text-[10px] font-bold uppercase ${
                         log.status === 'stored'
@@ -596,6 +689,21 @@ export function AdminDiagnosticsTab({
                     >
                       {log.status} · HTTP {log.httpStatus}
                     </span>
+                    {typeof log.totalMs === 'number' && (
+                      <span className="rounded-md bg-[#D4AF37]/15 px-1.5 py-0.5 font-mono text-[10px] font-bold text-[#8A6208] dark:text-[#F5D77A]">
+                        {log.totalMs}ms
+                      </span>
+                    )}
+                    {typeof log.dbInsertMs === 'number' && log.dbInsertMs > 0 && (
+                      <span className="rounded-md bg-emerald-500/10 px-1.5 py-0.5 font-mono text-[10px] font-bold text-emerald-700 dark:text-emerald-300">
+                        DB {log.dbInsertMs}ms
+                      </span>
+                    )}
+                    {typeof log.deliveryGapMs === 'number' && (
+                      <span className="rounded-md bg-black/5 px-1.5 py-0.5 font-mono text-[10px] font-bold text-[#4F4736] dark:bg-white/10 dark:text-[#D5CCB8]">
+                        Gap {log.deliveryGapMs}ms
+                      </span>
+                    )}
                     {log.otpDetected && (
                       <span className="font-mono text-[11px] font-bold text-[#8A6208] dark:text-[#F5D77A]">
                         OTP: {log.otpDetected}
@@ -614,6 +722,11 @@ export function AdminDiagnosticsTab({
                 <p className="mt-0.5 text-[11px] text-[#6E6552] dark:text-[#A89F8C] truncate">
                   Subject: {log.subject}
                 </p>
+                {(log.receivedAt || log.storedAt) && (
+                  <p className="mt-0.5 font-mono text-[10px] text-[#8A7F6A] dark:text-[#A89F8C] break-all">
+                    receivedAt: {log.receivedAt || '—'} → storedAt: {log.storedAt || '—'}
+                  </p>
+                )}
                 {log.error && (
                   <p className="mt-1 rounded bg-rose-500/10 px-2 py-1 font-mono text-[11px] text-rose-700 dark:text-rose-200 break-all">
                     {log.error}

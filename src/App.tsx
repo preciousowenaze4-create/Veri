@@ -270,6 +270,8 @@ export default function App() {
   const [loadingEmailDetail, setLoadingEmailDetail] = useState<boolean>(false);
   const [generatingEmail, setGeneratingEmail] = useState<boolean>(false);
   const [emailStreamConnected, setEmailStreamConnected] = useState<boolean>(false);
+  const [supabaseRealtimeConnected, setSupabaseRealtimeConnected] = useState<boolean>(false);
+  const [lastEmailCheckedAt, setLastEmailCheckedAt] = useState<string | null>(null);
   const [dailyGenerateUsed, setDailyGenerateUsed] = useState<number>(() =>
     readDailyGenerateCount(walletUserId)
   );
@@ -285,6 +287,9 @@ export default function App() {
 
   const lastFetchedAddressRef = useRef<string | null>(null);
   const knownEmailMsgIdsRef = useRef<Set<string>>(new Set());
+  const emailMessagesRef = useRef<EmailMessageSummary[]>(emailMessages);
+  emailMessagesRef.current = emailMessages;
+  const inboxPollInFlightRef = useRef<boolean>(false);
   const notifiedSmsOrderIdsRef = useRef<Set<number>>(new Set());
   const autoRefundedOrderIdsRef = useRef<Set<number>>(new Set());
 
@@ -1485,16 +1490,20 @@ export default function App() {
     async (accountOverride?: TempEmailAccount | null, silent = false) => {
       const target = accountOverride ?? activeEmail;
       if (!target) return;
+      if (silent && inboxPollInFlightRef.current) return;
+      inboxPollInFlightRef.current = true;
       if (!silent) {
         setLoadingEmailMessages(true);
         setEmailError(null);
       }
       try {
         const res = await fetch('/api/email/messages', {
+          cache: 'no-store',
           headers: {
             Authorization: `Bearer ${target.token}`,
             'x-email-provider': 'veribox',
             'x-email-address': target.address,
+            'Cache-Control': 'no-cache',
           },
           signal: AbortSignal.timeout(8000),
         });
@@ -1512,6 +1521,7 @@ export default function App() {
           );
         }
         applyInboxSnapshot(target.address, data.messages || [], silent);
+        setLastEmailCheckedAt(new Date().toISOString());
         setEmailError(data.warning ? `Sync warning: ${data.warning}` : null);
       } catch (err) {
         const message =
@@ -1522,6 +1532,7 @@ export default function App() {
             : 'Failed to load emails';
         setEmailError(message);
       } finally {
+        inboxPollInFlightRef.current = false;
         if (!silent) {
           setLoadingEmailMessages(false);
         }
@@ -1764,7 +1775,75 @@ export default function App() {
     }
   }, [activeEmail, refreshEmailInbox]);
 
-  // Real-time SSE stream for instant incoming emails on active mailbox
+  // 1. Supabase Realtime INSERT subscription filtered for the active mailbox
+  useEffect(() => {
+    if (!autoRefresh || !activeEmail?.address) {
+      setSupabaseRealtimeConnected(false);
+      return;
+    }
+
+    const targetAddr = activeEmail.address.trim().toLowerCase();
+    let cancelled = false;
+    let cleanupChannel: (() => void) | null = null;
+
+    void ensureSupabaseClient().then((sb) => {
+      if (cancelled || !sb) return;
+      const channel = sb
+        .channel(`inbox-realtime-${targetAddr}`)
+        .on(
+          'postgres_changes',
+          {
+            event: 'INSERT',
+            schema: 'public',
+            table: 'mailbox_messages',
+            filter: `recipient_address=eq.${targetAddr}`,
+          },
+          (payload) => {
+            if (cancelled) return;
+            const row = payload.new as Record<string, unknown> | undefined;
+            if (!row || !row.id) return;
+            const rowId = String(row.id);
+            if (rowId.startsWith('att_')) return;
+
+            const incomingMsg: EmailMessageSummary = {
+              id: rowId,
+              fromName: String(row.from_name || row.from_address || 'Unknown sender'),
+              fromAddress: String(row.from_address || ''),
+              subject: String(row.subject || '(No subject)'),
+              intro: String(row.body_text || '').slice(0, 180),
+              seen: Boolean(row.seen),
+              createdAt: String(row.created_at || new Date().toISOString()),
+              otp: row.otp ? String(row.otp) : null,
+            };
+
+            const nextList = [
+              incomingMsg,
+              ...emailMessagesRef.current.filter((m) => m.id !== rowId),
+            ].slice(0, 50);
+            applyInboxSnapshot(targetAddr, nextList, true);
+            setLastEmailCheckedAt(new Date().toISOString());
+            setCountdown(3);
+          }
+        )
+        .subscribe((status) => {
+          if (!cancelled) {
+            setSupabaseRealtimeConnected(status === 'SUBSCRIBED');
+          }
+        });
+
+      cleanupChannel = () => {
+        void sb.removeChannel(channel);
+      };
+    });
+
+    return () => {
+      cancelled = true;
+      setSupabaseRealtimeConnected(false);
+      cleanupChannel?.();
+    };
+  }, [autoRefresh, activeEmail?.address, applyInboxSnapshot]);
+
+  // 2. Real-time SSE stream for instant incoming emails on active mailbox
   useEffect(() => {
     if (!autoRefresh || activeTab !== 'home' || !activeEmail) {
       setEmailStreamConnected(false);
@@ -1789,6 +1868,7 @@ export default function App() {
             payload.messages,
             payload.type === 'new_email'
           );
+          setLastEmailCheckedAt(new Date().toISOString());
         }
       } catch {
         // Ignore malformed SSE event
@@ -1802,15 +1882,15 @@ export default function App() {
     };
   }, [autoRefresh, activeTab, activeEmail?.address, activeEmail?.token, applyInboxSnapshot]);
 
-  // Fast 2-second silent polling + immediate refresh when returning from another app/tab
+  // 3. Lightweight 3-second polling + immediate refresh when returning from another app/tab (never backs off)
   useEffect(() => {
     if (!autoRefresh || activeTab !== 'home' || !activeEmail) return;
-    setCountdown(2);
+    setCountdown(3);
     const timer = window.setInterval(() => {
       setCountdown((prev) => {
         if (prev <= 1) {
           void refreshEmailInbox(activeEmail, true);
-          return 2;
+          return 3;
         }
         return prev - 1;
       });
@@ -1818,7 +1898,7 @@ export default function App() {
 
     const handleResume = () => {
       if (document.visibilityState === 'hidden') return;
-      setCountdown(2);
+      setCountdown(3);
       void refreshEmailInbox(activeEmail, true);
     };
 
@@ -2053,7 +2133,8 @@ export default function App() {
             loadingMessages={loadingEmailMessages}
             loadingDetail={loadingEmailDetail}
             generatingEmail={generatingEmail}
-            emailStreamConnected={emailStreamConnected}
+            emailStreamConnected={emailStreamConnected || supabaseRealtimeConnected}
+            lastCheckedAt={lastEmailCheckedAt}
             dailyGenerateUsed={dailyGenerateUsed}
             dailyGenerateLimit={FREE_DAILY_EMAIL_LIMIT}
             emailError={emailError}

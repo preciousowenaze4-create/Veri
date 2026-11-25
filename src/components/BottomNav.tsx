@@ -1,13 +1,14 @@
-import { Home, MailPlus, Phone, Sparkles, User } from 'lucide-react';
+import { Home, MailPlus, Phone, ShieldCheck, Sparkles, User } from 'lucide-react';
 import type { TabId } from '../types';
 
 interface BottomNavProps {
   activeTab: TabId;
   unreadEmailCount: number;
+  isOwnerAdmin?: boolean;
   onChange: (tab: TabId) => void;
 }
 
-const NAV_ITEMS: Array<{ id: TabId; label: string; Icon: typeof Home }> = [
+const BASE_NAV_ITEMS: Array<{ id: TabId; label: string; Icon: typeof Home }> = [
   { id: 'home', label: 'Home', Icon: Home },
   { id: 'create', label: 'Create', Icon: MailPlus },
   { id: 'numbers', label: 'Numbers', Icon: Phone },
@@ -15,14 +16,27 @@ const NAV_ITEMS: Array<{ id: TabId; label: string; Icon: typeof Home }> = [
   { id: 'profile', label: 'Profile', Icon: User },
 ];
 
-export function BottomNav({ activeTab, unreadEmailCount, onChange }: BottomNavProps) {
+export function BottomNav({
+  activeTab,
+  unreadEmailCount,
+  isOwnerAdmin = false,
+  onChange,
+}: BottomNavProps) {
+  const navItems = isOwnerAdmin
+    ? [...BASE_NAV_ITEMS, { id: 'admin' as TabId, label: 'Admin', Icon: ShieldCheck }]
+    : BASE_NAV_ITEMS;
+
   return (
     <nav
       aria-label="Primary bottom navigation"
       className="fixed bottom-0 left-0 right-0 z-40 border-t border-[#D4AF37]/20 bg-[#FAF7F0]/95 backdrop-blur-md pb-safe dark:border-[#D4AF37]/20 dark:bg-[#0A0906]/95"
     >
-      <div className="mx-auto grid h-16 w-full max-w-3xl grid-cols-5 items-center px-1 sm:px-2">
-        {NAV_ITEMS.map(({ id, label, Icon }) => {
+      <div
+        className={`mx-auto grid h-16 w-full max-w-3xl items-center px-1 sm:px-2 ${
+          isOwnerAdmin ? 'grid-cols-6' : 'grid-cols-5'
+        }`}
+      >
+        {navItems.map(({ id, label, Icon }) => {
           const isActive = activeTab === id;
           return (
             <button
@@ -47,7 +61,11 @@ export function BottomNav({ activeTab, unreadEmailCount, onChange }: BottomNavPr
                   </span>
                 )}
               </div>
-              <span className="mt-1 text-[11px] font-bold tracking-tight whitespace-nowrap shrink-0">
+              <span
+                className={`mt-1 font-bold tracking-tight whitespace-nowrap shrink-0 ${
+                  isOwnerAdmin ? 'text-[10px] sm:text-[11px]' : 'text-[11px]'
+                }`}
+              >
                 {label}
               </span>
             </button>

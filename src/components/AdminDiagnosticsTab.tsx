@@ -4,6 +4,7 @@ import {
   ArrowLeft,
   CheckCircle2,
   Database,
+  Globe,
   Loader2,
   Mail,
   Play,
@@ -25,6 +26,7 @@ interface AdminDiagnosticsTabProps {
   activeEmailAddress: string | null;
   diagnostics: AdminDiagnosticsResponse | null;
   loading: boolean;
+  realtimeConnected?: boolean;
   error: string | null;
   testingInbound: boolean;
   testResult: AdminInboundTestResult | null;
@@ -105,6 +107,7 @@ export function AdminDiagnosticsTab({
   activeEmailAddress,
   diagnostics,
   loading,
+  realtimeConnected = false,
   error,
   testingInbound,
   testResult,
@@ -123,6 +126,7 @@ export function AdminDiagnosticsTab({
   }, [activeEmailAddress]);
 
   const env = diagnostics?.environment;
+  const activeConnectionErrors = diagnostics?.connectionErrors || [];
 
   return (
     <div className="space-y-4">
@@ -134,9 +138,15 @@ export function AdminDiagnosticsTab({
               <ShieldCheck className="h-5 w-5" />
             </div>
             <div className="min-w-0">
-              <p className="text-[11px] font-extrabold uppercase tracking-wider text-[#8A6208] dark:text-[#D4AF37]">
-                Owner Admin Diagnostics
-              </p>
+              <div className="flex flex-wrap items-center gap-2">
+                <p className="text-[11px] font-extrabold uppercase tracking-wider text-[#8A6208] dark:text-[#D4AF37]">
+                  Owner Admin Diagnostics
+                </p>
+                <span className="inline-flex items-center gap-1 rounded-md bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-bold text-emerald-700 dark:text-emerald-300">
+                  <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                  {realtimeConnected ? 'Live · Real-Time' : 'Live Sync (4s)'}
+                </span>
+              </div>
               <h1 className="font-display text-base sm:text-lg font-extrabold text-[#1A160D] dark:text-[#FAF6EC] truncate">
                 Inbound Email &amp; Router Monitor
               </h1>
@@ -167,6 +177,29 @@ export function AdminDiagnosticsTab({
             </button>
           </div>
         </div>
+
+        {activeConnectionErrors.length > 0 && (
+          <div className="mt-4 rounded-xl border border-rose-500/50 bg-rose-500/10 p-3.5 text-xs text-rose-700 dark:text-rose-200 space-y-1.5">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-1.5 font-extrabold text-rose-700 dark:text-rose-300">
+                <AlertTriangle className="h-4 w-4 shrink-0" />
+                <span>Active Domain / Pipeline Errors ({activeConnectionErrors.length})</span>
+              </div>
+              <button
+                type="button"
+                onClick={onRefresh}
+                className="rounded-lg bg-rose-600 px-2.5 py-1 text-[11px] font-bold text-white hover:bg-rose-500 cursor-pointer"
+              >
+                Re-test
+              </button>
+            </div>
+            <ul className="space-y-1 font-mono text-[11px] break-words">
+              {activeConnectionErrors.map((msg, i) => (
+                <li key={i}>• {msg}</li>
+              ))}
+            </ul>
+          </div>
+        )}
 
         {error && (
           <div className="mt-4 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-rose-500/40 bg-rose-500/10 p-3.5 text-xs text-rose-700 dark:text-rose-200">
@@ -279,6 +312,108 @@ export function AdminDiagnosticsTab({
                 probe={diagnostics.probes.mailboxMessages}
               />
             </div>
+
+            {(diagnostics.dnsCheck || diagnostics.domainConnection) && (
+              <div className="rounded-xl border border-[#D4AF37]/25 bg-[#FAF7F0] p-3.5 space-y-2.5 dark:bg-[#0B0A07]">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Globe className="h-4 w-4 text-[#D4AF37]" />
+                    <span className="text-xs font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
+                      Live Domain Connection &amp; DNS ({diagnostics.dnsCheck?.domain || emailDomain})
+                    </span>
+                  </div>
+                  {diagnostics.publicWebhookUrl && (
+                    <span className="font-mono text-[10px] text-[#6E6552] dark:text-[#A89F8C]">
+                      Webhook: {diagnostics.publicWebhookUrl}
+                    </span>
+                  )}
+                </div>
+
+                {diagnostics.domainConnection && (
+                  <div
+                    className={`rounded-lg border p-2.5 text-xs flex flex-wrap items-center justify-between gap-2 ${
+                      diagnostics.domainConnection.ok
+                        ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+                        : 'border-rose-500/40 bg-rose-500/10 text-rose-700 dark:text-rose-200'
+                    }`}
+                  >
+                    <div className="flex items-center gap-2 min-w-0">
+                      {diagnostics.domainConnection.ok ? (
+                        <CheckCircle2 className="h-4 w-4 shrink-0" />
+                      ) : (
+                        <XCircle className="h-4 w-4 shrink-0" />
+                      )}
+                      <span className="font-mono text-[11px] font-bold break-all">
+                        {diagnostics.domainConnection.ok
+                          ? `HTTPS Live (${diagnostics.domainConnection.url}) · HTTP ${diagnostics.domainConnection.httpStatus} · ${diagnostics.domainConnection.latencyMs}ms`
+                          : diagnostics.domainConnection.error || `Connection failed (${diagnostics.domainConnection.url})`}
+                      </span>
+                    </div>
+                  </div>
+                )}
+
+                {diagnostics.dnsCheck &&
+                  (diagnostics.dnsCheck.error ? (
+                    <p className="font-mono text-xs text-rose-600 dark:text-rose-300">
+                      DNS Lookup Error: {diagnostics.dnsCheck.error}
+                    </p>
+                  ) : (
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-[11px]">
+                      <div className="rounded-lg border border-[#D4AF37]/15 bg-white p-2 dark:bg-[#14120D]">
+                        <p className="font-bold text-[#6E6552] dark:text-[#A89F8C]">
+                          MX Records:{' '}
+                          <span
+                            className={
+                              diagnostics.dnsCheck.mxOk
+                                ? 'text-emerald-600 dark:text-emerald-400'
+                                : 'text-rose-600 dark:text-rose-400'
+                            }
+                          >
+                            {diagnostics.dnsCheck.mxOk ? 'Cloudflare MX OK' : 'Missing MX'}
+                          </span>
+                        </p>
+                        <p className="mt-0.5 font-mono text-[10px] text-[#1A160D] dark:text-[#FAF6EC] break-all">
+                          {diagnostics.dnsCheck.mxRecords.join(', ') || 'None found'}
+                        </p>
+                      </div>
+                      <div className="rounded-lg border border-[#D4AF37]/15 bg-white p-2 dark:bg-[#14120D]">
+                        <p className="font-bold text-[#6E6552] dark:text-[#A89F8C]">
+                          SPF:{' '}
+                          <span
+                            className={
+                              diagnostics.dnsCheck.spfOk
+                                ? 'text-emerald-600 dark:text-emerald-400'
+                                : 'text-amber-600 dark:text-amber-400'
+                            }
+                          >
+                            {diagnostics.dnsCheck.spfOk ? 'Valid' : 'Missing'}
+                          </span>
+                        </p>
+                        <p className="mt-0.5 font-mono text-[10px] text-[#1A160D] dark:text-[#FAF6EC] break-all">
+                          {diagnostics.dnsCheck.spfRecord || 'No SPF TXT record'}
+                        </p>
+                      </div>
+                      <div className="rounded-lg border border-[#D4AF37]/15 bg-white p-2 dark:bg-[#14120D]">
+                        <p className="font-bold text-[#6E6552] dark:text-[#A89F8C]">
+                          DMARC:{' '}
+                          <span
+                            className={
+                              diagnostics.dnsCheck.dmarcOk
+                                ? 'text-emerald-600 dark:text-emerald-400'
+                                : 'text-amber-600 dark:text-amber-400'
+                            }
+                          >
+                            {diagnostics.dnsCheck.dmarcOk ? 'Configured' : 'Missing'}
+                          </span>
+                        </p>
+                        <p className="mt-0.5 font-mono text-[10px] text-[#1A160D] dark:text-[#FAF6EC] break-all">
+                          {diagnostics.dnsCheck.dmarcRecord || 'No _dmarc TXT record'}
+                        </p>
+                      </div>
+                    </div>
+                  ))}
+              </div>
+            )}
           </>
         ) : null}
       </section>
@@ -288,11 +423,11 @@ export function AdminDiagnosticsTab({
         <div className="flex items-center gap-2">
           <Server className="h-4 w-4 text-[#D4AF37]" />
           <h2 className="font-display text-sm sm:text-base font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
-            Test Inbound Pipeline
+            Test Inbound Pipeline (Live HTTP + DB + Inbox API)
           </h2>
         </div>
         <p className="text-xs text-[#6E6552] dark:text-[#A89F8C]">
-          Dispatches a synthetic verification email through <code className="font-mono">/api/email/inbound</code> and verifies Supabase write + readback immediately.
+          Sends a real HTTP POST request to <code className="font-mono">/api/email/inbound</code> with a simulated TikTok OTP payload, verifies DNS routing, confirms Supabase write + readback, and tests <code className="font-mono">/api/email/messages</code> retrieval.
         </p>
 
         <div className="flex flex-col sm:flex-row gap-2">
@@ -314,7 +449,7 @@ export function AdminDiagnosticsTab({
             ) : (
               <Play className="h-4 w-4" />
             )}
-            <span>{testingInbound ? 'Testing...' : 'Test Inbound Pipeline'}</span>
+            <span>{testingInbound ? 'Testing Live...' : 'Run Live Pipeline Test'}</span>
           </button>
         </div>
 
@@ -325,7 +460,7 @@ export function AdminDiagnosticsTab({
         )}
 
         {testResult && (
-          <div className="rounded-xl border border-[#D4AF37]/25 bg-[#FAF7F0] p-3.5 space-y-2 dark:bg-[#0B0A07]">
+          <div className="rounded-xl border border-[#D4AF37]/25 bg-[#FAF7F0] p-3.5 space-y-2.5 dark:bg-[#0B0A07]">
             <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
               <div className="flex flex-wrap items-center gap-2">
                 <span
@@ -335,7 +470,7 @@ export function AdminDiagnosticsTab({
                       : 'bg-rose-500/15 text-rose-700 dark:text-rose-300'
                   }`}
                 >
-                  HTTP {testResult.httpStatus}
+                  HTTP {testResult.httpStatus || 'ERR'}
                 </span>
                 <span className="font-mono text-[#6E6552] dark:text-[#A89F8C]">
                   {testResult.latencyMs}ms
@@ -347,7 +482,7 @@ export function AdminDiagnosticsTab({
                 )}
               </div>
 
-              <div className="flex items-center gap-2 font-mono text-[11px]">
+              <div className="flex flex-wrap items-center gap-2 font-mono text-[11px]">
                 <span
                   className={
                     testResult.supabaseWriteOk
@@ -355,7 +490,7 @@ export function AdminDiagnosticsTab({
                       : 'text-rose-600 dark:text-rose-400'
                   }
                 >
-                  Write: {testResult.supabaseWriteOk ? 'OK' : 'FAILED'}
+                  DB Write: {testResult.supabaseWriteOk ? 'OK' : 'FAILED'}
                 </span>
                 <span
                   className={
@@ -364,14 +499,55 @@ export function AdminDiagnosticsTab({
                       : 'text-rose-600 dark:text-rose-400'
                   }
                 >
-                  Readback: {testResult.supabaseReadbackOk ? 'OK' : 'FAILED'}
+                  DB Read: {testResult.supabaseReadbackOk ? 'OK' : 'FAILED'}
+                </span>
+                <span
+                  className={
+                    testResult.inboxApiOk === true
+                      ? 'text-emerald-600 dark:text-emerald-400'
+                      : testResult.inboxApiOk === false
+                        ? 'text-rose-600 dark:text-rose-400'
+                        : 'text-amber-600 dark:text-amber-400'
+                  }
+                >
+                  Inbox API:{' '}
+                  {testResult.inboxApiOk === true
+                    ? `OK (${testResult.inboxMessageCount ?? 0} msgs)`
+                    : testResult.inboxApiOk === false
+                      ? 'FAILED'
+                      : 'SKIPPED'}
                 </span>
               </div>
             </div>
 
+            {testResult.endpointUrl && (
+              <p className="font-mono text-[11px] text-[#6E6552] dark:text-[#A89F8C] break-all">
+                Tested HTTP Endpoint: {testResult.endpointUrl}
+              </p>
+            )}
+
+            {testResult.productionProbe && (
+              <div
+                className={`rounded-lg border p-2 font-mono text-[11px] break-all ${
+                  testResult.productionProbe.reachable
+                    ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+                    : 'border-rose-500/30 bg-rose-500/10 text-rose-700 dark:text-rose-200'
+                }`}
+              >
+                Live Custom Domain ({testResult.productionProbe.url}) → HTTP{' '}
+                {testResult.productionProbe.httpStatus ?? 'ERR'}: {testResult.productionProbe.detail}
+              </div>
+            )}
+
+            {testResult.inboxError && (
+              <p className="rounded-lg bg-amber-500/10 p-2 font-mono text-[11px] text-amber-800 dark:text-amber-200 break-words">
+                Inbox Check: {testResult.inboxError}
+              </p>
+            )}
+
             {testResult.supabaseError && (
               <p className="rounded-lg bg-rose-500/10 p-2 font-mono text-[11px] text-rose-700 dark:text-rose-200 break-all">
-                Supabase Error: {testResult.supabaseError}
+                Supabase / Webhook Error: {testResult.supabaseError}
               </p>
             )}
 
@@ -394,9 +570,14 @@ export function AdminDiagnosticsTab({
         </div>
 
         {!diagnostics || diagnostics.recentInboundAttempts.length === 0 ? (
-          <p className="rounded-xl border border-dashed border-[#D4AF37]/25 p-4 text-xs text-[#6E6552] dark:text-[#A89F8C]">
-            No inbound requests hit this backend instance yet since the last cold start. Use <strong>Test Inbound Pipeline</strong> above or send a real verification email to check if Cloudflare Worker requests reach <code className="font-mono">/api/email/inbound</code>.
-          </p>
+          <div className="rounded-xl border border-dashed border-[#D4AF37]/25 p-4 text-xs text-[#6E6552] space-y-1.5 dark:text-[#A89F8C]">
+            <p className="font-bold text-[#1A160D] dark:text-[#FAF6EC]">
+              No inbound webhook hits recorded yet.
+            </p>
+            <p>
+              If external verification emails (such as TikTok) are not appearing here after sending, Cloudflare Email Routing is not reaching <code className="font-mono">{diagnostics?.publicWebhookUrl || `https://${emailDomain}/api/email/inbound`}</code> — check your Cloudflare Catch-All Email Routing rule and Worker URL/secret, or verify the external platform did not block the domain before sending.
+            </p>
+          </div>
         ) : (
           <div className="space-y-2 max-h-72 overflow-y-auto">
             {diagnostics.recentInboundAttempts.map((log) => (

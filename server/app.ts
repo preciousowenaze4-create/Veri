@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import crypto from 'node:crypto';
+import dns from 'node:dns/promises';
 import { EventEmitter } from 'node:events';
 import vm from 'node:vm';
 import express from 'express';
@@ -2105,6 +2106,56 @@ function inStockNgnMore(existing: number, candidate: number): boolean {
 
 export function createApiApp() {
   const app = express();
+
+  const OWNER_ADMIN_EMAIL = 'preciousddkid@gmail.com';
+  const INBOUND_AUDIT_ADDRESS = '__inbound_audit__@system.veribox';
+
+  interface InboundAttemptLog {
+    id: string;
+    timestamp: string;
+    status: 'stored' | 'rejected_secret' | 'unmatched_recipient' | 'db_error' | 'invalid_payload';
+    httpStatus: number;
+    recipients: string[];
+    rawToPreview: string;
+    fromAddress: string;
+    subject: string;
+    otpDetected: string | null;
+    supabaseStored: boolean;
+    error: string | null;
+  }
+
+  const inboundAttemptLogs: InboundAttemptLog[] = [];
+
+  async function recordInboundAttempt(entry: InboundAttemptLog): Promise<void> {
+    inboundAttemptLogs.unshift(entry);
+    if (inboundAttemptLogs.length > 50) {
+      inboundAttemptLogs.length = 50;
+    }
+
+    const sb = getSupabaseServerClient();
+    if (!sb) return;
+    try {
+      const targetPreview = entry.recipients.join(', ') || entry.rawToPreview || 'unmatched';
+      await sb.from('mailbox_messages').upsert(
+        {
+          id: entry.id,
+          recipient_address: INBOUND_AUDIT_ADDRESS,
+          from_name: `${entry.status} · HTTP ${entry.httpStatus}`,
+          from_address: (entry.fromAddress || 'webhook').slice(0, 120),
+          subject: `[${targetPreview}] ${entry.subject}`.slice(0, 280),
+          body_text: JSON.stringify(entry),
+          body_html: '',
+          otp: entry.otpDetected,
+          seen: true,
+          created_at: entry.timestamp,
+        },
+        { onConflict: 'id' }
+      );
+    } catch {
+      // Non-blocking audit persistence
+    }
+  }
+
   app.use(
     express.json({
       limit: '5mb',
@@ -2115,6 +2166,57 @@ export function createApiApp() {
     })
   );
   app.use(express.urlencoded({ extended: true, limit: '5mb' }));
+  app.use(
+    ['/api/email/inbound', '/api/email/inbound/:secret'],
+    express.text({ limit: '5mb', type: ['message/rfc822', 'text/*'] }),
+    express.raw({ limit: '5mb', type: 'application/octet-stream' })
+  );
+  app.use(
+    (
+      err: unknown,
+      req: express.Request,
+      res: express.Response,
+      next: express.NextFunction
+    ) => {
+      if (err && typeof err === 'object' && ('status' in err || err instanceof SyntaxError)) {
+        const errObj = err as {
+          status?: number;
+          statusCode?: number;
+          message?: string;
+        };
+        const code = errObj.status || errObj.statusCode || 400;
+        if (req.path.startsWith('/api/email/inbound')) {
+          const rawBuf = (req as express.Request & { rawBody?: Buffer }).rawBody;
+          if (rawBuf && rawBuf.length > 0 && err instanceof SyntaxError) {
+            req.body = rawBuf.toString('utf8');
+            next();
+            return;
+          }
+          const attemptId = `att_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`;
+          const msg = `HTTP ${code}: ${errObj.message || 'Invalid webhook payload'}`;
+          void recordInboundAttempt({
+            id: attemptId,
+            timestamp: new Date().toISOString(),
+            status: 'invalid_payload',
+            httpStatus: code,
+            recipients: [],
+            rawToPreview: '',
+            fromAddress: '',
+            subject: '(Payload parse error)',
+            otpDetected: null,
+            supabaseStored: false,
+            error: msg,
+          }).finally(() => {
+            res.status(code).json({ error: msg });
+          });
+          return;
+        }
+        res.status(code).json({ error: errObj.message || 'Malformed request body' });
+        return;
+      }
+      next(err);
+    }
+  );
 
   app.get('/api/health', (_req, res) => {
     res.json({
@@ -2462,34 +2564,10 @@ export function createApiApp() {
     createdAt: string;
   }
 
-  const OWNER_ADMIN_EMAIL = 'preciousddkid@gmail.com';
-
-  interface InboundAttemptLog {
-    id: string;
-    timestamp: string;
-    status: 'stored' | 'rejected_secret' | 'unmatched_recipient' | 'db_error' | 'invalid_payload';
-    httpStatus: number;
-    recipients: string[];
-    rawToPreview: string;
-    fromAddress: string;
-    subject: string;
-    otpDetected: string | null;
-    supabaseStored: boolean;
-    error: string | null;
-  }
-
   const mailboxRegistry = new Map<string, CustomMailboxRecord>();
   const mailboxMessagesMap = new Map<string, CustomInboxMessageRecord[]>();
-  const inboundAttemptLogs: InboundAttemptLog[] = [];
   const emailEvents = new EventEmitter();
   emailEvents.setMaxListeners(200);
-
-  function recordInboundAttempt(entry: InboundAttemptLog): void {
-    inboundAttemptLogs.unshift(entry);
-    if (inboundAttemptLogs.length > 50) {
-      inboundAttemptLogs.length = 50;
-    }
-  }
 
   function hashEmailPassword(password: string, salt?: string): { salt: string; hash: string } {
     const useSalt = salt || crypto.randomBytes(16).toString('hex');
@@ -3237,7 +3315,7 @@ export function createApiApp() {
 
       if (!provided || !safeSecretsEqual(provided, configuredSecret)) {
         console.warn('[VeriBox Inbound] Rejected request due to invalid or missing x-inbound-secret');
-        recordInboundAttempt({
+        await recordInboundAttempt({
           id: attemptId,
           timestamp: attemptTime,
           status: 'rejected_secret',
@@ -3256,11 +3334,19 @@ export function createApiApp() {
     }
 
     let parsedBody: unknown = req.body;
+    if (Buffer.isBuffer(parsedBody)) {
+      parsedBody = parsedBody.toString('utf8');
+    }
     if (typeof parsedBody === 'string') {
-      try {
-        parsedBody = JSON.parse(parsedBody);
-      } catch {
-        parsedBody = {};
+      const trimmedStr = parsedBody.trim();
+      if (trimmedStr.startsWith('{') || trimmedStr.startsWith('[')) {
+        try {
+          parsedBody = JSON.parse(trimmedStr);
+        } catch {
+          parsedBody = { raw: parsedBody };
+        }
+      } else {
+        parsedBody = { raw: parsedBody };
       }
     }
     const body = (parsedBody && typeof parsedBody === 'object' ? parsedBody : {}) as Record<
@@ -3323,7 +3409,7 @@ export function createApiApp() {
     if (rawRecipients.length === 0) {
       const msg = `No recipient matching @${CUSTOM_EMAIL_DOMAIN} found in payload (received to: ${rawToPreview || 'empty'})`;
       console.warn('[VeriBox Inbound] Dropped webhook:', msg);
-      recordInboundAttempt({
+      await recordInboundAttempt({
         id: attemptId,
         timestamp: attemptTime,
         status: 'unmatched_recipient',
@@ -3460,7 +3546,7 @@ export function createApiApp() {
       storedIds.push(msgId);
     }
 
-    recordInboundAttempt({
+    await recordInboundAttempt({
       id: attemptId,
       timestamp: attemptTime,
       status: firstDbError ? 'db_error' : 'stored',
@@ -3677,11 +3763,169 @@ export function createApiApp() {
     }
   }
 
+  async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<T>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  async function checkDomainDns(domain: string) {
+    const checkedAt = new Date().toISOString();
+    const resolveDoh = async (name: string, type: string): Promise<string[]> => {
+      const res = await fetch(
+        `https://dns.google/resolve?name=${encodeURIComponent(name)}&type=${encodeURIComponent(type)}`,
+        { signal: AbortSignal.timeout(2500) }
+      );
+      if (!res.ok) {
+        throw new Error(`DNS lookup HTTP ${res.status} for ${name} (${type})`);
+      }
+      const data = (await res.json()) as { Answer?: Array<{ data?: string }> };
+      return Array.isArray(data.Answer)
+        ? data.Answer.map((a) => String(a.data || '').replace(/^"|"$/g, '').trim()).filter(Boolean)
+        : [];
+    };
+
+    try {
+      const nativeResult = await withTimeout(
+        Promise.all([
+          dns.resolveMx(domain).then((recs) =>
+            recs
+              .slice()
+              .sort((a, b) => a.priority - b.priority)
+              .map((r) => `${r.priority} ${r.exchange.replace(/\.$/, '')}`)
+          ),
+          dns.resolveTxt(domain).then((chunks) => chunks.map((c) => c.join(''))),
+          dns
+            .resolveTxt(`_dmarc.${domain}`)
+            .then((chunks) => chunks.map((c) => c.join('')))
+            .catch(() => [] as string[]),
+          dns.resolve4(domain).catch(() => [] as string[]),
+        ]),
+        2500,
+        'Native DNS lookup'
+      ).catch(() => null);
+
+      const [mxRecords, txtRecords, dmarcRecords, aRecords] =
+        nativeResult && (nativeResult[0].length > 0 || nativeResult[1].length > 0)
+          ? nativeResult
+          : await Promise.all([
+              resolveDoh(domain, 'MX'),
+              resolveDoh(domain, 'TXT'),
+              resolveDoh(`_dmarc.${domain}`, 'TXT').catch(() => [] as string[]),
+              resolveDoh(domain, 'A').catch(() => [] as string[]),
+            ]);
+
+      const spfRecord = txtRecords.find((t) => /v=spf1/i.test(t)) || null;
+      const dmarcRecord = dmarcRecords.find((t) => /v=DMARC1/i.test(t)) || null;
+      const mxOk = mxRecords.some((m) => /mx\.cloudflare\.net/i.test(m)) || mxRecords.length > 0;
+      return {
+        checkedAt,
+        domain,
+        mxOk,
+        mxRecords,
+        spfOk: Boolean(spfRecord),
+        spfRecord,
+        dmarcOk: Boolean(dmarcRecord),
+        dmarcRecord,
+        aRecords,
+        error: null,
+      };
+    } catch (err) {
+      return {
+        checkedAt,
+        domain,
+        mxOk: false,
+        mxRecords: [],
+        spfOk: false,
+        spfRecord: null,
+        dmarcOk: false,
+        dmarcRecord: null,
+        aRecords: [],
+        error: err instanceof Error ? err.message : 'DNS resolution check failed',
+      };
+    }
+  }
+
+  async function checkLiveDomainConnection(domain: string) {
+    const checkedAt = new Date().toISOString();
+    const url = `https://${domain}/api/email/domains`;
+    const startedAt = Date.now();
+    try {
+      const res = await fetch(url, {
+        headers: { accept: 'application/json' },
+        signal: AbortSignal.timeout(2500),
+      });
+      const latencyMs = Date.now() - startedAt;
+      const payload = (await res.json().catch(() => null)) as { domain?: string; error?: string } | null;
+      const domainMatched =
+        typeof payload?.domain === 'string' &&
+        payload.domain.trim().toLowerCase() === domain.toLowerCase();
+      if (!res.ok) {
+        return {
+          checkedAt,
+          url,
+          ok: false,
+          httpStatus: res.status,
+          latencyMs,
+          domainMatched,
+          error: payload?.error
+            ? `HTTP ${res.status}: ${payload.error}`
+            : `Live domain ${domain} returned HTTP ${res.status}`,
+        };
+      }
+      if (!domainMatched) {
+        return {
+          checkedAt,
+          url,
+          ok: false,
+          httpStatus: res.status,
+          latencyMs,
+          domainMatched: false,
+          error: `Domain mismatch on ${url}: expected "${domain}", got "${payload?.domain || 'none'}"`,
+        };
+      }
+      return {
+        checkedAt,
+        url,
+        ok: true,
+        httpStatus: res.status,
+        latencyMs,
+        domainMatched: true,
+        error: null,
+      };
+    } catch (err) {
+      return {
+        checkedAt,
+        url,
+        ok: false,
+        httpStatus: null,
+        latencyMs: Date.now() - startedAt,
+        domainMatched: false,
+        error:
+          err instanceof Error
+            ? err.name === 'TimeoutError' || err.name === 'AbortError'
+              ? `Live connection to https://${domain} timed out after 2500ms`
+              : `Connection to https://${domain} failed: ${err.message}`
+            : `Connection to https://${domain} failed`,
+      };
+    }
+  }
+
   app.get('/api/admin/diagnostics', async (req, res) => {
     const verified = await verifyOwnerAdminRequest(req, res);
     if (!verified) return;
     const sb = verified.supabase;
 
+    const inboundSecretConfigured = Boolean(getInboundEmailSecret());
+    const supabaseConfigured = Boolean(getSupabaseServerConfig().url);
     const serviceRoleConfigured = Boolean(
       (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY || '').trim()
     );
@@ -3691,11 +3935,15 @@ export function createApiApp() {
       columns: string
     ) => {
       try {
-        const { data, error, status, count } = await sb
+        let query = sb
           .from(table)
           .select(columns, { count: 'exact' })
           .order('created_at', { ascending: false })
           .limit(30);
+        if (table === 'mailbox_messages') {
+          query = query.neq('recipient_address', INBOUND_AUDIT_ADDRESS);
+        }
+        const { data, error, status, count } = await query;
         return {
           ok: !error,
           httpStatus: typeof status === 'number' ? status : error ? 500 : 200,
@@ -3718,13 +3966,92 @@ export function createApiApp() {
       }
     };
 
-    const [mailboxesProbe, messagesProbe] = await Promise.all([
-      probeTable('mailboxes', 'address, username, domain, account_mode, created_at, is_deleted'),
-      probeTable(
-        'mailbox_messages',
-        'id, recipient_address, from_name, from_address, subject, otp, seen, created_at'
-      ),
-    ]);
+    const fetchPersistedAuditLogs = async (): Promise<InboundAttemptLog[]> => {
+      try {
+        const { data, error } = await sb
+          .from('mailbox_messages')
+          .select('id, body_text, created_at')
+          .eq('recipient_address', INBOUND_AUDIT_ADDRESS)
+          .order('created_at', { ascending: false })
+          .limit(40);
+        if (error || !Array.isArray(data)) return [];
+        const parsed: InboundAttemptLog[] = [];
+        for (const row of data) {
+          try {
+            const entry = JSON.parse(String(row.body_text || '{}')) as InboundAttemptLog;
+            if (entry && entry.id && entry.status) parsed.push(entry);
+          } catch {
+            // Skip non-JSON row
+          }
+        }
+        return parsed;
+      } catch {
+        return [];
+      }
+    };
+
+    const [mailboxesProbe, messagesProbe, persistedAuditLogs, dnsCheck, domainConnection] =
+      await Promise.all([
+        probeTable('mailboxes', 'address, username, domain, account_mode, created_at, is_deleted'),
+        probeTable(
+          'mailbox_messages',
+          'id, recipient_address, from_name, from_address, subject, otp, seen, created_at'
+        ),
+        fetchPersistedAuditLogs(),
+        checkDomainDns(CUSTOM_EMAIL_DOMAIN),
+        checkLiveDomainConnection(CUSTOM_EMAIL_DOMAIN),
+      ]);
+
+    const mergedAttemptsMap = new Map<string, InboundAttemptLog>();
+    for (const item of [...persistedAuditLogs, ...inboundAttemptLogs]) {
+      if (item && item.id && !mergedAttemptsMap.has(item.id)) {
+        mergedAttemptsMap.set(item.id, item);
+      }
+    }
+    const mergedAttempts = Array.from(mergedAttemptsMap.values())
+      .sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp))
+      .slice(0, 50);
+
+    const connectionErrors: string[] = [];
+    if (!domainConnection.ok && domainConnection.error) {
+      connectionErrors.push(domainConnection.error);
+    }
+    if (dnsCheck.error) {
+      connectionErrors.push(`DNS lookup error (${CUSTOM_EMAIL_DOMAIN}): ${dnsCheck.error}`);
+    } else {
+      if (!dnsCheck.mxOk) {
+        connectionErrors.push(`Missing Cloudflare MX records for ${CUSTOM_EMAIL_DOMAIN}`);
+      }
+      if (!dnsCheck.spfOk) {
+        connectionErrors.push(`Missing SPF TXT record on ${CUSTOM_EMAIL_DOMAIN}`);
+      }
+    }
+    if (!inboundSecretConfigured) {
+      connectionErrors.push('INBOUND_EMAIL_SECRET is not configured on backend server');
+    }
+    if (!serviceRoleConfigured) {
+      connectionErrors.push('SUPABASE_SERVICE_ROLE_KEY is missing (backend may hit RLS blocks)');
+    }
+    if (!mailboxesProbe.ok) {
+      connectionErrors.push(
+        `Supabase mailboxes table error (${mailboxesProbe.errorCode || `HTTP ${mailboxesProbe.httpStatus}`}): ${mailboxesProbe.errorMessage || 'Query failed'}`
+      );
+    }
+    if (!messagesProbe.ok) {
+      connectionErrors.push(
+        `Supabase mailbox_messages table error (${messagesProbe.errorCode || `HTTP ${messagesProbe.httpStatus}`}): ${messagesProbe.errorMessage || 'Query failed'}`
+      );
+    }
+
+    const recentFailedCutoff = Date.now() - 15 * 60 * 1000;
+    const latestRecentFailure = mergedAttempts.find(
+      (a) => a.status !== 'stored' && Date.parse(a.timestamp) >= recentFailedCutoff
+    );
+    if (latestRecentFailure) {
+      connectionErrors.push(
+        `Recent inbound webhook failure (${latestRecentFailure.status} · HTTP ${latestRecentFailure.httpStatus}): ${latestRecentFailure.error || latestRecentFailure.subject}`
+      );
+    }
 
     const latestMessagesFromDb = (
       messagesProbe.rows as unknown as Array<Record<string, unknown>>
@@ -3741,6 +4068,7 @@ export function createApiApp() {
 
     const memMessages = Array.from(mailboxMessagesMap.values())
       .flat()
+      .filter((m) => m.recipientAddress !== INBOUND_AUDIT_ADDRESS)
       .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
       .slice(0, 30)
       .map((m) => ({
@@ -3757,14 +4085,13 @@ export function createApiApp() {
     const latestMailboxesFromDb = (
       mailboxesProbe.rows as unknown as Array<Record<string, unknown>>
     ).map((row) => ({
-        address: String(row.address || ''),
-        username: String(row.username || ''),
-        domain: String(row.domain || CUSTOM_EMAIL_DOMAIN),
-        accountMode: String(row.account_mode || 'personal'),
-        createdAt: String(row.created_at || ''),
-        isDeleted: Boolean(row.is_deleted),
-      })
-    );
+      address: String(row.address || ''),
+      username: String(row.username || ''),
+      domain: String(row.domain || CUSTOM_EMAIL_DOMAIN),
+      accountMode: String(row.account_mode || 'personal'),
+      createdAt: String(row.created_at || ''),
+      isDeleted: Boolean(row.is_deleted),
+    }));
 
     const memMailboxes = Array.from(mailboxRegistry.values())
       .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
@@ -3781,12 +4108,16 @@ export function createApiApp() {
     res.json({
       checkedAt: new Date().toISOString(),
       ownerEmail: verified.email,
+      publicWebhookUrl: `https://${CUSTOM_EMAIL_DOMAIN}/api/email/inbound`,
       environment: {
         emailDomain: CUSTOM_EMAIL_DOMAIN,
-        inboundSecretConfigured: Boolean(getInboundEmailSecret()),
-        supabaseConfigured: Boolean(getSupabaseServerConfig().url),
+        inboundSecretConfigured,
+        supabaseConfigured,
         supabaseServiceRoleConfigured: serviceRoleConfigured,
       },
+      dnsCheck,
+      domainConnection,
+      connectionErrors,
       probes: {
         mailboxes: {
           ok: mailboxesProbe.ok,
@@ -3805,7 +4136,7 @@ export function createApiApp() {
           errorHint: messagesProbe.errorHint,
         },
       },
-      recentInboundAttempts: inboundAttemptLogs,
+      recentInboundAttempts: mergedAttempts,
       latestMessages: latestMessagesFromDb.length > 0 ? latestMessagesFromDb : memMessages,
       latestMailboxes: latestMailboxesFromDb.length > 0 ? latestMailboxesFromDb : memMailboxes,
     });
@@ -3826,46 +4157,102 @@ export function createApiApp() {
       ? requestedAddr
       : `diag.test@${CUSTOM_EMAIL_DOMAIN}`;
 
+    const reqHost = req.get('host') || `127.0.0.1:${process.env.PORT || 3000}`;
+    const forwardedProto =
+      typeof req.headers['x-forwarded-proto'] === 'string'
+        ? req.headers['x-forwarded-proto'].split(',')[0].trim()
+        : req.protocol || 'http';
+    const isLocalHost =
+      reqHost.startsWith('127.0.0.1') || reqHost.startsWith('localhost');
+    const origin = isLocalHost
+      ? `http://${reqHost}`
+      : `${forwardedProto || 'https'}://${reqHost}`;
+    const endpointUrl = `${origin}/api/email/inbound`;
+
     const testCode = String(Math.floor(100000 + Math.random() * 899999));
     const startedAt = Date.now();
     const secret = getInboundEmailSecret();
 
-    let httpStatus = 500;
-    let mockStatusCode = 200;
+    let httpStatus = 0;
     let responseBody: unknown = null;
+    let fetchError: string | null = null;
 
-    const mockReq = {
-      params: {},
-      headers: {
-        'content-type': 'application/json',
-        ...(secret ? { 'x-inbound-secret': secret } : {}),
-      },
-      query: {},
-      body: {
-        to: targetAddress,
-        from: `VeriBox Diagnostic <diag@${CUSTOM_EMAIL_DOMAIN}>`,
-        subject: `Pipeline Test Code ${testCode}`,
-        text: `Your VeriBox inbound pipeline diagnostic code is ${testCode}.`,
-        html: `<p>Your VeriBox inbound pipeline diagnostic code is <strong>${testCode}</strong>.</p>`,
-      },
-    } as unknown as express.Request;
+    const dnsCheckPromise = checkDomainDns(CUSTOM_EMAIL_DOMAIN);
+    const prodDomainUrl = `https://${CUSTOM_EMAIL_DOMAIN}`;
+    const prodProbePromise =
+      origin !== prodDomainUrl
+        ? (async () => {
+            try {
+              const r = await fetch(`${prodDomainUrl}/api/email/inbound`, {
+                method: 'POST',
+                headers: {
+                  'content-type': 'application/json',
+                  ...(secret ? { 'x-inbound-secret': secret } : {}),
+                },
+                body: JSON.stringify({
+                  to: targetAddress,
+                  from: 'TikTok <noreply@account.tiktok.com>',
+                  subject: `${testCode} is your verification code`,
+                  text: `[TikTok] ${testCode} is your verification code`,
+                  html: `<p>Your TikTok verification code is <strong>${testCode}</strong>.</p>`,
+                }),
+                signal: AbortSignal.timeout(3500),
+              });
+              const txt = await r.text();
+              let parsed: unknown = txt;
+              try {
+                parsed = JSON.parse(txt);
+              } catch {
+                // Keep raw text
+              }
+              return {
+                url: `${prodDomainUrl}/api/email/inbound`,
+                httpStatus: r.status,
+                reachable: r.ok,
+                detail:
+                  typeof parsed === 'object' && parsed && 'error' in parsed
+                    ? String((parsed as { error?: string }).error)
+                    : r.ok
+                      ? 'Live custom domain webhook accepted payload and stored message'
+                      : `HTTP ${r.status}: ${txt.slice(0, 180)}`,
+              };
+            } catch (err) {
+              return {
+                url: `${prodDomainUrl}/api/email/inbound`,
+                httpStatus: null,
+                reachable: false,
+                detail: err instanceof Error ? err.message : 'Production webhook unreachable',
+              };
+            }
+          })()
+        : Promise.resolve(null);
 
-    const mockResObj = {
-      status(code: number) {
-        mockStatusCode = code;
-        httpStatus = code;
-        return mockResObj;
-      },
-      json(data: unknown) {
-        responseBody = data;
-        return mockResObj;
-      },
-    };
-    const mockRes = mockResObj as unknown as express.Response;
-
-    await handleInboundEmailWebhook(mockReq, mockRes);
-    if (httpStatus === 500 && responseBody) {
-      httpStatus = mockStatusCode || 200;
+    try {
+      const webhookRes = await fetch(endpointUrl, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(secret ? { 'x-inbound-secret': secret } : {}),
+        },
+        body: JSON.stringify({
+          to: targetAddress,
+          from: 'TikTok <noreply@account.tiktok.com>',
+          subject: `${testCode} is your verification code`,
+          text: `[TikTok] ${testCode} is your verification code`,
+          html: `<div style="font-family:sans-serif"><p>Your verification code is <strong>${testCode}</strong>. Valid for 10 minutes.</p></div>`,
+        }),
+        signal: AbortSignal.timeout(4500),
+      });
+      httpStatus = webhookRes.status;
+      const rawRespText = await webhookRes.text();
+      try {
+        responseBody = JSON.parse(rawRespText);
+      } catch {
+        responseBody = { raw: rawRespText.slice(0, 500) };
+      }
+    } catch (err) {
+      fetchError = err instanceof Error ? err.message : 'Real HTTP POST to /api/email/inbound failed';
+      responseBody = { error: fetchError };
     }
 
     const parsedResp = (responseBody && typeof responseBody === 'object'
@@ -3875,11 +4262,12 @@ export function createApiApp() {
       otpDetected?: string | null;
       supabaseStored?: boolean;
       supabaseError?: string | null;
+      error?: string;
     };
 
     const insertedId = Array.isArray(parsedResp.messageIds) ? parsedResp.messageIds[0] : null;
     let supabaseReadbackOk = false;
-    let readbackError: string | null = parsedResp.supabaseError || null;
+    let readbackError: string | null = parsedResp.supabaseError || parsedResp.error || fetchError || null;
 
     if (insertedId) {
       try {
@@ -3900,16 +4288,62 @@ export function createApiApp() {
       }
     }
 
+    let inboxApiOk: boolean | null = null;
+    let inboxMessageCount: number | null = null;
+    let inboxError: string | null = null;
+
+    const mailboxRec = await findMailboxRecord(targetAddress);
+    if (mailboxRec && mailboxRec.token) {
+      try {
+        const inboxRes = await fetch(`${origin}/api/email/messages`, {
+          headers: {
+            Authorization: `Bearer ${mailboxRec.token}`,
+            'x-email-address': targetAddress,
+          },
+          signal: AbortSignal.timeout(3000),
+        });
+        const inboxData = (await inboxRes.json().catch(() => ({}))) as {
+          messages?: Array<{ id?: string; otp?: string | null }>;
+          error?: string;
+        };
+        if (inboxRes.ok && Array.isArray(inboxData.messages)) {
+          inboxMessageCount = inboxData.messages.length;
+          inboxApiOk = insertedId
+            ? inboxData.messages.some((m) => m.id === insertedId)
+            : inboxData.messages.length > 0;
+          if (!inboxApiOk && insertedId) {
+            inboxError = 'Webhook stored message, but /api/email/messages did not return the new row';
+          }
+        } else {
+          inboxApiOk = false;
+          inboxError = `HTTP ${inboxRes.status}: ${inboxData.error || 'Inbox API check failed'}`;
+        }
+      } catch (err) {
+        inboxApiOk = false;
+        inboxError = err instanceof Error ? err.message : 'Inbox API HTTP fetch failed';
+      }
+    } else {
+      inboxError = `No registered mailbox found for ${targetAddress} — generate or select an active mailbox first to verify frontend inbox readback.`;
+    }
+
+    const [dnsCheck, productionProbe] = await Promise.all([dnsCheckPromise, prodProbePromise]);
+
     res.json({
       testedAt: new Date().toISOString(),
       targetAddress,
+      endpointUrl,
       httpStatus,
       latencyMs: Date.now() - startedAt,
       responseBody,
       supabaseWriteOk: Boolean(parsedResp.supabaseStored),
       supabaseReadbackOk,
+      inboxApiOk,
+      inboxMessageCount,
+      inboxError,
       supabaseError: readbackError,
       otpDetected: parsedResp.otpDetected || null,
+      productionProbe,
+      dnsCheck,
     });
   });
 

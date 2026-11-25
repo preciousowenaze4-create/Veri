@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { User as SupabaseUser } from '@supabase/supabase-js';
-import { WifiOff } from 'lucide-react';
+import { AlertTriangle, RefreshCw, ShieldAlert, WifiOff, X } from 'lucide-react';
 import { AdminDiagnosticsTab } from './components/AdminDiagnosticsTab';
 import { AuthModal } from './components/AuthModal';
 import { BottomNav } from './components/BottomNav';
@@ -189,7 +189,15 @@ export default function App() {
   const [testingInbound, setTestingInbound] = useState<boolean>(false);
   const [adminTestResult, setAdminTestResult] = useState<AdminInboundTestResult | null>(null);
   const [adminTestError, setAdminTestError] = useState<string | null>(null);
+  const [adminRealtimeConnected, setAdminRealtimeConnected] = useState<boolean>(false);
+  const [domainErrorPopup, setDomainErrorPopup] = useState<{
+    title: string;
+    errors: string[];
+    timestamp: string;
+  } | null>(null);
   const autoSwitchedAdminUserIdRef = useRef<string | null>(null);
+  const adminDiagnosticsInFlightRef = useRef<boolean>(false);
+  const lastAlertedSignatureRef = useRef<string>('');
 
   // Private Numbers Flow state (Setup -> Active Receiver -> History)
   const [services, setServices] = useState<NumberServiceOption[]>(DEFAULT_SERVICES);
@@ -343,40 +351,84 @@ export default function App() {
     }
   }, []);
 
-  const fetchAdminDiagnostics = useCallback(async () => {
-    if (!isOwnerAdmin) return;
-    setAdminLoading(true);
-    setAdminError(null);
-    try {
-      const token = await getAuthAccessToken();
-      if (!token) {
-        throw new Error('HTTP 401: Missing active Supabase session token for admin diagnostics.');
+  const fetchAdminDiagnostics = useCallback(
+    async (silent = false) => {
+      if (!isOwnerAdmin || adminDiagnosticsInFlightRef.current) return;
+      adminDiagnosticsInFlightRef.current = true;
+      if (!silent) {
+        setAdminLoading(true);
       }
-      const res = await fetch('/api/admin/diagnostics', {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-        signal: AbortSignal.timeout(10000),
-      });
-      const data = await parseJsonResponse<AdminDiagnosticsResponse & { error?: string }>(res);
-      if (!res.ok) {
-        throw new Error(
-          `HTTP ${res.status}: ${data.error || res.statusText || 'Failed to load diagnostics'}`
-        );
+      setAdminError(null);
+      try {
+        const token = await getAuthAccessToken();
+        if (!token) {
+          throw new Error('HTTP 401: Missing active Supabase session token for admin diagnostics.');
+        }
+        const res = await fetch('/api/admin/diagnostics', {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+          signal: AbortSignal.timeout(9000),
+        });
+        const data = await parseJsonResponse<AdminDiagnosticsResponse & { error?: string }>(res);
+        if (!res.ok) {
+          throw new Error(
+            `HTTP ${res.status}: ${data.error || res.statusText || 'Failed to load diagnostics'}`
+          );
+        }
+        setAdminDiagnostics(data);
+
+        const activeIssues: string[] = Array.isArray(data.connectionErrors)
+          ? [...data.connectionErrors]
+          : [];
+        if (
+          data.domainConnection &&
+          !data.domainConnection.ok &&
+          data.domainConnection.error &&
+          !activeIssues.includes(data.domainConnection.error)
+        ) {
+          activeIssues.unshift(data.domainConnection.error);
+        }
+
+        if (activeIssues.length > 0) {
+          const signature = activeIssues.join('||');
+          if (signature !== lastAlertedSignatureRef.current) {
+            lastAlertedSignatureRef.current = signature;
+            setDomainErrorPopup({
+              title: `${data.environment?.emailDomain || emailDomain} Connection Alert`,
+              errors: activeIssues,
+              timestamp: data.checkedAt || new Date().toISOString(),
+            });
+          }
+        } else {
+          lastAlertedSignatureRef.current = '';
+          setDomainErrorPopup(null);
+        }
+      } catch (err) {
+        const message =
+          err instanceof Error
+            ? err.name === 'TimeoutError' || err.name === 'AbortError'
+              ? 'Request timed out while loading admin diagnostics'
+              : err.message
+            : 'Failed to load admin diagnostics';
+        setAdminError(message);
+        if (message !== lastAlertedSignatureRef.current) {
+          lastAlertedSignatureRef.current = message;
+          setDomainErrorPopup({
+            title: `${emailDomain} Diagnostics Connection Error`,
+            errors: [message],
+            timestamp: new Date().toISOString(),
+          });
+        }
+      } finally {
+        adminDiagnosticsInFlightRef.current = false;
+        if (!silent) {
+          setAdminLoading(false);
+        }
       }
-      setAdminDiagnostics(data);
-    } catch (err) {
-      const message =
-        err instanceof Error
-          ? err.name === 'TimeoutError' || err.name === 'AbortError'
-            ? 'Request timed out while loading admin diagnostics'
-            : err.message
-          : 'Failed to load admin diagnostics';
-      setAdminError(message);
-    } finally {
-      setAdminLoading(false);
-    }
-  }, [isOwnerAdmin, getAuthAccessToken]);
+    },
+    [isOwnerAdmin, getAuthAccessToken, emailDomain]
+  );
 
   const handleTestInboundPipeline = useCallback(
     async (targetAddress: string) => {
@@ -395,7 +447,7 @@ export default function App() {
             Authorization: `Bearer ${token}`,
           },
           body: JSON.stringify({ targetAddress }),
-          signal: AbortSignal.timeout(12000),
+          signal: AbortSignal.timeout(10500),
         });
         const data = await parseJsonResponse<AdminInboundTestResult & { error?: string }>(res);
         if (!res.ok && typeof data.httpStatus !== 'number') {
@@ -404,7 +456,16 @@ export default function App() {
           );
         }
         setAdminTestResult(data);
-        void fetchAdminDiagnostics();
+        if (data.productionProbe && !data.productionProbe.reachable) {
+          setDomainErrorPopup({
+            title: `Live Webhook Connection Failed (${emailDomain})`,
+            errors: [
+              `${data.productionProbe.url} -> HTTP ${data.productionProbe.httpStatus ?? 'ERR'}: ${data.productionProbe.detail}`,
+            ],
+            timestamp: data.testedAt || new Date().toISOString(),
+          });
+        }
+        void fetchAdminDiagnostics(true);
       } catch (err) {
         const message =
           err instanceof Error
@@ -413,11 +474,16 @@ export default function App() {
               : err.message
             : 'Inbound pipeline test failed';
         setAdminTestError(message);
+        setDomainErrorPopup({
+          title: `Live Pipeline Test Error (${emailDomain})`,
+          errors: [message],
+          timestamp: new Date().toISOString(),
+        });
       } finally {
         setTestingInbound(false);
       }
     },
-    [isOwnerAdmin, getAuthAccessToken, fetchAdminDiagnostics]
+    [isOwnerAdmin, getAuthAccessToken, fetchAdminDiagnostics, emailDomain]
   );
 
   // Auto-switch owner account (preciousddkid@gmail.com) to Owner Admin Diagnostics on sign-in,
@@ -427,17 +493,90 @@ export default function App() {
       if (autoSwitchedAdminUserIdRef.current !== authUser.id) {
         autoSwitchedAdminUserIdRef.current = authUser.id;
         setActiveTab('admin');
-        void fetchAdminDiagnostics();
+        void fetchAdminDiagnostics(false);
       }
     } else {
       autoSwitchedAdminUserIdRef.current = null;
+      lastAlertedSignatureRef.current = '';
       setAdminDiagnostics(null);
       setAdminError(null);
       setAdminTestResult(null);
       setAdminTestError(null);
+      setDomainErrorPopup(null);
+      setAdminRealtimeConnected(false);
       setActiveTab((prev) => (prev === 'admin' ? 'home' : prev));
     }
   }, [isOwnerAdmin, authUser?.id, fetchAdminDiagnostics]);
+
+  // Real-time Supabase Postgres subscription for owner admin: instant updates + immediate error pop-up on any event
+  useEffect(() => {
+    if (!isOwnerAdmin || !authUser?.id) {
+      setAdminRealtimeConnected(false);
+      return;
+    }
+
+    let active = true;
+    let cleanupChannel: (() => void) | null = null;
+
+    void ensureSupabaseClient().then((sb) => {
+      if (!active || !sb) return;
+      const channel = sb
+        .channel(`owner-admin-realtime-${authUser.id}`)
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'mailbox_messages' },
+          () => {
+            void fetchAdminDiagnostics(true);
+          }
+        )
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'mailboxes' },
+          () => {
+            void fetchAdminDiagnostics(true);
+          }
+        )
+        .subscribe((status) => {
+          if (!active) return;
+          setAdminRealtimeConnected(status === 'SUBSCRIBED');
+        });
+
+      cleanupChannel = () => {
+        void sb.removeChannel(channel);
+      };
+    });
+
+    return () => {
+      active = false;
+      setAdminRealtimeConnected(false);
+      cleanupChannel?.();
+    };
+  }, [isOwnerAdmin, authUser?.id, fetchAdminDiagnostics]);
+
+  // Real-time 4s silent polling while Owner Admin tab is active (plus instant resume refresh across tabs)
+  useEffect(() => {
+    if (!isOwnerAdmin) return;
+
+    const handleResume = () => {
+      if (document.visibilityState === 'hidden') return;
+      void fetchAdminDiagnostics(true);
+    };
+
+    window.addEventListener('focus', handleResume);
+    document.addEventListener('visibilitychange', handleResume);
+
+    const intervalMs = activeTab === 'admin' ? 4000 : 20000;
+    const intervalId = window.setInterval(() => {
+      if (document.visibilityState === 'hidden') return;
+      void fetchAdminDiagnostics(true);
+    }, intervalMs);
+
+    return () => {
+      window.clearInterval(intervalId);
+      window.removeEventListener('focus', handleResume);
+      document.removeEventListener('visibilitychange', handleResume);
+    };
+  }, [isOwnerAdmin, activeTab, fetchAdminDiagnostics]);
 
   const handleSignOut = useCallback(async () => {
     const client = getActiveSupabaseClient() || (await ensureSupabaseClient());
@@ -446,12 +585,15 @@ export default function App() {
     }
     pendingAuthActionRef.current = null;
     autoSwitchedAdminUserIdRef.current = null;
+    lastAlertedSignatureRef.current = '';
     setAuthUser(null);
     setWalletBalance(0);
     setAdminDiagnostics(null);
     setAdminError(null);
     setAdminTestResult(null);
     setAdminTestError(null);
+    setDomainErrorPopup(null);
+    setAdminRealtimeConnected(false);
     setActiveTab((prev) => (prev === 'admin' ? 'home' : prev));
     setAuthModalOpen(false);
     setAuthActionReason(null);
@@ -1748,6 +1890,83 @@ export default function App() {
         </div>
       )}
 
+      {isOwnerAdmin && domainErrorPopup && (
+        <div
+          role="alertdialog"
+          aria-modal="true"
+          aria-label="Domain connection error alert"
+          className="fixed inset-x-0 top-14 z-50 mx-auto w-[calc(100%-1.5rem)] max-w-xl animate-in fade-in duration-150"
+        >
+          <div className="rounded-2xl border-2 border-rose-500/80 bg-[#1A0D0E] p-4 text-rose-50 shadow-2xl">
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-start gap-2.5 min-w-0">
+                <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-rose-500/20 text-rose-400">
+                  <ShieldAlert className="h-5 w-5" />
+                </div>
+                <div className="min-w-0">
+                  <p className="text-[11px] font-extrabold uppercase tracking-wider text-rose-300">
+                    Real-Time Domain Error Alert
+                  </p>
+                  <h2 className="font-display text-sm font-extrabold text-white truncate">
+                    {domainErrorPopup.title}
+                  </h2>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setDomainErrorPopup(null)}
+                aria-label="Dismiss domain error popup"
+                className="rounded-lg p-1.5 text-rose-200 hover:bg-rose-500/20 cursor-pointer"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <ul className="mt-3 space-y-1.5 max-h-40 overflow-y-auto">
+              {domainErrorPopup.errors.map((errMsg, idx) => (
+                <li
+                  key={idx}
+                  className="flex items-start gap-2 rounded-lg bg-rose-950/70 px-2.5 py-1.5 font-mono text-[11px] text-rose-100 break-words"
+                >
+                  <AlertTriangle className="h-3.5 w-3.5 shrink-0 mt-0.5 text-rose-400" />
+                  <span>{errMsg}</span>
+                </li>
+              ))}
+            </ul>
+
+            <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => void fetchAdminDiagnostics(false)}
+                className="inline-flex items-center gap-1.5 rounded-xl border border-rose-400/40 bg-rose-500/15 px-3 py-1.5 text-xs font-bold text-rose-100 hover:bg-rose-500/30 cursor-pointer"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${adminLoading ? 'animate-spin' : ''}`} />
+                <span>Re-check Domain</span>
+              </button>
+              {activeTab !== 'admin' && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setActiveTab('admin');
+                    void fetchAdminDiagnostics(false);
+                  }}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-rose-500 px-3.5 py-1.5 text-xs font-extrabold text-white hover:bg-rose-400 cursor-pointer"
+                >
+                  <span>Open Owner Admin</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setDomainErrorPopup(null)}
+                className="rounded-xl px-2.5 py-1.5 text-xs font-bold text-rose-200 hover:bg-white/10 cursor-pointer"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <main className="mx-auto w-full max-w-7xl px-3 pb-24 pt-3 sm:px-6 sm:pt-5">
         {activeTab === 'home' && (
           <HomeEmailTab
@@ -2000,11 +2219,12 @@ export default function App() {
             activeEmailAddress={activeEmail?.address ?? null}
             diagnostics={adminDiagnostics}
             loading={adminLoading}
+            realtimeConnected={adminRealtimeConnected}
             error={adminError}
             testingInbound={testingInbound}
             testResult={adminTestResult}
             testError={adminTestError}
-            onRefresh={() => void fetchAdminDiagnostics()}
+            onRefresh={() => void fetchAdminDiagnostics(false)}
             onTestInbound={(addr) => void handleTestInboundPipeline(addr)}
             onSwitchToUserView={() => setActiveTab('home')}
           />
@@ -2014,7 +2234,16 @@ export default function App() {
       <BottomNav
         activeTab={activeTab}
         unreadEmailCount={unreadEmailCount}
-        onChange={(tab) => setActiveTab(tab)}
+        isOwnerAdmin={isOwnerAdmin}
+        onChange={(tab) => {
+          if (tab === 'admin') {
+            if (!isOwnerAdmin) return;
+            setActiveTab('admin');
+            void fetchAdminDiagnostics();
+            return;
+          }
+          setActiveTab(tab);
+        }}
       />
     </div>
   );

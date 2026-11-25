@@ -232,15 +232,42 @@ export interface AdminMailboxRow {
   isDeleted: boolean;
 }
 
+export interface AdminDnsCheck {
+  checkedAt: string;
+  domain: string;
+  mxOk: boolean;
+  mxRecords: string[];
+  spfOk: boolean;
+  spfRecord: string | null;
+  dmarcOk: boolean;
+  dmarcRecord: string | null;
+  aRecords: string[];
+  error: string | null;
+}
+
+export interface AdminDomainConnectionCheck {
+  checkedAt: string;
+  url: string;
+  ok: boolean;
+  httpStatus: number | null;
+  latencyMs: number;
+  domainMatched: boolean;
+  error: string | null;
+}
+
 export interface AdminDiagnosticsResponse {
   checkedAt: string;
   ownerEmail: string;
+  publicWebhookUrl?: string;
   environment: {
     emailDomain: string;
     inboundSecretConfigured: boolean;
     supabaseConfigured: boolean;
     supabaseServiceRoleConfigured: boolean;
   };
+  dnsCheck?: AdminDnsCheck;
+  domainConnection?: AdminDomainConnectionCheck;
+  connectionErrors?: string[];
   probes: {
     mailboxes: AdminTableProbe;
     mailboxMessages: AdminTableProbe;
@@ -253,11 +280,22 @@ export interface AdminDiagnosticsResponse {
 export interface AdminInboundTestResult {
   testedAt: string;
   targetAddress: string;
+  endpointUrl: string;
   httpStatus: number;
   latencyMs: number;
   responseBody: unknown;
   supabaseWriteOk: boolean;
   supabaseReadbackOk: boolean;
+  inboxApiOk: boolean | null;
+  inboxMessageCount: number | null;
+  inboxError: string | null;
   supabaseError: string | null;
   otpDetected: string | null;
+  productionProbe?: {
+    url: string;
+    httpStatus: number | null;
+    reachable: boolean;
+    detail: string;
+  } | null;
+  dnsCheck?: AdminDnsCheck;
 }

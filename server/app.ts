@@ -2565,9 +2565,77 @@ export function createApiApp() {
   }
 
   const mailboxRegistry = new Map<string, CustomMailboxRecord>();
+  const markedCreatedAddresses = new Set<string>();
   const mailboxMessagesMap = new Map<string, CustomInboxMessageRecord[]>();
   const emailEvents = new EventEmitter();
   emailEvents.setMaxListeners(200);
+  const runtimeMailboxSigningKey = crypto.randomBytes(32).toString('hex');
+
+  function getMailboxSigningSecret(): string {
+    return (
+      (
+        process.env.MAILBOX_TOKEN_SECRET ||
+        process.env.INBOUND_EMAIL_SECRET ||
+        process.env.SUPABASE_SERVICE_ROLE_KEY ||
+        process.env.SUPABASE_SECRET_KEY ||
+        ''
+      ).trim() || runtimeMailboxSigningKey
+    );
+  }
+
+  function createSignedMailboxToken(rawAddress: string): string {
+    const addr = rawAddress.trim().toLowerCase();
+    const nonce = crypto.randomBytes(16).toString('hex');
+    const sig = crypto
+      .createHmac('sha256', getMailboxSigningSecret())
+      .update(`${addr}|${nonce}`)
+      .digest('hex')
+      .slice(0, 32);
+    return `vbx1.${nonce}.${sig}`;
+  }
+
+  function verifySignedMailboxToken(rawAddress: string, rawToken: string): boolean {
+    const addr = rawAddress.trim().toLowerCase();
+    const parts = rawToken.trim().split('.');
+    if (parts.length !== 3 || parts[0] !== 'vbx1') return false;
+    const [, nonce, providedSig] = parts;
+    if (!nonce || !providedSig) return false;
+    const expectedSig = crypto
+      .createHmac('sha256', getMailboxSigningSecret())
+      .update(`${addr}|${nonce}`)
+      .digest('hex')
+      .slice(0, 32);
+    return safeSecretsEqual(providedSig, expectedSig);
+  }
+
+  async function getVerifiedSupabaseBearerUser(
+    req: express.Request
+  ): Promise<{ id: string; email: string } | null> {
+    const rawHeader =
+      (typeof req.headers['x-supabase-token'] === 'string'
+        ? req.headers['x-supabase-token']
+        : '') || (req.headers.authorization || '');
+    const jwt = rawHeader.replace(/^Bearer\s+/i, '').trim();
+    if (!jwt || jwt.startsWith('vbx1.')) return null;
+
+    const sb = getSupabaseServerClient();
+    if (!sb) return null;
+    try {
+      const { data, error } = await sb.auth.getUser(jwt);
+      if (error || !data?.user) return null;
+      return {
+        id: String(data.user.id),
+        email: String(data.user.email || '').trim().toLowerCase(),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  async function isVerifiedOwnerAdminCaller(req: express.Request): Promise<boolean> {
+    const user = await getVerifiedSupabaseBearerUser(req);
+    return Boolean(user && user.email === OWNER_ADMIN_EMAIL);
+  }
 
   function hashEmailPassword(password: string, salt?: string): { salt: string; hash: string } {
     const useSalt = salt || crypto.randomBytes(16).toString('hex');
@@ -2586,6 +2654,78 @@ export function createApiApp() {
     }
   }
 
+  async function isEmailAddressClaimed(rawAddress: string): Promise<boolean> {
+    const addr = rawAddress.trim().toLowerCase();
+    if (!addr) return true;
+    if (markedCreatedAddresses.has(addr) || mailboxRegistry.has(addr)) {
+      markedCreatedAddresses.add(addr);
+      return true;
+    }
+
+    const sb = getSupabaseServerClient();
+    if (!sb) return false;
+
+    try {
+      const [regRes, mbRes, msgRes] = await Promise.all([
+        sb
+          .from('created_email_registry')
+          .select('address')
+          .ilike('address', addr)
+          .limit(1)
+          .maybeSingle(),
+        sb.from('mailboxes').select('address').ilike('address', addr).limit(1).maybeSingle(),
+        sb
+          .from('mailbox_messages')
+          .select('recipient_address')
+          .ilike('recipient_address', addr)
+          .limit(1)
+          .maybeSingle(),
+      ]);
+
+      if (regRes.data?.address || mbRes.data?.address || msgRes.data?.recipient_address) {
+        markedCreatedAddresses.add(addr);
+        return true;
+      }
+    } catch {
+      // Non-blocking fallback to in-memory set
+    }
+
+    return false;
+  }
+
+  async function markEmailAsClaimed(params: {
+    address: string;
+    username: string;
+    domain: string;
+    ownerUserId?: string;
+    source: 'generate' | 'create';
+    isDeleted?: boolean;
+    createdAt?: string;
+  }): Promise<void> {
+    const addr = params.address.trim().toLowerCase();
+    markedCreatedAddresses.add(addr);
+
+    const sb = getSupabaseServerClient();
+    if (!sb) return;
+    try {
+      await sb.from('created_email_registry').upsert(
+        {
+          address: addr,
+          username: params.username.trim().toLowerCase(),
+          domain: params.domain.trim().toLowerCase(),
+          created_by_user_id: params.ownerUserId || null,
+          source: params.source,
+          is_deleted: Boolean(params.isDeleted),
+          created_at: params.createdAt || new Date().toISOString(),
+          deleted_at: params.isDeleted ? new Date().toISOString() : null,
+        },
+        { onConflict: 'address' }
+      );
+    } catch {
+      // Non-blocking if migration SQL hasn't been run yet
+    }
+  }
+
   async function findMailboxRecord(rawAddress: string): Promise<CustomMailboxRecord | null> {
     const addr = rawAddress.trim().toLowerCase();
     if (!addr) return null;
@@ -2596,13 +2736,15 @@ export function createApiApp() {
         const { data, error } = await sb
           .from('mailboxes')
           .select('*')
-          .eq('address', addr)
+          .ilike('address', addr)
+          .limit(1)
           .maybeSingle();
         if (!error && data) {
+          const normalizedAddr = String(data.address).trim().toLowerCase();
           const rec: CustomMailboxRecord = {
             id: String(data.id),
-            address: String(data.address),
-            username: String(data.username),
+            address: normalizedAddr,
+            username: String(data.username).trim().toLowerCase(),
             domain: String(data.domain || CUSTOM_EMAIL_DOMAIN),
             displayName: data.display_name ? String(data.display_name) : undefined,
             accountMode: data.account_mode ? String(data.account_mode) : 'personal',
@@ -2614,7 +2756,8 @@ export function createApiApp() {
             isDeleted: Boolean(data.is_deleted),
             createdAt: String(data.created_at || new Date().toISOString()),
           };
-          mailboxRegistry.set(addr, rec);
+          mailboxRegistry.set(normalizedAddr, rec);
+          markedCreatedAddresses.add(normalizedAddr);
           return rec;
         }
       } catch {
@@ -2622,40 +2765,80 @@ export function createApiApp() {
       }
     }
 
-    return mailboxRegistry.get(addr) || null;
+    const mem = mailboxRegistry.get(addr) || null;
+    if (mem) markedCreatedAddresses.add(addr);
+    return mem;
   }
 
-  async function saveMailboxRecord(record: CustomMailboxRecord): Promise<void> {
+  async function saveMailboxRecord(
+    record: CustomMailboxRecord,
+    opts?: { isNew?: boolean; source?: 'generate' | 'create' }
+  ): Promise<void> {
     const addr = record.address.trim().toLowerCase();
-    mailboxRegistry.set(addr, record);
+    const isNew = Boolean(opts?.isNew);
+    if (isNew && (mailboxRegistry.has(addr) || markedCreatedAddresses.has(addr))) {
+      const dupErr = new Error(`${addr} is already registered. Pick or generate a different username.`);
+      (dupErr as Error & { statusCode?: number }).statusCode = 409;
+      throw dupErr;
+    }
+
+    const rowPayload = {
+      address: addr,
+      id: record.id,
+      username: record.username.trim().toLowerCase(),
+      domain: record.domain,
+      display_name: record.displayName || null,
+      account_mode: record.accountMode || 'personal',
+      owner_user_id: record.ownerUserId || null,
+      password_hash: record.passwordHash,
+      salt: record.salt,
+      token: record.token,
+      is_deleted: record.isDeleted,
+      created_at: record.createdAt,
+    };
 
     const sb = getSupabaseServerClient();
     if (sb) {
       try {
-        const { error } = await sb.from('mailboxes').upsert(
-          {
-            address: addr,
-            id: record.id,
-            username: record.username,
-            domain: record.domain,
-            display_name: record.displayName || null,
-            account_mode: record.accountMode || 'personal',
-            owner_user_id: record.ownerUserId || null,
-            password_hash: record.passwordHash,
-            salt: record.salt,
-            token: record.token,
-            is_deleted: record.isDeleted,
-            created_at: record.createdAt,
-          },
-          { onConflict: 'address' }
-        );
-        if (error) {
-          console.warn('[VeriBox Mail] Supabase mailboxes upsert warning:', error.message);
+        if (isNew) {
+          const { error } = await sb.from('mailboxes').insert(rowPayload);
+          if (error) {
+            if (error.code === '23505') {
+              markedCreatedAddresses.add(addr);
+              const dupErr = new Error(`${addr} is already registered.`);
+              (dupErr as Error & { statusCode?: number }).statusCode = 409;
+              throw dupErr;
+            }
+            console.warn('[VeriBox Mail] Supabase mailboxes insert warning:', error.message);
+          }
+        } else {
+          const { error } = await sb
+            .from('mailboxes')
+            .upsert(rowPayload, { onConflict: 'address' });
+          if (error) {
+            console.warn('[VeriBox Mail] Supabase mailboxes upsert warning:', error.message);
+          }
         }
-      } catch {
+      } catch (err) {
+        if ((err as { statusCode?: number }).statusCode === 409) {
+          throw err;
+        }
         // In-memory store remains active
       }
     }
+
+    mailboxRegistry.set(addr, { ...record, address: addr });
+    markedCreatedAddresses.add(addr);
+
+    await markEmailAsClaimed({
+      address: addr,
+      username: record.username,
+      domain: record.domain,
+      ownerUserId: record.ownerUserId,
+      source: opts?.source || 'create',
+      isDeleted: record.isDeleted,
+      createdAt: record.createdAt,
+    });
   }
 
   async function listMailboxesForOwner(ownerUserId: string): Promise<CustomMailboxRecord[]> {
@@ -2945,12 +3128,25 @@ export function createApiApp() {
       let username = normalizeCustomEmailUsername(rawCand);
       if (!isValidCustomEmailUsername(username) || seen.has(username)) continue;
 
-      const existing = await findMailboxRecord(`${username}@${CUSTOM_EMAIL_DOMAIN}`);
-      if (existing) {
-        username = normalizeCustomEmailUsername(`${username}${Math.floor(10 + Math.random() * 89)}`);
-        if (!isValidCustomEmailUsername(username) || seen.has(username)) continue;
-        const retryExisting = await findMailboxRecord(`${username}@${CUSTOM_EMAIL_DOMAIN}`);
-        if (retryExisting) continue;
+      if (await isEmailAddressClaimed(`${username}@${CUSTOM_EMAIL_DOMAIN}`)) {
+        let allocated: string | null = null;
+        for (let step = 0; step < 5; step++) {
+          const suffix =
+            step === 0
+              ? String(Math.floor(10 + Math.random() * 89))
+              : String(Math.floor(100 + Math.random() * 8999));
+          const numbered = normalizeCustomEmailUsername(`${username.slice(0, 24)}${suffix}`);
+          if (
+            isValidCustomEmailUsername(numbered) &&
+            !seen.has(numbered) &&
+            !(await isEmailAddressClaimed(`${numbered}@${CUSTOM_EMAIL_DOMAIN}`))
+          ) {
+            allocated = numbered;
+            break;
+          }
+        }
+        if (!allocated) continue;
+        username = allocated;
       }
 
       seen.add(username);
@@ -2987,13 +3183,23 @@ export function createApiApp() {
     }
 
     const address = `${username}@${CUSTOM_EMAIL_DOMAIN}`;
-    const existing = await findMailboxRecord(address);
+    const claimed = await isEmailAddressClaimed(address);
+    let suggestedAlternative: string | undefined;
+    if (claimed) {
+      const altUser = await allocateUniqueCustomUsername(username);
+      suggestedAlternative = `${altUser}@${CUSTOM_EMAIL_DOMAIN}`;
+    }
+
     res.json({
-      available: !existing,
+      available: !claimed,
+      alreadyCreated: claimed,
+      suggestedAlternative,
       username,
       address,
       domain: CUSTOM_EMAIL_DOMAIN,
-      error: existing ? `${address} is already taken. Choose a different username.` : undefined,
+      error: claimed
+        ? `${address} was already created and cannot be reused. Try ${suggestedAlternative} or pick another username.`
+        : undefined,
     });
   });
 
@@ -3004,6 +3210,7 @@ export function createApiApp() {
     displayName?: string;
     accountMode?: string;
     ownerUserId?: string;
+    source?: 'generate' | 'create';
   }) {
     const rawUser = params.usernameInput || params.addressInput || '';
     const username = normalizeCustomEmailUsername(rawUser);
@@ -3019,15 +3226,17 @@ export function createApiApp() {
     }
 
     const address = `${username}@${CUSTOM_EMAIL_DOMAIN}`;
-    const existing = await findMailboxRecord(address);
-    if (existing) {
-      const err = new Error(`${address} is already registered. Sign in with its password or pick another username.`);
+    const alreadyClaimed = await isEmailAddressClaimed(address);
+    if (alreadyClaimed) {
+      const err = new Error(
+        `${address} has already been created before (active or deleted) and cannot be reused.`
+      );
       (err as Error & { statusCode?: number }).statusCode = 409;
       throw err;
     }
 
     const { salt, hash } = hashEmailPassword(cleanPassword);
-    const token = crypto.randomBytes(24).toString('hex');
+    const token = createSignedMailboxToken(address);
     const id = `vbox_${crypto.randomBytes(8).toString('hex')}`;
     const createdAt = new Date().toISOString();
 
@@ -3047,7 +3256,7 @@ export function createApiApp() {
       createdAt,
     };
 
-    await saveMailboxRecord(record);
+    await saveMailboxRecord(record, { isNew: true, source: params.source || 'create' });
 
     // Deliver an instant welcome message into the new @veribox.name.ng inbox
     await saveInboxMessage({
@@ -3076,7 +3285,7 @@ export function createApiApp() {
     };
   }
 
-  async function generateInstantCustomUsername(): Promise<string> {
+  async function allocateUniqueCustomUsername(baseRaw?: string): Promise<string> {
     const firstNames = [
       'daniel', 'samuel', 'david', 'chinedu', 'tunde', 'michael', 'joseph', 'victor',
       'emeka', 'ibrahim', 'joshua', 'caleb', 'peter', 'isaac', 'nathan', 'kevin',
@@ -3086,27 +3295,58 @@ export function createApiApp() {
     const lastNames = [
       'okafor', 'adeyemi', 'bello', 'mensah', 'nwosu', 'balogun', 'eze', 'cole',
       'adams', 'johnson', 'okoro', 'suleiman', 'lawal', 'williams', 'brooks', 'morgan',
-      'carter', 'hassan', 'okafor', 'akintola', 'olamide', 'bennett', 'reid', 'foster',
+      'carter', 'hassan', 'akintola', 'olamide', 'bennett', 'reid', 'foster', 'wright',
     ];
-    for (let attempt = 0; attempt < 12; attempt++) {
+
+    if (baseRaw && baseRaw.trim()) {
+      const base = normalizeCustomEmailUsername(baseRaw).slice(0, 24);
+      if (isValidCustomEmailUsername(base)) {
+        if (!(await isEmailAddressClaimed(`${base}@${CUSTOM_EMAIL_DOMAIN}`))) {
+          return base;
+        }
+        // Automatically append numbers if base already exists (even if deleted)
+        for (let attempt = 0; attempt < 16; attempt++) {
+          const num =
+            attempt < 4
+              ? Math.floor(10 + Math.random() * 89)
+              : attempt < 10
+                ? Math.floor(100 + Math.random() * 8999)
+                : Math.floor(10000 + Math.random() * 89999);
+          const candidate = normalizeCustomEmailUsername(`${base.slice(0, 23)}${num}`);
+          if (
+            isValidCustomEmailUsername(candidate) &&
+            !(await isEmailAddressClaimed(`${candidate}@${CUSTOM_EMAIL_DOMAIN}`))
+          ) {
+            return candidate;
+          }
+        }
+      }
+    }
+
+    for (let attempt = 0; attempt < 18; attempt++) {
       const first = firstNames[Math.floor(Math.random() * firstNames.length)];
       const last = lastNames[Math.floor(Math.random() * lastNames.length)];
-      const num = Math.floor(12 + Math.random() * 987);
+      const num =
+        attempt < 10
+          ? Math.floor(12 + Math.random() * 987)
+          : Math.floor(1000 + Math.random() * 89999);
       const sep = attempt % 3 === 0 ? '.' : attempt % 3 === 1 ? '' : '_';
       const candidate = normalizeCustomEmailUsername(`${first}${sep}${last}${num}`);
       if (!isValidCustomEmailUsername(candidate)) continue;
-      const existing = await findMailboxRecord(`${candidate}@${CUSTOM_EMAIL_DOMAIN}`);
-      if (!existing) return candidate;
+      if (!(await isEmailAddressClaimed(`${candidate}@${CUSTOM_EMAIL_DOMAIN}`))) {
+        return candidate;
+      }
     }
+
     const fallbackFirst = firstNames[Math.floor(Math.random() * firstNames.length)];
     const fallbackLast = lastNames[Math.floor(Math.random() * lastNames.length)];
-    return normalizeCustomEmailUsername(
-      `${fallbackFirst}.${fallbackLast}${Math.floor(1000 + Math.random() * 8999)}`
-    );
+    const uniqSuffix = `${Date.now().toString(36).slice(-3)}${crypto.randomBytes(2).toString('hex')}`;
+    return normalizeCustomEmailUsername(`${fallbackFirst}.${fallbackLast}${uniqSuffix}`);
   }
 
   app.post('/api/email/create-selected', async (req, res) => {
     try {
+      const ownerUnlimited = await isVerifiedOwnerAdminCaller(req);
       const acct = await createCustomDomainMailbox({
         usernameInput: typeof req.body?.username === 'string' ? req.body.username : undefined,
         addressInput: typeof req.body?.address === 'string' ? req.body.address : undefined,
@@ -3114,8 +3354,9 @@ export function createApiApp() {
         displayName: typeof req.body?.displayName === 'string' ? req.body.displayName : undefined,
         accountMode: typeof req.body?.accountMode === 'string' ? req.body.accountMode : 'personal',
         ownerUserId: typeof req.body?.userId === 'string' ? req.body.userId : undefined,
+        source: 'create',
       });
-      res.json(acct);
+      res.json({ ...acct, ownerUnlimited });
     } catch (err) {
       const status = (err as { statusCode?: number }).statusCode || 400;
       res.status(status).json({
@@ -3126,23 +3367,41 @@ export function createApiApp() {
 
   app.post('/api/email/generate', async (req, res) => {
     try {
-      const generatedUsername =
+      const ownerUnlimited = await isVerifiedOwnerAdminCaller(req);
+      const requestedUsername =
         typeof req.body?.username === 'string' && req.body.username.trim()
           ? req.body.username
-          : await generateInstantCustomUsername();
+          : undefined;
       const generatedPassword =
         typeof req.body?.password === 'string' && req.body.password.trim().length >= 6
           ? req.body.password.trim()
           : `VB#${crypto.randomBytes(5).toString('hex')}`;
 
-      const acct = await createCustomDomainMailbox({
-        usernameInput: generatedUsername,
-        password: generatedPassword,
-        displayName: typeof req.body?.displayName === 'string' ? req.body.displayName : undefined,
-        accountMode: typeof req.body?.accountMode === 'string' ? req.body.accountMode : 'personal',
-        ownerUserId: typeof req.body?.userId === 'string' ? req.body.userId : undefined,
-      });
-      res.json(acct);
+      let lastErr: unknown = null;
+      for (let attempt = 0; attempt < 6; attempt++) {
+        const candidateUsername = await allocateUniqueCustomUsername(
+          attempt === 0 ? requestedUsername : requestedUsername || undefined
+        );
+        try {
+          const acct = await createCustomDomainMailbox({
+            usernameInput: candidateUsername,
+            password: generatedPassword,
+            displayName: typeof req.body?.displayName === 'string' ? req.body.displayName : undefined,
+            accountMode: typeof req.body?.accountMode === 'string' ? req.body.accountMode : 'personal',
+            ownerUserId: typeof req.body?.userId === 'string' ? req.body.userId : undefined,
+            source: 'generate',
+          });
+          res.json({ ...acct, ownerUnlimited });
+          return;
+        } catch (err) {
+          lastErr = err;
+          if ((err as { statusCode?: number }).statusCode !== 409) {
+            throw err;
+          }
+        }
+      }
+
+      throw lastErr || new Error(`Could not allocate unique @${CUSTOM_EMAIL_DOMAIN} address`);
     } catch (err) {
       const status = (err as { statusCode?: number }).statusCode || 400;
       res.status(status).json({
@@ -3153,6 +3412,7 @@ export function createApiApp() {
 
   app.post('/api/email/create', async (req, res) => {
     try {
+      const ownerUnlimited = await isVerifiedOwnerAdminCaller(req);
       const hasCustomInput =
         (typeof req.body?.username === 'string' && req.body.username.trim().length > 0) ||
         (typeof req.body?.address === 'string' && req.body.address.trim().length > 0);
@@ -3160,7 +3420,7 @@ export function createApiApp() {
         ? typeof req.body?.username === 'string'
           ? req.body.username
           : undefined
-        : await generateInstantCustomUsername();
+        : await allocateUniqueCustomUsername();
       const addressInput =
         typeof req.body?.address === 'string' && req.body.address.trim()
           ? req.body.address
@@ -3179,8 +3439,9 @@ export function createApiApp() {
         displayName: typeof req.body?.displayName === 'string' ? req.body.displayName : undefined,
         accountMode: typeof req.body?.accountMode === 'string' ? req.body.accountMode : 'personal',
         ownerUserId: typeof req.body?.userId === 'string' ? req.body.userId : undefined,
+        source: hasCustomInput ? 'create' : 'generate',
       });
-      res.json(acct);
+      res.json({ ...acct, ownerUnlimited });
     } catch (err) {
       const status = (err as { statusCode?: number }).statusCode || 400;
       res.status(status).json({
@@ -3234,8 +3495,15 @@ export function createApiApp() {
         return;
       }
 
-      if (reg.isDeleted) {
+      const callerUserId =
+        typeof req.body?.userId === 'string' && req.body.userId.trim()
+          ? normalizeWalletUserId(req.body.userId)
+          : undefined;
+      if (reg.isDeleted || (callerUserId && callerUserId !== 'default-wallet' && !reg.ownerUserId)) {
         reg.isDeleted = false;
+        if (callerUserId && callerUserId !== 'default-wallet' && !reg.ownerUserId) {
+          reg.ownerUserId = callerUserId;
+        }
         await saveMailboxRecord(reg);
       }
 
@@ -3255,12 +3523,18 @@ export function createApiApp() {
   });
 
   app.get('/api/email/list', async (req, res) => {
-    const userId = normalizeWalletUserId(req.query.userId);
-    if (!userId || userId === 'default-wallet') {
+    const requestedUserId = normalizeWalletUserId(req.query.userId);
+    const verifiedUser = await getVerifiedSupabaseBearerUser(req);
+    const effectiveUserId = verifiedUser ? verifiedUser.id : requestedUserId;
+    if (verifiedUser && requestedUserId !== 'default-wallet' && verifiedUser.id !== requestedUserId) {
+      res.status(403).json({ error: 'Forbidden: Cannot list another user mailbox collection' });
+      return;
+    }
+    if (!effectiveUserId || effectiveUserId === 'default-wallet') {
       res.json({ accounts: [] });
       return;
     }
-    const list = await listMailboxesForOwner(userId);
+    const list = await listMailboxesForOwner(effectiveUserId);
     res.json({
       accounts: list.map((m) => ({
         id: m.id,
@@ -3284,11 +3558,19 @@ export function createApiApp() {
       return;
     }
     const rec = await findMailboxRecord(address);
-    if (rec && (!token || rec.token === token)) {
+    if (rec && (!token || safeSecretsEqual(token, rec.token))) {
       rec.isDeleted = true;
       await saveMailboxRecord(rec);
+    } else if (address.endsWith(`@${CUSTOM_EMAIL_DOMAIN}`)) {
+      await markEmailAsClaimed({
+        address,
+        username: address.split('@')[0],
+        domain: CUSTOM_EMAIL_DOMAIN,
+        source: 'create',
+        isDeleted: true,
+      });
     }
-    res.json({ deleted: true, recoverable: true });
+    res.json({ deleted: true, recoverable: true, permanentlyMarked: true });
   });
 
   function safeSecretsEqual(provided: string, expected: string): boolean {
@@ -3591,20 +3873,20 @@ export function createApiApp() {
       .trim()
       .toLowerCase();
 
-    if (!emailAddress || !emailAddress.endsWith(`@${CUSTOM_EMAIL_DOMAIN}`)) {
+    if (!token || !emailAddress || !emailAddress.endsWith(`@${CUSTOM_EMAIL_DOMAIN}`)) {
       return null;
     }
 
     const reg = await findMailboxRecord(emailAddress);
     if (reg) {
-      if (!token || reg.token !== token) {
+      if (!safeSecretsEqual(token, reg.token)) {
         return null;
       }
       return reg.address;
     }
 
-    // Require non-empty token when checking an inbox across serverless cold starts
-    return token ? emailAddress : null;
+    // Strict fallback if DB was unreachable on cold start: ONLY accept a server-signed HMAC token bound to this exact email address
+    return verifySignedMailboxToken(emailAddress, token) ? emailAddress : null;
   }
 
   app.get('/api/email/stream', async (req, res) => {

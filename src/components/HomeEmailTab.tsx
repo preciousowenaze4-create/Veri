@@ -19,6 +19,7 @@ import { formatRelativeTime } from '../utils/clipboard';
 
 interface HomeEmailTabProps {
   emailDomain?: string;
+  isOwnerAdmin?: boolean;
   activeEmail: TempEmailAccount | null;
   savedEmails: TempEmailAccount[];
   messages: EmailMessageSummary[];
@@ -56,6 +57,7 @@ function providerName(domain: string, mode?: string): string {
 
 export function HomeEmailTab({
   emailDomain = 'veribox.name.ng',
+  isOwnerAdmin = false,
   activeEmail,
   savedEmails,
   messages,
@@ -107,15 +109,21 @@ export function HomeEmailTab({
             </h1>
           </div>
 
-          <span
-            className={`shrink-0 rounded-lg border px-2 py-1 text-[11px] font-bold tabular-nums ${
-              dailyRemaining > 0
-                ? 'border-[#D4AF37]/35 bg-[#D4AF37]/10 text-[#8A6208] dark:text-[#F5D77A]'
-                : 'border-rose-500/35 bg-rose-500/10 text-rose-600 dark:text-rose-300'
-            }`}
-          >
-            {dailyRemaining}/{dailyGenerateLimit} free today
-          </span>
+          {isOwnerAdmin ? (
+            <span className="shrink-0 rounded-lg border border-emerald-500/40 bg-emerald-500/15 px-2 py-1 text-[11px] font-extrabold text-emerald-700 dark:text-emerald-300">
+              Owner · Free Unlimited
+            </span>
+          ) : (
+            <span
+              className={`shrink-0 rounded-lg border px-2 py-1 text-[11px] font-bold tabular-nums ${
+                dailyRemaining > 0
+                  ? 'border-[#D4AF37]/35 bg-[#D4AF37]/10 text-[#8A6208] dark:text-[#F5D77A]'
+                  : 'border-rose-500/35 bg-rose-500/10 text-rose-600 dark:text-rose-300'
+              }`}
+            >
+              {dailyRemaining}/{dailyGenerateLimit} free today
+            </span>
+          )}
         </div>
 
         {/* Straight 3-Column Row: Phone Number -> Create -> Generate */}
@@ -153,7 +161,7 @@ export function HomeEmailTab({
           </button>
         </div>
 
-        {dailyRemaining === 0 && (
+        {!isOwnerAdmin && dailyRemaining === 0 && (
           <p className="mt-2.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-[11px] font-semibold text-amber-800 dark:text-amber-200">
             5/5 free emails used today. Resets tomorrow, or tap <strong>Create</strong> (₦50) for a custom address.
           </p>
@@ -329,8 +337,17 @@ export function HomeEmailTab({
         ) : (
           <div className="mt-3.5 rounded-xl border border-dashed border-[#D4AF37]/30 p-4 text-center space-y-3">
             <p className="text-xs sm:text-sm text-[#6E6552] dark:text-[#A89F8C]">
-              Tap <strong>Generate</strong> ({dailyRemaining}/5 free today) for an instant{' '}
-              <strong>@{emailDomain}</strong> inbox, or <strong>Create</strong> for a custom username.
+              {isOwnerAdmin ? (
+                <>
+                  Tap <strong>Generate</strong> (Free Unlimited) for an instant{' '}
+                  <strong>@{emailDomain}</strong> inbox, or <strong>Create</strong> for a free custom username.
+                </>
+              ) : (
+                <>
+                  Tap <strong>Generate</strong> ({dailyRemaining}/5 free today) for an instant{' '}
+                  <strong>@{emailDomain}</strong> inbox, or <strong>Create</strong> for a custom username.
+                </>
+              )}
             </p>
             <div className="flex flex-wrap items-center justify-center gap-2">
               <button
@@ -340,7 +357,7 @@ export function HomeEmailTab({
                 className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl bg-[#D4AF37] px-4 py-1.5 text-xs font-extrabold text-[#0A0906] hover:bg-[#E5C150] cursor-pointer"
               >
                 <Sparkles className="h-3.5 w-3.5" />
-                <span>Generate ({dailyRemaining} left)</span>
+                <span>{isOwnerAdmin ? 'Generate (Free)' : `Generate (${dailyRemaining} left)`}</span>
               </button>
               <button
                 type="button"
@@ -348,7 +365,7 @@ export function HomeEmailTab({
                 className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl border border-[#D4AF37]/45 px-4 py-1.5 text-xs font-bold text-[#8A6208] hover:bg-[#D4AF37]/10 cursor-pointer dark:text-[#F5D77A]"
               >
                 <MailPlus className="h-3.5 w-3.5" />
-                <span>Create Custom</span>
+                <span>{isOwnerAdmin ? 'Create Free' : 'Create Custom'}</span>
               </button>
             </div>
           </div>

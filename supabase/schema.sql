@@ -34,7 +34,46 @@ create table if not exists public.mailboxes (
   created_at timestamptz not null default now()
 );
 
+create unique index if not exists idx_mailboxes_address_lower
+  on public.mailboxes (lower(address));
 create index if not exists idx_mailboxes_owner on public.mailboxes (owner_user_id);
+
+create table if not exists public.created_email_registry (
+  address text primary key,
+  username text not null,
+  domain text not null default 'veribox.name.ng',
+  created_by_user_id text,
+  source text not null default 'create',
+  is_deleted boolean not null default false,
+  created_at timestamptz not null default now(),
+  deleted_at timestamptz
+);
+
+create unique index if not exists idx_created_email_registry_address_lower
+  on public.created_email_registry (lower(address));
+create index if not exists idx_created_email_registry_username_lower
+  on public.created_email_registry (lower(username));
+
+-- Backfill any previously created mailboxes so deleted or active emails remain permanently marked
+insert into public.created_email_registry (
+  address,
+  username,
+  domain,
+  created_by_user_id,
+  source,
+  is_deleted,
+  created_at
+)
+select
+  lower(address),
+  lower(username),
+  domain,
+  owner_user_id,
+  'backfill',
+  is_deleted,
+  created_at
+from public.mailboxes
+on conflict (address) do nothing;
 
 create table if not exists public.mailbox_messages (
   id text primary key,
@@ -52,10 +91,11 @@ create table if not exists public.mailbox_messages (
 create index if not exists idx_mailbox_messages_recipient
   on public.mailbox_messages (recipient_address, created_at desc);
 
--- Enable Row Level Security with safe read policies for realtime balance updates
+-- Enable Row Level Security (backend uses service role key for strict per-user mailbox isolation)
 alter table public.wallets enable row level security;
 alter table public.wallet_transactions enable row level security;
 alter table public.mailboxes enable row level security;
+alter table public.created_email_registry enable row level security;
 alter table public.mailbox_messages enable row level security;
 
 do $$

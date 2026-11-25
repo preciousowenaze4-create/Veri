@@ -24,11 +24,13 @@ import {
   generateCustomDomainSuggestions,
   normalizeCustomUsername,
 } from '../utils/directEmailFallback';
+import { ensureSupabaseClient, getActiveSupabaseClient } from '../utils/supabase';
 
 const CREATE_EMAIL_FEE_NGN = 50;
 
 interface CreateEmailTabProps {
   emailDomain?: string;
+  isOwnerAdmin?: boolean;
   isAuthenticated?: boolean;
   onRequireAuth?: (reason?: string) => void;
   walletBalance?: number;
@@ -77,6 +79,7 @@ function modeLabel(mode: AccountMode): string {
 
 export function CreateEmailTab({
   emailDomain = CUSTOM_EMAIL_DOMAIN,
+  isOwnerAdmin = false,
   isAuthenticated = true,
   onRequireAuth,
   walletBalance = 0,
@@ -133,6 +136,7 @@ export function CreateEmailTab({
     available: boolean;
     address: string;
     message: string;
+    suggestedAlternative?: string;
   } | null>(null);
   const [paidSessionRef, setPaidSessionRef] = useState<string | null>(null);
   const paidSessionRefCurrent = useRef<string | null>(null);
@@ -416,7 +420,11 @@ export function CreateEmailTab({
         const res = await fetch('/api/email/login', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ address: cleanAddr, password: enteredPass }),
+          body: JSON.stringify({
+            address: cleanAddr,
+            password: enteredPass,
+            userId: walletUserId,
+          }),
           signal: AbortSignal.timeout(7000),
         });
         const data = await parseJsonResponse<{
@@ -563,6 +571,8 @@ export function CreateEmailTab({
       });
       const data = await parseJsonResponse<{
         available?: boolean;
+        alreadyCreated?: boolean;
+        suggestedAlternative?: string;
         username?: string;
         address?: string;
         error?: string;
@@ -570,8 +580,13 @@ export function CreateEmailTab({
 
       const resolvedAddr = data.address || `${norm}@${activeDomain}`;
       if (!res.ok || !data.available) {
-        const msg = data.error || `${resolvedAddr} is already taken.`;
-        setCustomStatus({ available: false, address: resolvedAddr, message: msg });
+        const msg = data.error || `${resolvedAddr} was already created and cannot be reused.`;
+        setCustomStatus({
+          available: false,
+          address: resolvedAddr,
+          message: msg,
+          suggestedAlternative: data.suggestedAlternative,
+        });
         setError(msg);
         return null;
       }
@@ -629,7 +644,7 @@ export function CreateEmailTab({
       return;
     }
 
-    // Re-check availability on server before charging ₦50
+    // Re-check availability on server before charging ₦50 (or advancing for owner)
     try {
       const availRes = await fetch('/api/email/check-availability', {
         method: 'POST',
@@ -637,16 +652,25 @@ export function CreateEmailTab({
         body: JSON.stringify({ username: targetOption.username }),
         signal: AbortSignal.timeout(5000),
       });
-      const availData = await parseJsonResponse<{ available?: boolean; error?: string }>(availRes);
+      const availData = await parseJsonResponse<{
+        available?: boolean;
+        suggestedAlternative?: string;
+        error?: string;
+      }>(availRes);
       if (availRes.ok && availData.available === false) {
-        setError(availData.error || `${targetOption.address} was just claimed. Pick another address.`);
+        setError(
+          availData.error ||
+            `${targetOption.address} was already created. Pick another address${
+              availData.suggestedAlternative ? ` (e.g. ${availData.suggestedAlternative})` : ''
+            }.`
+        );
         return;
       }
     } catch {
       // Non-blocking precheck; create-selected enforces uniqueness as well
     }
 
-    if (paidSessionRefCurrent.current) {
+    if (isOwnerAdmin || paidSessionRefCurrent.current) {
       navigateBrowserTo('password');
       return;
     }
@@ -731,10 +755,25 @@ export function CreateEmailTab({
     try {
       const finalPassword = password.trim();
       const fullName = [firstName.trim(), lastName.trim()].filter(Boolean).join(' ');
+      const sbClient = getActiveSupabaseClient() || (await ensureSupabaseClient());
+      let sbToken: string | undefined;
+      if (sbClient) {
+        try {
+          const { data: sessionData } = await sbClient.auth.getSession();
+          sbToken = sessionData.session?.access_token;
+        } catch {
+          // Non-blocking
+        }
+      }
+
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (sbToken) {
+        headers['x-supabase-token'] = sbToken;
+      }
 
       const res = await fetch('/api/email/create-selected', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           provider: 'veribox',
           username: selectedOption.username,
@@ -772,7 +811,9 @@ export function CreateEmailTab({
       onShowToast(`Mailbox active: ${newAccount.address}`);
       onComplete(newAccount);
     } catch (err) {
-      await refundHeldCreateFee('Activation failed · ₦50 refunded to your wallet');
+      if (!isOwnerAdmin) {
+        await refundHeldCreateFee('Activation failed · ₦50 refunded to your wallet');
+      }
       setError(err instanceof Error ? err.message : `Could not finalize @${activeDomain} account`);
       setCreatingFinal(false);
       setIsBrowserLoading(false);
@@ -876,7 +917,11 @@ export function CreateEmailTab({
               </div>
               <div className="flex items-center gap-2">
                 <Wallet className="h-3.5 w-3.5 text-[#D4AF37]" />
-                <span>₦{CREATE_EMAIL_FEE_NGN} / Custom Mailbox</span>
+                <span>
+                  {isOwnerAdmin
+                    ? 'Owner · Free Unlimited'
+                    : `₦${CREATE_EMAIL_FEE_NGN} / Custom Mailbox`}
+                </span>
               </div>
             </div>
           </div>
@@ -1362,7 +1407,9 @@ export function CreateEmailTab({
                     Choose your @{activeDomain} address
                   </h2>
                   <p className="mt-0.5 text-xs text-[#6E6552] dark:text-[#A89F8C]">
-                    Pick a suggested address or type your own custom username (₦{CREATE_EMAIL_FEE_NGN} fee)
+                    {isOwnerAdmin
+                      ? 'Pick a suggested address or type your own custom username (Free Unlimited for Owner)'
+                      : `Pick a suggested address or type your own custom username (₦${CREATE_EMAIL_FEE_NGN} fee)`}
                   </p>
                 </div>
 
@@ -1374,7 +1421,11 @@ export function CreateEmailTab({
                       Wallet: ₦{effectiveBalance.toLocaleString()}
                     </span>
                   </div>
-                  {paidSessionRef ? (
+                  {isOwnerAdmin ? (
+                    <span className="rounded-md bg-emerald-500/15 px-2 py-0.5 text-[11px] font-extrabold text-emerald-700 dark:text-emerald-300">
+                      Owner Free · ₦0
+                    </span>
+                  ) : paidSessionRef ? (
                     <span className="rounded-md bg-emerald-500/15 px-2 py-0.5 text-[11px] font-extrabold text-emerald-700 dark:text-emerald-300">
                       ₦{CREATE_EMAIL_FEE_NGN} Paid
                     </span>
@@ -1385,7 +1436,7 @@ export function CreateEmailTab({
                   )}
                 </div>
 
-                {!paidSessionRef && effectiveBalance < CREATE_EMAIL_FEE_NGN && (
+                {!isOwnerAdmin && !paidSessionRef && effectiveBalance < CREATE_EMAIL_FEE_NGN && (
                   <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-rose-500/35 bg-rose-500/10 px-3.5 py-2.5 text-xs">
                     <span className="font-semibold text-rose-700 dark:text-rose-200">
                       Insufficient balance (₦{effectiveBalance.toLocaleString()}). Deposit at least ₦
@@ -1432,8 +1483,14 @@ export function CreateEmailTab({
                             {opt.address}
                           </span>
                         </div>
-                        <span className="shrink-0 font-mono text-[11px] font-bold text-[#8A6208] dark:text-[#F5D77A]">
-                          ₦{CREATE_EMAIL_FEE_NGN}
+                        <span
+                          className={`shrink-0 font-mono text-[11px] font-bold ${
+                            isOwnerAdmin
+                              ? 'text-emerald-600 dark:text-emerald-300'
+                              : 'text-[#8A6208] dark:text-[#F5D77A]'
+                          }`}
+                        >
+                          {isOwnerAdmin ? 'Free' : `₦${CREATE_EMAIL_FEE_NGN}`}
                         </span>
                       </button>
                     );
@@ -1484,15 +1541,44 @@ export function CreateEmailTab({
                     </button>
                   </div>
                   {customStatus && (
-                    <p
-                      className={`text-[11px] font-semibold ${
-                        customStatus.available
-                          ? 'text-emerald-700 dark:text-emerald-300'
-                          : 'text-rose-600 dark:text-rose-300'
-                      }`}
-                    >
-                      {customStatus.message}
-                    </p>
+                    <div className="space-y-1.5">
+                      <p
+                        className={`text-[11px] font-semibold ${
+                          customStatus.available
+                            ? 'text-emerald-700 dark:text-emerald-300'
+                            : 'text-rose-600 dark:text-rose-300'
+                        }`}
+                      >
+                        {customStatus.message}
+                      </p>
+                      {!customStatus.available && customStatus.suggestedAlternative && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const alt = customStatus.suggestedAlternative!;
+                            const altUser = alt.split('@')[0] || '';
+                            setCustomUsername(altUser);
+                            setSelectedOption({
+                              id: 'custom',
+                              address: alt,
+                              username: altUser,
+                              domain: activeDomain,
+                              provider: 'veribox',
+                              providerLabel: `@${activeDomain}`,
+                            });
+                            setCustomStatus({
+                              available: true,
+                              address: alt,
+                              message: `${alt} is unclaimed and ready!`,
+                            });
+                            setError(null);
+                          }}
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 font-mono text-[11px] font-bold text-emerald-700 hover:bg-emerald-500/20 cursor-pointer dark:text-emerald-300"
+                        >
+                          <span>Use {customStatus.suggestedAlternative}</span>
+                        </button>
+                      )}
+                    </div>
                   )}
                 </div>
 
@@ -1520,7 +1606,11 @@ export function CreateEmailTab({
                     ) : (
                       <>
                         <span>
-                          {paidSessionRef ? 'Next' : `Next · ₦${CREATE_EMAIL_FEE_NGN}`}
+                          {isOwnerAdmin
+                            ? 'Next · Free'
+                            : paidSessionRef
+                              ? 'Next'
+                              : `Next · ₦${CREATE_EMAIL_FEE_NGN}`}
                         </span>
                         <ArrowRight className="h-3.5 w-3.5" />
                       </>

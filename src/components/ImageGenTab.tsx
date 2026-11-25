@@ -22,6 +22,7 @@ import type { GeneratedImageItem } from '../types';
 import { parseJsonResponse } from '../utils/apiFetch';
 
 interface ImageGenTabProps {
+  isOwnerAdmin?: boolean;
   isAuthenticated?: boolean;
   onRequireAuth?: (reason?: string) => void;
   onCopyText: (value: string, label: string) => void;
@@ -247,6 +248,7 @@ async function generateDirectPollinationsFallback(
 }
 
 export function ImageGenTab({
+  isOwnerAdmin = false,
   isAuthenticated = true,
   onRequireAuth,
   onCopyText,
@@ -680,7 +682,7 @@ export function ImageGenTab({
                   VeriBox AI
                 </h1>
                 <span className="rounded-md border border-emerald-500/35 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-extrabold text-emerald-700 dark:text-emerald-300">
-                  Free
+                  {isOwnerAdmin ? 'Owner · Free Unlimited' : 'Free Unlimited'}
                 </span>
               </div>
               <p className="text-[11px] text-[#6E6552] truncate dark:text-[#A89F8C]">

@@ -36,9 +36,9 @@ import { CUSTOM_EMAIL_DOMAIN } from './utils/directEmailFallback';
 import { ensureSupabaseClient, getActiveSupabaseClient } from './utils/supabase';
 
 const STORAGE_KEYS = {
-  emails: 'veribox_saved_emails_v2',
-  deletedEmails: 'veribox_deleted_emails_v2',
-  activeEmail: 'veribox_active_email_v2',
+  emails: 'veribox_saved_emails_v3',
+  deletedEmails: 'veribox_deleted_emails_v3',
+  activeEmail: 'veribox_active_email_v3',
   savedNumbers: 'veribox_saved_numbers_v2',
   otpHistory: 'veribox_otp_history_v2',
   theme: 'veribox_theme_v2',
@@ -146,6 +146,31 @@ function isCustomDomainMailbox(
   );
 }
 
+function scopedEmailStorageKey(baseKey: string, userId: string): string {
+  return `${baseKey}:${userId || 'guest'}`;
+}
+
+function readScopedEmailList(
+  baseKey: string,
+  userId: string,
+  domain: string = CUSTOM_EMAIL_DOMAIN
+): TempEmailAccount[] {
+  return readStorage<TempEmailAccount[]>(scopedEmailStorageKey(baseKey, userId), []).filter((a) =>
+    isCustomDomainMailbox(a, domain)
+  );
+}
+
+function readScopedActiveEmail(
+  userId: string,
+  domain: string = CUSTOM_EMAIL_DOMAIN
+): TempEmailAccount | null {
+  const stored = readStorage<TempEmailAccount | null>(
+    scopedEmailStorageKey(STORAGE_KEYS.activeEmail, userId),
+    null
+  );
+  return isCustomDomainMailbox(stored, domain) ? stored : null;
+}
+
 export default function App() {
   const isOnline = useOnlineStatus();
   const [activeTab, setActiveTab] = useState<TabId>('home');
@@ -227,22 +252,18 @@ export default function App() {
   const [acquireError, setAcquireError] = useState<string | null>(null);
   const [streamConnected, setStreamConnected] = useState<boolean>(false);
 
-  // Email state (custom domain from process.env.EMAIL_DOMAIN)
+  // Email state (custom domain from process.env.EMAIL_DOMAIN, strictly isolated per walletUserId)
   const [emailDomain, setEmailDomain] = useState<string>(CUSTOM_EMAIL_DOMAIN);
+  const [emailScopeId, setEmailScopeId] = useState<string>(walletUserId);
   const [savedEmails, setSavedEmails] = useState<TempEmailAccount[]>(() =>
-    readStorage<TempEmailAccount[]>(STORAGE_KEYS.emails, []).filter((a) =>
-      isCustomDomainMailbox(a, CUSTOM_EMAIL_DOMAIN)
-    )
+    readScopedEmailList(STORAGE_KEYS.emails, walletUserId, CUSTOM_EMAIL_DOMAIN)
   );
   const [deletedEmails, setDeletedEmails] = useState<TempEmailAccount[]>(() =>
-    readStorage<TempEmailAccount[]>(STORAGE_KEYS.deletedEmails, []).filter((a) =>
-      isCustomDomainMailbox(a, CUSTOM_EMAIL_DOMAIN)
-    )
+    readScopedEmailList(STORAGE_KEYS.deletedEmails, walletUserId, CUSTOM_EMAIL_DOMAIN)
   );
-  const [activeEmail, setActiveEmail] = useState<TempEmailAccount | null>(() => {
-    const stored = readStorage<TempEmailAccount | null>(STORAGE_KEYS.activeEmail, null);
-    return isCustomDomainMailbox(stored, CUSTOM_EMAIL_DOMAIN) ? stored : null;
-  });
+  const [activeEmail, setActiveEmail] = useState<TempEmailAccount | null>(() =>
+    readScopedActiveEmail(walletUserId, CUSTOM_EMAIL_DOMAIN)
+  );
   const [emailMessages, setEmailMessages] = useState<EmailMessageSummary[]>([]);
   const [selectedEmailDetail, setSelectedEmailDetail] = useState<EmailMessageDetail | null>(null);
   const [loadingEmailMessages, setLoadingEmailMessages] = useState<boolean>(false);
@@ -278,17 +299,43 @@ export default function App() {
     localStorage.setItem(STORAGE_KEYS.autoRefresh, JSON.stringify(autoRefresh));
   }, [autoRefresh]);
 
+  // Switch isolated email vault whenever the active user (or guest session) changes
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.emails, JSON.stringify(savedEmails));
-  }, [savedEmails]);
+    if (walletUserId === emailScopeId) return;
+    lastFetchedAddressRef.current = null;
+    knownEmailMsgIdsRef.current = new Set();
+    setEmailMessages([]);
+    setSelectedEmailDetail(null);
+    setEmailError(null);
+    setSavedEmails(readScopedEmailList(STORAGE_KEYS.emails, walletUserId, emailDomain));
+    setDeletedEmails(readScopedEmailList(STORAGE_KEYS.deletedEmails, walletUserId, emailDomain));
+    setActiveEmail(readScopedActiveEmail(walletUserId, emailDomain));
+    setEmailScopeId(walletUserId);
+  }, [walletUserId, emailScopeId, emailDomain]);
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.deletedEmails, JSON.stringify(deletedEmails));
-  }, [deletedEmails]);
+    if (emailScopeId !== walletUserId) return;
+    localStorage.setItem(
+      scopedEmailStorageKey(STORAGE_KEYS.emails, emailScopeId),
+      JSON.stringify(savedEmails)
+    );
+  }, [savedEmails, emailScopeId, walletUserId]);
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.activeEmail, JSON.stringify(activeEmail));
-  }, [activeEmail]);
+    if (emailScopeId !== walletUserId) return;
+    localStorage.setItem(
+      scopedEmailStorageKey(STORAGE_KEYS.deletedEmails, emailScopeId),
+      JSON.stringify(deletedEmails)
+    );
+  }, [deletedEmails, emailScopeId, walletUserId]);
+
+  useEffect(() => {
+    if (emailScopeId !== walletUserId) return;
+    localStorage.setItem(
+      scopedEmailStorageKey(STORAGE_KEYS.activeEmail, emailScopeId),
+      JSON.stringify(activeEmail)
+    );
+  }, [activeEmail, emailScopeId, walletUserId]);
 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEYS.savedNumbers, JSON.stringify(savedNumbers));
@@ -586,6 +633,11 @@ export default function App() {
     pendingAuthActionRef.current = null;
     autoSwitchedAdminUserIdRef.current = null;
     lastAlertedSignatureRef.current = '';
+    lastFetchedAddressRef.current = null;
+    knownEmailMsgIdsRef.current = new Set();
+    setEmailMessages([]);
+    setSelectedEmailDetail(null);
+    setEmailError(null);
     setAuthUser(null);
     setWalletBalance(0);
     setAdminDiagnostics(null);
@@ -1481,7 +1533,7 @@ export default function App() {
   const handleGenerateCustomEmail = useCallback(async () => {
     const usedToday = readDailyGenerateCount(walletUserId);
     setDailyGenerateUsed(usedToday);
-    if (usedToday >= FREE_DAILY_EMAIL_LIMIT) {
+    if (!isOwnerAdmin && usedToday >= FREE_DAILY_EMAIL_LIMIT) {
       const limitMsg = `Daily free limit reached (${FREE_DAILY_EMAIL_LIMIT}/${FREE_DAILY_EMAIL_LIMIT} today). Resets tomorrow or use Create (₦50).`;
       setEmailError(limitMsg);
       showToast(limitMsg);
@@ -1491,23 +1543,35 @@ export default function App() {
     setGeneratingEmail(true);
     setEmailError(null);
     try {
+      const sbToken = await getAuthAccessToken();
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (sbToken) {
+        headers['x-supabase-token'] = sbToken;
+      }
+
       const res = await fetch('/api/email/generate', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           userId: walletUserId,
           accountMode: 'personal',
         }),
         signal: AbortSignal.timeout(9000),
       });
-      const data = await parseJsonResponse<TempEmailAccount & { error?: string }>(res);
+      const data = await parseJsonResponse<
+        TempEmailAccount & { error?: string; ownerUnlimited?: boolean }
+      >(res);
       if (!res.ok || !data.address) {
         throw new Error(data.error || `Could not generate @${emailDomain} email`);
       }
 
-      const nextUsed = writeDailyGenerateCount(walletUserId, usedToday + 1);
-      setDailyGenerateUsed(nextUsed);
-      const remaining = Math.max(0, FREE_DAILY_EMAIL_LIMIT - nextUsed);
+      const unlimited = isOwnerAdmin || Boolean(data.ownerUnlimited);
+      let remaining = FREE_DAILY_EMAIL_LIMIT;
+      if (!unlimited) {
+        const nextUsed = writeDailyGenerateCount(walletUserId, usedToday + 1);
+        setDailyGenerateUsed(nextUsed);
+        remaining = Math.max(0, FREE_DAILY_EMAIL_LIMIT - nextUsed);
+      }
 
       lastFetchedAddressRef.current = null;
       knownEmailMsgIdsRef.current = new Set();
@@ -1521,7 +1585,11 @@ export default function App() {
       setSelectedEmailDetail(null);
       setEmailMessages([]);
       setCountdown(3);
-      showToast(`Generated ${data.address} · ${remaining}/${FREE_DAILY_EMAIL_LIMIT} free left today`);
+      showToast(
+        unlimited
+          ? `Generated ${data.address} · Owner Unlimited`
+          : `Generated ${data.address} · ${remaining}/${FREE_DAILY_EMAIL_LIMIT} free left today`
+      );
     } catch (err) {
       const msg = err instanceof Error ? err.message : `Could not generate @${emailDomain} email`;
       setEmailError(msg);
@@ -1529,7 +1597,7 @@ export default function App() {
     } finally {
       setGeneratingEmail(false);
     }
-  }, [walletUserId, emailDomain, showToast]);
+  }, [walletUserId, isOwnerAdmin, emailDomain, getAuthAccessToken, showToast]);
 
   const handleOpenEmailDetail = useCallback(
     async (id: string) => {
@@ -1646,13 +1714,19 @@ export default function App() {
     [savedEmails, activeEmail, showToast]
   );
 
-  // Sync user's saved mailboxes when signed in
+  // Sync user's saved mailboxes when signed in (strictly scoped to authUser.id)
   useEffect(() => {
-    if (!authUser) return;
+    if (!authUser || emailScopeId !== authUser.id) return;
     let active = true;
     void (async () => {
       try {
+        const sbToken = await getAuthAccessToken();
+        const headers: Record<string, string> = {};
+        if (sbToken) {
+          headers['x-supabase-token'] = sbToken;
+        }
         const res = await fetch(`/api/email/list?userId=${encodeURIComponent(authUser.id)}`, {
+          headers,
           signal: AbortSignal.timeout(7000),
         });
         if (!res.ok || !active) return;
@@ -1680,7 +1754,7 @@ export default function App() {
     return () => {
       active = false;
     };
-  }, [authUser, emailDomain]);
+  }, [authUser, emailScopeId, emailDomain, getAuthAccessToken]);
 
   // Fetch inbox immediately when active email changes
   useEffect(() => {
@@ -1971,6 +2045,7 @@ export default function App() {
         {activeTab === 'home' && (
           <HomeEmailTab
             emailDomain={emailDomain}
+            isOwnerAdmin={isOwnerAdmin}
             activeEmail={activeEmail}
             savedEmails={savedEmails}
             messages={emailMessages}
@@ -2031,6 +2106,7 @@ export default function App() {
         {activeTab === 'create' && (
           <CreateEmailTab
             emailDomain={emailDomain}
+            isOwnerAdmin={isOwnerAdmin}
             isAuthenticated={isAuthenticated}
             onRequireAuth={(reason) =>
               openAuthModal(reason || 'Sign in to create an email', () => setActiveTab('create'))
@@ -2154,6 +2230,7 @@ export default function App() {
 
         {activeTab === 'images' && (
           <ImageGenTab
+            isOwnerAdmin={isOwnerAdmin}
             isAuthenticated={isAuthenticated}
             onRequireAuth={(reason) =>
               openAuthModal(reason || 'Sign in to generate free AI images')

@@ -2114,6 +2114,7 @@ export function createApiApp() {
       },
     })
   );
+  app.use(express.urlencoded({ extended: true, limit: '5mb' }));
 
   app.get('/api/health', (_req, res) => {
     res.json({
@@ -2600,9 +2601,18 @@ export function createApiApp() {
   }
 
   async function saveInboxMessage(msg: CustomInboxMessageRecord): Promise<void> {
-    const recipient = msg.recipientAddress.trim().toLowerCase();
+    const cleanStr = (v: string) => v.replace(/\u0000/g, '');
+    const sanitizedMsg: CustomInboxMessageRecord = {
+      ...msg,
+      fromName: cleanStr(msg.fromName),
+      fromAddress: cleanStr(msg.fromAddress),
+      subject: cleanStr(msg.subject),
+      text: cleanStr(msg.text),
+      html: cleanStr(msg.html),
+    };
+    const recipient = sanitizedMsg.recipientAddress.trim().toLowerCase();
     const existing = mailboxMessagesMap.get(recipient) || [];
-    const next = [msg, ...existing.filter((m) => m.id !== msg.id)].slice(0, 100);
+    const next = [sanitizedMsg, ...existing.filter((m) => m.id !== sanitizedMsg.id)].slice(0, 100);
     mailboxMessagesMap.set(recipient, next);
 
     const sb = getSupabaseServerClient();
@@ -2610,16 +2620,16 @@ export function createApiApp() {
       try {
         const { error } = await sb.from('mailbox_messages').upsert(
           {
-            id: msg.id,
+            id: sanitizedMsg.id,
             recipient_address: recipient,
-            from_name: msg.fromName,
-            from_address: msg.fromAddress,
-            subject: msg.subject,
-            body_text: msg.text,
-            body_html: msg.html,
-            otp: msg.otp,
-            seen: msg.seen,
-            created_at: msg.createdAt,
+            from_name: sanitizedMsg.fromName,
+            from_address: sanitizedMsg.fromAddress,
+            subject: sanitizedMsg.subject,
+            body_text: sanitizedMsg.text,
+            body_html: sanitizedMsg.html,
+            otp: sanitizedMsg.otp,
+            seen: sanitizedMsg.seen,
+            created_at: sanitizedMsg.createdAt,
           },
           { onConflict: 'id' }
         );
@@ -2631,7 +2641,7 @@ export function createApiApp() {
       }
     }
 
-    emailEvents.emit(`inbound:${recipient}`, msg);
+    emailEvents.emit(`inbound:${recipient}`, sanitizedMsg);
   }
 
   async function listInboxMessages(recipientAddress: string): Promise<CustomInboxMessageRecord[]> {
@@ -2915,16 +2925,32 @@ export function createApiApp() {
   }
 
   async function generateInstantCustomUsername(): Promise<string> {
-    const prefixes = ['vb', 'mail', 'box', 'user', 'veri', 'inbox'];
-    for (let attempt = 0; attempt < 8; attempt++) {
-      const prefix = prefixes[Math.floor(Math.random() * prefixes.length)];
-      const randPart = crypto.randomBytes(3).toString('hex');
-      const candidate = normalizeCustomEmailUsername(`${prefix}.${randPart}`);
+    const firstNames = [
+      'daniel', 'samuel', 'david', 'chinedu', 'tunde', 'michael', 'joseph', 'victor',
+      'emeka', 'ibrahim', 'joshua', 'caleb', 'peter', 'isaac', 'nathan', 'kevin',
+      'amara', 'grace', 'sarah', 'zainab', 'chiamaka', 'faith', 'esther', 'rachel',
+      'hannah', 'naomi', 'amina', 'blessing', 'rebecca', 'olivia', 'claire', 'deborah',
+    ];
+    const lastNames = [
+      'okafor', 'adeyemi', 'bello', 'mensah', 'nwosu', 'balogun', 'eze', 'cole',
+      'adams', 'johnson', 'okoro', 'suleiman', 'lawal', 'williams', 'brooks', 'morgan',
+      'carter', 'hassan', 'okafor', 'akintola', 'olamide', 'bennett', 'reid', 'foster',
+    ];
+    for (let attempt = 0; attempt < 12; attempt++) {
+      const first = firstNames[Math.floor(Math.random() * firstNames.length)];
+      const last = lastNames[Math.floor(Math.random() * lastNames.length)];
+      const num = Math.floor(12 + Math.random() * 987);
+      const sep = attempt % 3 === 0 ? '.' : attempt % 3 === 1 ? '' : '_';
+      const candidate = normalizeCustomEmailUsername(`${first}${sep}${last}${num}`);
       if (!isValidCustomEmailUsername(candidate)) continue;
       const existing = await findMailboxRecord(`${candidate}@${CUSTOM_EMAIL_DOMAIN}`);
       if (!existing) return candidate;
     }
-    return `vb${Date.now().toString(36)}${crypto.randomBytes(2).toString('hex')}`;
+    const fallbackFirst = firstNames[Math.floor(Math.random() * firstNames.length)];
+    const fallbackLast = lastNames[Math.floor(Math.random() * lastNames.length)];
+    return normalizeCustomEmailUsername(
+      `${fallbackFirst}.${fallbackLast}${Math.floor(1000 + Math.random() * 8999)}`
+    );
   }
 
   app.post('/api/email/create-selected', async (req, res) => {
@@ -3165,6 +3191,19 @@ export function createApiApp() {
         ? (payload.headers as Record<string, unknown>)
         : undefined;
 
+    const rawMime =
+      typeof payload.raw === 'string' && payload.raw.trim()
+        ? payload.raw
+        : typeof payload.rawEmail === 'string' && payload.rawEmail.trim()
+          ? payload.rawEmail
+          : '';
+    const rawHeaderBlock = rawMime ? rawMime.split(/\r?\n\r?\n/, 1)[0].replace(/\r?\n[ \t]+/g, ' ') : '';
+    const rawHeaderValue = (name: string): string => {
+      if (!rawHeaderBlock) return '';
+      const m = new RegExp(`^${name}:\\s*(.+)$`, 'im').exec(rawHeaderBlock);
+      return m ? m[1].trim() : '';
+    };
+
     const candidateRecipients = [
       payload.to,
       payload.rcptTo,
@@ -3180,6 +3219,9 @@ export function createApiApp() {
       body.to,
       body.rcptTo,
       body.recipient,
+      rawHeaderValue('Delivered-To'),
+      rawHeaderValue('X-Original-To'),
+      rawHeaderValue('To'),
     ];
 
     const rawRecipients = extractTargetRecipients(candidateRecipients).filter((addr) =>
@@ -3214,15 +3256,35 @@ export function createApiApp() {
       }
     }
 
+    const extractSenderString = (...candidates: unknown[]): string => {
+      for (const c of candidates) {
+        if (!c) continue;
+        if (typeof c === 'string' && c.trim()) return c.trim();
+        if (typeof c === 'object' && !Array.isArray(c)) {
+          const obj = c as { name?: unknown; address?: unknown; email?: unknown };
+          const addr =
+            typeof obj.address === 'string'
+              ? obj.address.trim()
+              : typeof obj.email === 'string'
+                ? obj.email.trim()
+                : '';
+          const nm = typeof obj.name === 'string' ? obj.name.trim() : '';
+          if (addr && nm) return `${nm} <${addr}>`;
+          if (addr) return addr;
+        }
+      }
+      return `sender@${CUSTOM_EMAIL_DOMAIN}`;
+    };
+
     const rawFrom = decodeMimeWord(
-      String(
-        payload.from ||
-          payload.sender ||
-          envelopeObj?.from ||
-          headersObj?.from ||
-          payload.From ||
-          payload.FromFull ||
-          `sender@${CUSTOM_EMAIL_DOMAIN}`
+      extractSenderString(
+        payload.from,
+        payload.sender,
+        envelopeObj?.from,
+        headersObj?.from,
+        payload.From,
+        payload.FromFull,
+        rawHeaderValue('From')
       )
     );
     const parsedFrom = extractAddressFromHeader(rawFrom);
@@ -3232,7 +3294,13 @@ export function createApiApp() {
         : parsedFrom.name
     );
     const subject = decodeMimeWord(
-      String(payload.subject || headersObj?.subject || payload.Subject || '(No subject)')
+      String(
+        payload.subject ||
+          headersObj?.subject ||
+          payload.Subject ||
+          rawHeaderValue('Subject') ||
+          '(No subject)'
+      )
     ).slice(0, 300);
 
     const rawHtml = String(
@@ -3249,12 +3317,6 @@ export function createApiApp() {
         payload.TextBody ||
         ''
     );
-    const rawMime =
-      typeof payload.raw === 'string' && payload.raw.trim()
-        ? payload.raw
-        : typeof payload.rawEmail === 'string' && payload.rawEmail.trim()
-          ? payload.rawEmail
-          : '';
     if (!rawText && !rawHtml && rawMime) {
       rawText = rawMime;
     }

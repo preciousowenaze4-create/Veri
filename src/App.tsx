@@ -159,7 +159,7 @@ export default function App() {
   const [autoRefresh, setAutoRefresh] = useState<boolean>(() =>
     readStorage<boolean>(STORAGE_KEYS.autoRefresh, true)
   );
-  const [countdown, setCountdown] = useState<number>(15);
+  const [countdown, setCountdown] = useState<number>(2);
 
   // Supabase Auth & Naira Wallet Balance state (synced with Supabase & Paystack webhook)
   const [authUser, setAuthUser] = useState<SupabaseUser | null>(null);
@@ -1438,20 +1438,36 @@ export default function App() {
     };
   }, [autoRefresh, activeTab, activeEmail?.address, activeEmail?.token, applyInboxSnapshot]);
 
-  // Fast 3-second silent polling fallback (guarantees immediate updates across serverless lambdas too)
+  // Fast 2-second silent polling + immediate refresh when returning from another app/tab
   useEffect(() => {
     if (!autoRefresh || activeTab !== 'home' || !activeEmail) return;
-    setCountdown(3);
+    setCountdown(2);
     const timer = window.setInterval(() => {
       setCountdown((prev) => {
         if (prev <= 1) {
           void refreshEmailInbox(activeEmail, true);
-          return 3;
+          return 2;
         }
         return prev - 1;
       });
     }, 1000);
-    return () => window.clearInterval(timer);
+
+    const handleResume = () => {
+      if (document.visibilityState === 'hidden') return;
+      setCountdown(2);
+      void refreshEmailInbox(activeEmail, true);
+    };
+
+    window.addEventListener('focus', handleResume);
+    window.addEventListener('pageshow', handleResume);
+    document.addEventListener('visibilitychange', handleResume);
+
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('focus', handleResume);
+      window.removeEventListener('pageshow', handleResume);
+      document.removeEventListener('visibilitychange', handleResume);
+    };
   }, [autoRefresh, activeTab, activeEmail, refreshEmailInbox]);
 
   const unreadEmailCount = emailMessages.filter((m) => !m.seen).length;

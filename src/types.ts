@@ -214,6 +214,7 @@ export interface AdminInboundAttempt {
   dbInsertMs?: number | null;
   parseMs?: number | null;
   matchedMailbox?: boolean | null;
+  matchedMailboxId?: string | null;
   receivedAt?: string | null;
   storedAt?: string | null;
   deliveryGapMs?: number | null;
@@ -288,13 +289,34 @@ export interface AdminDiagnosticsResponse {
   domainConnection?: AdminDomainConnectionCheck;
   connectionErrors?: string[];
   timingSummary?: AdminTimingSummary;
+  inboundTraffic24hCount?: number;
   probes: {
     mailboxes: AdminTableProbe;
     mailboxMessages: AdminTableProbe;
+    inboundWebhookLogs?: AdminTableProbe;
   };
   recentInboundAttempts: AdminInboundAttempt[];
+  rawInboundLogs?: AdminInboundAttempt[];
   latestMessages: AdminInboundMessageRow[];
   latestMailboxes: AdminMailboxRow[];
+}
+
+export type UserModerationStatus = 'active' | 'verified' | 'restricted' | 'suspended' | 'banned';
+export type UserModerationAction = 'verify' | 'restrict' | 'suspend' | 'ban' | 'restore';
+
+export interface AdminManagedUser {
+  id: string;
+  email: string;
+  fullName: string | null;
+  avatarUrl: string | null;
+  createdAt: string;
+  lastSignInAt: string | null;
+  emailConfirmed: boolean;
+  status: UserModerationStatus;
+  bannedUntil: string | null;
+  walletBalance: number;
+  mailboxCount: number;
+  moderationReason: string | null;
 }
 
 export interface AdminInboundTestResult {

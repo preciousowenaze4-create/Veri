@@ -16,6 +16,7 @@ import { useOnlineStatus } from './hooks/usePWAInstall';
 import type {
   AdminDiagnosticsResponse,
   AdminInboundTestResult,
+  AdminManagedUser,
   CopiedOtpRecord,
   EmailMessageDetail,
   EmailMessageSummary,
@@ -29,6 +30,7 @@ import type {
   PrivateNumberOrder,
   TabId,
   TempEmailAccount,
+  UserModerationAction,
 } from './types';
 import { parseJsonResponse } from './utils/apiFetch';
 import { copyToClipboard } from './utils/clipboard';
@@ -215,6 +217,10 @@ export default function App() {
   const [adminTestResult, setAdminTestResult] = useState<AdminInboundTestResult | null>(null);
   const [adminTestError, setAdminTestError] = useState<string | null>(null);
   const [adminRealtimeConnected, setAdminRealtimeConnected] = useState<boolean>(false);
+  const [adminUsers, setAdminUsers] = useState<AdminManagedUser[]>([]);
+  const [adminUsersLoading, setAdminUsersLoading] = useState<boolean>(false);
+  const [adminUsersError, setAdminUsersError] = useState<string | null>(null);
+  const [moderatingUserId, setModeratingUserId] = useState<string | null>(null);
   const [domainErrorPopup, setDomainErrorPopup] = useState<{
     title: string;
     errors: string[];
@@ -565,6 +571,88 @@ export default function App() {
     [isOwnerAdmin, getAuthAccessToken, fetchAdminDiagnostics, emailDomain]
   );
 
+  const fetchAdminUsers = useCallback(async () => {
+    if (!isOwnerAdmin) return;
+    setAdminUsersLoading(true);
+    setAdminUsersError(null);
+    try {
+      const token = await getAuthAccessToken();
+      if (!token) {
+        throw new Error('HTTP 401: Missing active Supabase session token.');
+      }
+      const res = await fetch('/api/admin/users', {
+        cache: 'no-store',
+        headers: { Authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(9000),
+      });
+      const data = await parseJsonResponse<{ users?: AdminManagedUser[]; error?: string }>(res);
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}: ${data.error || res.statusText || 'Failed to load users'}`);
+      }
+      setAdminUsers(Array.isArray(data.users) ? data.users : []);
+    } catch (err) {
+      setAdminUsersError(
+        err instanceof Error ? err.message : 'Failed to load registered users'
+      );
+    } finally {
+      setAdminUsersLoading(false);
+    }
+  }, [isOwnerAdmin, getAuthAccessToken]);
+
+  const handleModerateUser = useCallback(
+    async (userId: string, action: UserModerationAction) => {
+      if (!isOwnerAdmin) return;
+      setModeratingUserId(userId);
+      setAdminUsersError(null);
+      try {
+        const token = await getAuthAccessToken();
+        if (!token) {
+          throw new Error('HTTP 401: Missing active Supabase session token.');
+        }
+        const res = await fetch(`/api/admin/users/${encodeURIComponent(userId)}/action`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ action }),
+          signal: AbortSignal.timeout(9000),
+        });
+        const data = await parseJsonResponse<{
+          ok?: boolean;
+          status?: AdminManagedUser['status'];
+          emailConfirmed?: boolean;
+          error?: string;
+        }>(res);
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}: ${data.error || 'User action failed'}`);
+        }
+        setAdminUsers((prev) =>
+          prev.map((u) =>
+            u.id === userId
+              ? {
+                  ...u,
+                  status: data.status || u.status,
+                  emailConfirmed:
+                    typeof data.emailConfirmed === 'boolean'
+                      ? data.emailConfirmed
+                      : u.emailConfirmed,
+                }
+              : u
+          )
+        );
+        showToast(`User updated: ${data.status || action}`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Failed to update user';
+        setAdminUsersError(msg);
+        showToast(msg);
+      } finally {
+        setModeratingUserId(null);
+      }
+    },
+    [isOwnerAdmin, getAuthAccessToken, showToast]
+  );
+
   // Auto-switch owner account (preciousddkid@gmail.com) to Owner Admin Diagnostics on sign-in,
   // and immediately lock out non-owner accounts if activeTab was ever 'admin'.
   useEffect(() => {
@@ -573,6 +661,7 @@ export default function App() {
         autoSwitchedAdminUserIdRef.current = authUser.id;
         setActiveTab('admin');
         void fetchAdminDiagnostics(false);
+        void fetchAdminUsers();
       }
     } else {
       autoSwitchedAdminUserIdRef.current = null;
@@ -581,11 +670,13 @@ export default function App() {
       setAdminError(null);
       setAdminTestResult(null);
       setAdminTestError(null);
+      setAdminUsers([]);
+      setAdminUsersError(null);
       setDomainErrorPopup(null);
       setAdminRealtimeConnected(false);
       setActiveTab((prev) => (prev === 'admin' ? 'home' : prev));
     }
-  }, [isOwnerAdmin, authUser?.id, fetchAdminDiagnostics]);
+  }, [isOwnerAdmin, authUser?.id, fetchAdminDiagnostics, fetchAdminUsers]);
 
   // Real-time Supabase Postgres subscription for owner admin: instant updates + immediate error pop-up on any event
   useEffect(() => {
@@ -601,6 +692,13 @@ export default function App() {
       if (!active || !sb) return;
       const channel = sb
         .channel(`owner-admin-realtime-${authUser.id}`)
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'inbound_webhook_logs' },
+          () => {
+            void fetchAdminDiagnostics(true);
+          }
+        )
         .on(
           'postgres_changes',
           { event: '*', schema: 'public', table: 'mailbox_messages' },
@@ -677,6 +775,8 @@ export default function App() {
     setAdminError(null);
     setAdminTestResult(null);
     setAdminTestError(null);
+    setAdminUsers([]);
+    setAdminUsersError(null);
     setDomainErrorPopup(null);
     setAdminRealtimeConnected(false);
     setActiveTab((prev) => (prev === 'admin' ? 'home' : prev));
@@ -2403,8 +2503,17 @@ export default function App() {
             testingInbound={testingInbound}
             testResult={adminTestResult}
             testError={adminTestError}
-            onRefresh={() => void fetchAdminDiagnostics(false)}
+            users={adminUsers}
+            usersLoading={adminUsersLoading}
+            usersError={adminUsersError}
+            moderatingUserId={moderatingUserId}
+            onRefresh={() => {
+              void fetchAdminDiagnostics(false);
+              void fetchAdminUsers();
+            }}
             onTestInbound={(addr) => void handleTestInboundPipeline(addr)}
+            onRefreshUsers={() => void fetchAdminUsers()}
+            onModerateUser={(userId, action) => void handleModerateUser(userId, action)}
             onSwitchToUserView={() => setActiveTab('home')}
           />
         )}
@@ -2419,6 +2528,7 @@ export default function App() {
             if (!isOwnerAdmin) return;
             setActiveTab('admin');
             void fetchAdminDiagnostics();
+            void fetchAdminUsers();
             return;
           }
           setActiveTab(tab);

@@ -1,5 +1,6 @@
 -- Run this once in your Supabase Dashboard -> SQL Editor
--- Enables persistent Naira wallets, custom @veribox.name.ng mailboxes, and inbound email storage.
+-- Enables persistent Naira wallets, custom @veribox.name.ng mailboxes, inbound email storage,
+-- raw inbound webhook traffic diagnostics, user moderation, and live Realtime updates.
 
 create table if not exists public.wallets (
   user_id text primary key,
@@ -77,6 +78,7 @@ on conflict (address) do nothing;
 
 create table if not exists public.mailbox_messages (
   id text primary key,
+  mailbox_id text,
   recipient_address text not null,
   from_name text,
   from_address text,
@@ -88,17 +90,59 @@ create table if not exists public.mailbox_messages (
   created_at timestamptz not null default now()
 );
 
+-- Ensure mailbox_id column exists even on older deployments
+alter table public.mailbox_messages
+  add column if not exists mailbox_id text;
+
 create index if not exists idx_mailbox_messages_recipient
   on public.mailbox_messages (recipient_address, created_at desc);
 create index if not exists idx_mailbox_messages_recipient_lower
   on public.mailbox_messages (lower(recipient_address), created_at desc);
+create index if not exists idx_mailbox_messages_mailbox_id
+  on public.mailbox_messages (mailbox_id, created_at desc);
 
--- Enable Row Level Security (backend uses service role key for strict per-user mailbox isolation)
+create table if not exists public.inbound_webhook_logs (
+  id text primary key,
+  created_at timestamptz not null default now(),
+  http_status integer not null,
+  status text not null,
+  error_detail text,
+  from_address text,
+  recipient text,
+  raw_to_preview text,
+  subject text,
+  otp_detected text,
+  matched_mailbox_id text,
+  matched_mailbox boolean not null default false,
+  supabase_stored boolean not null default false,
+  total_ms integer,
+  db_insert_ms integer,
+  parse_ms integer,
+  received_at timestamptz,
+  stored_at timestamptz,
+  delivery_gap_ms integer
+);
+
+create index if not exists idx_inbound_webhook_logs_created_at
+  on public.inbound_webhook_logs (created_at desc);
+
+create table if not exists public.user_moderation (
+  user_id text primary key,
+  email text,
+  status text not null default 'active',
+  reason text,
+  updated_by text,
+  updated_at timestamptz not null default now()
+);
+
+-- Enable Row Level Security (backend uses service role key for strict per-user isolation)
 alter table public.wallets enable row level security;
 alter table public.wallet_transactions enable row level security;
 alter table public.mailboxes enable row level security;
 alter table public.created_email_registry enable row level security;
 alter table public.mailbox_messages enable row level security;
+alter table public.inbound_webhook_logs enable row level security;
+alter table public.user_moderation enable row level security;
 
 do $$
 begin
@@ -110,29 +154,52 @@ begin
   end if;
 
   if not exists (
-    select 1 from pg_policies where tablename = 'mailbox_messages' and policyname = 'Allow owner read own mailbox messages'
+    select 1 from pg_policies where tablename = 'mailboxes' and policyname = 'Allow owner read own mailboxes'
   ) then
-    create policy "Allow owner read own mailbox messages"
-      on public.mailbox_messages
+    create policy "Allow owner read own mailboxes"
+      on public.mailboxes
       for select
       to authenticated
       using (
-        recipient_address <> '__inbound_audit__@system.veribox'
-        and (
-          lower(coalesce(auth.jwt() ->> 'email', '')) = 'preciousddkid@gmail.com'
-          or exists (
-            select 1
-            from public.mailboxes m
-            where lower(m.address) = lower(mailbox_messages.recipient_address)
-              and m.owner_user_id = auth.uid()::text
-              and coalesce(m.is_deleted, false) = false
-          )
-        )
+        owner_user_id = auth.uid()::text
+        or lower(coalesce(auth.jwt() ->> 'email', '')) = 'preciousddkid@gmail.com'
       );
+  end if;
+
+  drop policy if exists "Allow owner read own mailbox messages" on public.mailbox_messages;
+  create policy "Allow owner read own mailbox messages"
+    on public.mailbox_messages
+    for select
+    to authenticated
+    using (
+      recipient_address <> '__inbound_audit__@system.veribox'
+      and (
+        lower(coalesce(auth.jwt() ->> 'email', '')) = 'preciousddkid@gmail.com'
+        or exists (
+          select 1
+          from public.mailboxes m
+          where (
+            lower(m.address) = lower(mailbox_messages.recipient_address)
+            or (mailbox_messages.mailbox_id is not null and m.id = mailbox_messages.mailbox_id)
+          )
+          and m.owner_user_id = auth.uid()::text
+          and coalesce(m.is_deleted, false) = false
+        )
+      )
+    );
+
+  if not exists (
+    select 1 from pg_policies where tablename = 'inbound_webhook_logs' and policyname = 'Allow owner admin read inbound_webhook_logs'
+  ) then
+    create policy "Allow owner admin read inbound_webhook_logs"
+      on public.inbound_webhook_logs
+      for select
+      to authenticated
+      using (lower(coalesce(auth.jwt() ->> 'email', '')) = 'preciousddkid@gmail.com');
   end if;
 end $$;
 
--- Enable Supabase Realtime on wallets, mailbox_messages, and mailboxes for instant UI updates
+-- Enable Supabase Realtime on wallets, mailbox_messages, mailboxes, and inbound_webhook_logs
 do $$
 begin
   if not exists (
@@ -152,5 +219,11 @@ begin
     where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'mailboxes'
   ) then
     alter publication supabase_realtime add table public.mailboxes;
+  end if;
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'inbound_webhook_logs'
+  ) then
+    alter publication supabase_realtime add table public.inbound_webhook_logs;
   end if;
 end $$;

@@ -645,10 +645,16 @@ function getCustomEmailDomain(): string {
 }
 
 function getInboundEmailSecret(): string {
-  const raw = (process.env.INBOUND_EMAIL_SECRET || '')
+  const raw = (
+    process.env.INBOUND_EMAIL_SECRET ||
+    process.env.CLOUDFLARE_WEBHOOK_SECRET ||
+    process.env.EMAIL_WEBHOOK_SECRET ||
+    process.env.WEBHOOK_SECRET ||
+    ''
+  )
     .trim()
     .replace(/^["'`]|["'`]$/g, '')
-    .replace(/^INBOUND_EMAIL_SECRET\s*=\s*/i, '')
+    .replace(/^(INBOUND_EMAIL_SECRET|CLOUDFLARE_WEBHOOK_SECRET|EMAIL_WEBHOOK_SECRET|WEBHOOK_SECRET)\s*=\s*/i, '')
     .trim()
     .replace(/^["'`]|["'`]$/g, '')
     .trim();
@@ -4864,7 +4870,10 @@ export function createApiApp() {
         | 'mailbox_messages'
         | 'inbound_webhook_logs'
         | 'wallets'
-        | 'wallet_transactions',
+        | 'wallet_transactions'
+        | 'app_error_logs'
+        | 'created_email_registry'
+        | 'user_moderation',
       columns: string,
       orderColumn: 'created_at' | 'received_at' | 'updated_at' = 'created_at'
     ) => {
@@ -5061,6 +5070,9 @@ export function createApiApp() {
       inboundLogsProbe,
       walletsProbe,
       walletTxProbe,
+      appErrorLogsProbe,
+      createdRegistryProbe,
+      userModerationProbe,
       persistedWebhookLogs,
       persistedAppErrors,
       legacyAuditLogs,
@@ -5079,6 +5091,9 @@ export function createApiApp() {
       ),
       probeTable('wallets', 'user_id, balance, updated_at', 'updated_at'),
       probeTable('wallet_transactions', 'reference, user_id, amount, status, created_at'),
+      probeTable('app_error_logs', 'id, created_at, source, severity, code, message'),
+      probeTable('created_email_registry', 'address, username, domain, is_deleted, created_at'),
+      probeTable('user_moderation', 'user_id, email, status, updated_at', 'updated_at'),
       fetchPersistedWebhookLogs(),
       fetchPersistedAppErrors(),
       fetchLegacyAuditLogs(),
@@ -5152,6 +5167,9 @@ export function createApiApp() {
       ['inbound_webhook_logs', inboundLogsProbe],
       ['wallets', walletsProbe],
       ['wallet_transactions', walletTxProbe],
+      ['app_error_logs', appErrorLogsProbe],
+      ['created_email_registry', createdRegistryProbe],
+      ['user_moderation', userModerationProbe],
     ] as const) {
       if (!probe.ok) {
         const msg = `Supabase ${label} table error (${probe.errorCode || `HTTP ${probe.httpStatus}`}): ${probe.errorMessage || 'Query failed'}`;
@@ -5344,6 +5362,30 @@ export function createApiApp() {
           errorMessage: walletTxProbe.errorMessage,
           errorHint: walletTxProbe.errorHint,
         },
+        appErrorLogs: {
+          ok: appErrorLogsProbe.ok,
+          httpStatus: appErrorLogsProbe.httpStatus,
+          rowCount: appErrorLogsProbe.rowCount,
+          errorCode: appErrorLogsProbe.errorCode,
+          errorMessage: appErrorLogsProbe.errorMessage,
+          errorHint: appErrorLogsProbe.errorHint,
+        },
+        createdEmailRegistry: {
+          ok: createdRegistryProbe.ok,
+          httpStatus: createdRegistryProbe.httpStatus,
+          rowCount: createdRegistryProbe.rowCount,
+          errorCode: createdRegistryProbe.errorCode,
+          errorMessage: createdRegistryProbe.errorMessage,
+          errorHint: createdRegistryProbe.errorHint,
+        },
+        userModeration: {
+          ok: userModerationProbe.ok,
+          httpStatus: userModerationProbe.httpStatus,
+          rowCount: userModerationProbe.rowCount,
+          errorCode: userModerationProbe.errorCode,
+          errorMessage: userModerationProbe.errorMessage,
+          errorHint: userModerationProbe.errorHint,
+        },
       },
       recentInboundAttempts: mergedAttempts,
       rawInboundLogs: mergedAttempts.slice(0, 20),
@@ -5358,21 +5400,22 @@ export function createApiApp() {
 
     inboundAttemptLogs.length = 0;
     appErrorLogs.length = 0;
+    cachedDnsProbe = null;
+    cachedLiveDomainProbe = null;
     try {
       await Promise.allSettled([
         verified.supabase
           .from('mailbox_messages')
           .delete()
-          .eq('recipient_address', INBOUND_AUDIT_ADDRESS)
-          .neq('otp', 'STORED'),
+          .eq('recipient_address', INBOUND_AUDIT_ADDRESS),
         verified.supabase
           .from('inbound_webhook_logs')
           .delete()
-          .eq('ok', false),
+          .or('ok.eq.false,ok.is.null,http_status.gte.400'),
         verified.supabase
           .from('app_error_logs')
           .delete()
-          .neq('id', '00000000-0000-0000-0000-000000000000'),
+          .not('id', 'is', null),
       ]);
     } catch {
       // Non-blocking

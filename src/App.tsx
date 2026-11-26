@@ -36,7 +36,11 @@ import type {
 import { parseJsonResponse } from './utils/apiFetch';
 import { copyToClipboard } from './utils/clipboard';
 import { CUSTOM_EMAIL_DOMAIN } from './utils/directEmailFallback';
-import { ensureSupabaseClient, getActiveSupabaseClient } from './utils/supabase';
+import {
+  ensureSupabaseClient,
+  getActiveSupabaseClient,
+  syncSupabaseRealtimeAuth,
+} from './utils/supabase';
 
 const STORAGE_KEYS = {
   emails: 'veribox_saved_emails_v3',
@@ -862,8 +866,10 @@ export default function App() {
     let active = true;
     let cleanupChannel: (() => void) | null = null;
 
-    void ensureSupabaseClient().then((sb) => {
+    void ensureSupabaseClient().then(async (sb) => {
       if (!active || !sb) return;
+      const token = await syncSupabaseRealtimeAuth(sb);
+      if (!active || !token) return;
       const channel = sb
         .channel(`owner-admin-realtime-${authUser.id}`)
         .on(
@@ -902,7 +908,12 @@ export default function App() {
             void fetchAdminDiagnostics(true);
           }
         )
-        .subscribe();
+        .subscribe((status) => {
+          if (!active) return;
+          if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+            void sb.removeChannel(channel);
+          }
+        });
 
       cleanupChannel = () => {
         void sb.removeChannel(channel);
@@ -995,6 +1006,9 @@ export default function App() {
 
       try {
         const { data } = await client.auth.getSession();
+        if (active && data.session?.access_token) {
+          void client.realtime.setAuth(data.session.access_token);
+        }
         if (active && data.session?.user) {
           setAuthUser(data.session.user);
         }
@@ -1004,6 +1018,9 @@ export default function App() {
 
       const { data: listener } = client.auth.onAuthStateChange((event, session) => {
         if (!active) return;
+        if (session?.access_token) {
+          void client.realtime.setAuth(session.access_token);
+        }
         const nextUser = session?.user ?? null;
         setAuthUser(nextUser);
 
@@ -1124,8 +1141,10 @@ export default function App() {
     let active = true;
     let cleanupChannel: (() => void) | null = null;
 
-    void ensureSupabaseClient().then((sb) => {
+    void ensureSupabaseClient().then(async (sb) => {
       if (!active || !sb) return;
+      const token = await syncSupabaseRealtimeAuth(sb);
+      if (!active || !token) return;
       const channel = sb
         .channel(`wallet-sync-${walletUserId}`)
         .on(
@@ -1152,7 +1171,12 @@ export default function App() {
             void fetchUserTransfers();
           }
         )
-        .subscribe();
+        .subscribe((status) => {
+          if (!active) return;
+          if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+            void sb.removeChannel(channel);
+          }
+        });
 
       cleanupChannel = () => {
         void sb.removeChannel(channel);
@@ -2110,9 +2134,9 @@ export default function App() {
     }
   }, [activeEmail, refreshEmailInbox]);
 
-  // 1. Supabase Realtime INSERT subscription filtered for the active mailbox
+  // 1. Supabase Realtime INSERT subscription filtered for the active mailbox (auto-reconnects cleanly & never blocks HTTPS sync)
   useEffect(() => {
-    if (!autoRefresh || !activeEmail?.address) {
+    if (!autoRefresh || !activeEmail?.address || !authUser?.id) {
       setSupabaseRealtimeConnected(false);
       return;
     }
@@ -2120,11 +2144,24 @@ export default function App() {
     const targetAddr = activeEmail.address.trim().toLowerCase();
     let cancelled = false;
     let cleanupChannel: (() => void) | null = null;
+    let retryTimer: number | null = null;
+    let retryCount = 0;
 
-    void ensureSupabaseClient().then((sb) => {
+    const connectRealtime = async () => {
+      const sb = await ensureSupabaseClient();
       if (cancelled || !sb) return;
+
+      const accessToken = await syncSupabaseRealtimeAuth(sb);
+      if (cancelled || !accessToken) {
+        setSupabaseRealtimeConnected(false);
+        return;
+      }
+
+      cleanupChannel?.();
+      cleanupChannel = null;
+
       const channel = sb
-        .channel(`inbox-realtime-${targetAddr}`)
+        .channel(`inbox-realtime-${authUser.id}-${targetAddr}`)
         .on(
           'postgres_changes',
           {
@@ -2159,25 +2196,43 @@ export default function App() {
             setLastEmailCheckedAt(new Date().toISOString());
           }
         )
-        .subscribe((status, err) => {
+        .subscribe((status) => {
           if (cancelled) return;
-          setSupabaseRealtimeConnected(status === 'SUBSCRIBED');
-          if ((status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') && err?.message) {
-            setEmailError((prev) => prev || `Realtime channel (${status}): ${err.message}`);
+          if (status === 'SUBSCRIBED') {
+            retryCount = 0;
+            setSupabaseRealtimeConnected(true);
+            return;
+          }
+          if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+            setSupabaseRealtimeConnected(false);
+            void sb.removeChannel(channel);
+            // Immediately pull via HTTPS so incoming codes are never delayed if mobile WebSocket drops
+            void refreshEmailInbox(activeEmail, true);
+            if (!cancelled && retryCount < 3) {
+              const delayMs = [5000, 12000, 25000][retryCount] ?? 25000;
+              retryCount += 1;
+              if (retryTimer !== null) window.clearTimeout(retryTimer);
+              retryTimer = window.setTimeout(() => {
+                if (!cancelled) void connectRealtime();
+              }, delayMs);
+            }
           }
         });
 
       cleanupChannel = () => {
         void sb.removeChannel(channel);
       };
-    });
+    };
+
+    void connectRealtime();
 
     return () => {
       cancelled = true;
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
       setSupabaseRealtimeConnected(false);
       cleanupChannel?.();
     };
-  }, [autoRefresh, activeEmail?.address, applyInboxSnapshot]);
+  }, [autoRefresh, activeEmail?.address, authUser?.id, applyInboxSnapshot, refreshEmailInbox]);
 
   // 2. Real-time SSE stream for instant incoming emails on persistent local server
   useEffect(() => {
@@ -2221,7 +2276,7 @@ export default function App() {
     };
   }, [autoRefresh, activeTab, activeEmail?.address, activeEmail?.token, applyInboxSnapshot]);
 
-  // 3. Lightweight 3-second polling + immediate refresh when returning to Home or switching back from another app
+  // 3. Lightweight 2.5-second HTTPS live sync + immediate refresh when returning to Home or switching back from another app
   useEffect(() => {
     if (!autoRefresh || activeTab !== 'home' || !activeEmail) return;
     if (lastFetchedAddressRef.current === activeEmail.address.toLowerCase()) {
@@ -2230,7 +2285,7 @@ export default function App() {
     const timer = window.setInterval(() => {
       if (document.visibilityState === 'hidden') return;
       void refreshEmailInbox(activeEmail, true);
-    }, 3000);
+    }, 2500);
 
     const handleResume = () => {
       if (document.visibilityState === 'hidden') return;

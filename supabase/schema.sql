@@ -132,12 +132,25 @@ create table if not exists public.inbound_webhook_logs (
   subject text not null default '',
   otp_code text,
   matched_mailbox_id uuid,
-  http_status integer not null,
-  status text not null,
+  http_status integer not null default 200,
+  status text not null default 'stored',
   ok boolean not null default false,
   error_reason text,
   raw_meta jsonb
 );
+
+alter table public.inbound_webhook_logs
+  add column if not exists received_at timestamptz not null default now(),
+  add column if not exists from_address text not null default '',
+  add column if not exists to_address text not null default '',
+  add column if not exists subject text not null default '',
+  add column if not exists otp_code text,
+  add column if not exists matched_mailbox_id uuid,
+  add column if not exists http_status integer not null default 200,
+  add column if not exists status text not null default 'stored',
+  add column if not exists ok boolean not null default false,
+  add column if not exists error_reason text,
+  add column if not exists raw_meta jsonb;
 
 create index if not exists idx_inbound_webhook_logs_received_at
   on public.inbound_webhook_logs (received_at desc);
@@ -164,6 +177,20 @@ create table if not exists public.app_error_logs (
 create index if not exists idx_app_error_logs_created_at
   on public.app_error_logs (created_at desc);
 
+-- Explicit schema & role grants for PostgREST + Realtime + backend service role
+grant usage on schema public to anon, authenticated, service_role;
+grant all on all tables in schema public to service_role;
+grant all on all sequences in schema public to service_role;
+grant select on
+  public.wallets,
+  public.wallet_transactions,
+  public.mailboxes,
+  public.mailbox_messages,
+  public.inbound_webhook_logs,
+  public.user_moderation,
+  public.app_error_logs
+  to authenticated;
+
 -- Enable Row Level Security (backend uses service role key for strict per-user isolation)
 alter table public.wallets enable row level security;
 alter table public.wallet_transactions enable row level security;
@@ -173,6 +200,14 @@ alter table public.mailbox_messages enable row level security;
 alter table public.inbound_webhook_logs enable row level security;
 alter table public.user_moderation enable row level security;
 alter table public.app_error_logs enable row level security;
+
+-- Full replica identity ensures Supabase Realtime WAL filters work reliably on all rows
+alter table public.wallets replica identity full;
+alter table public.wallet_transactions replica identity full;
+alter table public.mailboxes replica identity full;
+alter table public.mailbox_messages replica identity full;
+alter table public.inbound_webhook_logs replica identity full;
+alter table public.app_error_logs replica identity full;
 
 do $$
 begin
@@ -202,18 +237,15 @@ begin
       or lower(coalesce(auth.jwt() ->> 'email', '')) = 'preciousddkid@gmail.com'
     );
 
-  if not exists (
-    select 1 from pg_policies where tablename = 'mailboxes' and policyname = 'Allow owner read own mailboxes'
-  ) then
-    create policy "Allow owner read own mailboxes"
-      on public.mailboxes
-      for select
-      to authenticated
-      using (
-        owner_user_id = auth.uid()::text
-        or lower(coalesce(auth.jwt() ->> 'email', '')) = 'preciousddkid@gmail.com'
-      );
-  end if;
+  drop policy if exists "Allow owner read own mailboxes" on public.mailboxes;
+  create policy "Allow owner read own mailboxes"
+    on public.mailboxes
+    for select
+    to authenticated
+    using (
+      owner_user_id = auth.uid()::text
+      or lower(coalesce(auth.jwt() ->> 'email', '')) = 'preciousddkid@gmail.com'
+    );
 
   drop policy if exists "Allow owner read own mailbox messages" on public.mailbox_messages;
   create policy "Allow owner read own mailbox messages"
@@ -237,15 +269,12 @@ begin
       )
     );
 
-  if not exists (
-    select 1 from pg_policies where tablename = 'inbound_webhook_logs' and policyname = 'Allow owner admin read inbound_webhook_logs'
-  ) then
-    create policy "Allow owner admin read inbound_webhook_logs"
-      on public.inbound_webhook_logs
-      for select
-      to authenticated
-      using (lower(coalesce(auth.jwt() ->> 'email', '')) = 'preciousddkid@gmail.com');
-  end if;
+  drop policy if exists "Allow owner admin read inbound_webhook_logs" on public.inbound_webhook_logs;
+  create policy "Allow owner admin read inbound_webhook_logs"
+    on public.inbound_webhook_logs
+    for select
+    to authenticated
+    using (lower(coalesce(auth.jwt() ->> 'email', '')) = 'preciousddkid@gmail.com');
 
   drop policy if exists "Allow owner admin read user_moderation" on public.user_moderation;
   create policy "Allow owner admin read user_moderation"
@@ -262,7 +291,7 @@ begin
     using (lower(coalesce(auth.jwt() ->> 'email', '')) = 'preciousddkid@gmail.com');
 end $$;
 
--- Enable Supabase Realtime on wallets, wallet_transactions, mailbox_messages, mailboxes, and inbound_webhook_logs
+-- Enable Supabase Realtime on wallets, wallet_transactions, mailbox_messages, mailboxes, inbound_webhook_logs, and app_error_logs
 do $$
 begin
   if not exists (
@@ -302,3 +331,6 @@ begin
     alter publication supabase_realtime add table public.app_error_logs;
   end if;
 end $$;
+
+-- Refresh PostgREST schema cache immediately
+notify pgrst, 'reload schema';

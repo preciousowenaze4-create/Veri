@@ -353,8 +353,10 @@ export function ProfileTab({
     env?.supabaseConfigured &&
       adminDiagnostics?.probes.mailboxes.ok &&
       adminDiagnostics?.probes.mailboxMessages.ok &&
+      (adminDiagnostics?.probes.inboundWebhookLogs?.ok ?? true) &&
       (adminDiagnostics?.probes.wallets?.ok ?? true) &&
-      (adminDiagnostics?.probes.walletTransactions?.ok ?? true)
+      (adminDiagnostics?.probes.walletTransactions?.ok ?? true) &&
+      (adminDiagnostics?.probes.appErrorLogs?.ok ?? true)
   );
 
   const tableProbes = adminDiagnostics
@@ -364,6 +366,9 @@ export function ProfileTab({
         { name: 'inbound_webhook_logs', probe: adminDiagnostics.probes.inboundWebhookLogs },
         { name: 'wallets', probe: adminDiagnostics.probes.wallets },
         { name: 'wallet_transactions', probe: adminDiagnostics.probes.walletTransactions },
+        { name: 'app_error_logs', probe: adminDiagnostics.probes.appErrorLogs },
+        { name: 'created_email_registry', probe: adminDiagnostics.probes.createdEmailRegistry },
+        { name: 'user_moderation', probe: adminDiagnostics.probes.userModeration },
       ].filter((item) => Boolean(item.probe))
     : [];
 

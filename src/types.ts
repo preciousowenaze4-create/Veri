@@ -346,6 +346,9 @@ export interface AdminDiagnosticsResponse {
     inboundWebhookLogs?: AdminTableProbe;
     wallets?: AdminTableProbe;
     walletTransactions?: AdminTableProbe;
+    appErrorLogs?: AdminTableProbe;
+    createdEmailRegistry?: AdminTableProbe;
+    userModeration?: AdminTableProbe;
   };
   recentInboundAttempts: AdminInboundAttempt[];
   rawInboundLogs?: AdminInboundAttempt[];

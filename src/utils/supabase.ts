@@ -20,6 +20,13 @@ function buildClient(url: string, anonKey: string): SupabaseClient {
       autoRefreshToken: true,
       detectSessionInUrl: true,
     },
+    realtime: {
+      heartbeatIntervalMs: 15000,
+      timeout: 12000,
+      params: {
+        eventsPerSecond: 10,
+      },
+    },
   });
 }
 
@@ -58,6 +65,22 @@ export async function ensureSupabaseClient(): Promise<SupabaseClient | null> {
   })();
 
   return initPromise;
+}
+
+export async function syncSupabaseRealtimeAuth(
+  client: SupabaseClient | null
+): Promise<string | null> {
+  if (!client) return null;
+  try {
+    const { data } = await client.auth.getSession();
+    const token = data.session?.access_token ?? null;
+    if (token) {
+      await client.realtime.setAuth(token);
+    }
+    return token;
+  } catch {
+    return null;
+  }
 }
 
 export function getActiveSupabaseClient(): SupabaseClient | null {

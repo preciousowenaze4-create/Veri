@@ -438,6 +438,27 @@ export function AdminDiagnosticsTab({
                   probe={diagnostics.probes.walletTransactions}
                 />
               )}
+              {diagnostics.probes.appErrorLogs && (
+                <ProbeCard
+                  title="App Error Logs"
+                  tableName="app_error_logs"
+                  probe={diagnostics.probes.appErrorLogs}
+                />
+              )}
+              {diagnostics.probes.createdEmailRegistry && (
+                <ProbeCard
+                  title="Email Registry"
+                  tableName="created_email_registry"
+                  probe={diagnostics.probes.createdEmailRegistry}
+                />
+              )}
+              {diagnostics.probes.userModeration && (
+                <ProbeCard
+                  title="User Moderation"
+                  tableName="user_moderation"
+                  probe={diagnostics.probes.userModeration}
+                />
+              )}
             </div>
 
             {/* Recent App / Supabase / Webhook / Routing Errors */}

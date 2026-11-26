@@ -531,7 +531,10 @@ export default function App() {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${token}`,
           },
-          body: JSON.stringify({ targetAddress }),
+          body: JSON.stringify({
+            recipientAddress: targetAddress,
+            targetAddress,
+          }),
           signal: AbortSignal.timeout(10500),
         });
         const data = await parseJsonResponse<AdminInboundTestResult & { error?: string }>(res);

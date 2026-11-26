@@ -454,7 +454,7 @@ export function AdminDiagnosticsTab({
           </h2>
         </div>
         <p className="text-xs text-[#6E6552] dark:text-[#A89F8C]">
-          Sends a real HTTP POST request to <code className="font-mono">/api/email/inbound</code> with a simulated TikTok OTP payload, verifies DNS routing, confirms Supabase write + readback, and tests <code className="font-mono">/api/email/messages</code> retrieval.
+          Sends a real HTTP POST request to <code className="font-mono">/api/email/inbound</code> with a live VeriBox diagnostic payload, verifies DNS routing, confirms Supabase write + readback in <code className="font-mono">mailbox_messages</code> and <code className="font-mono">inbound_webhook_logs</code>, and tests <code className="font-mono">/api/email/messages</code> retrieval.
         </p>
 
         <div className="flex flex-col sm:flex-row gap-2">
@@ -528,6 +528,17 @@ export function AdminDiagnosticsTab({
                 >
                   DB Read: {testResult.supabaseReadbackOk ? 'OK' : 'FAILED'}
                 </span>
+                {typeof testResult.webhookLogReadbackOk === 'boolean' && (
+                  <span
+                    className={
+                      testResult.webhookLogReadbackOk
+                        ? 'text-emerald-600 dark:text-emerald-400'
+                        : 'text-rose-600 dark:text-rose-400'
+                    }
+                  >
+                    Webhook Log: {testResult.webhookLogReadbackOk ? 'OK' : 'FAILED'}
+                  </span>
+                )}
                 <span
                   className={
                     testResult.inboxApiOk === true

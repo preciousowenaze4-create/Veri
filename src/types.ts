@@ -328,6 +328,8 @@ export interface AdminInboundTestResult {
   responseBody: unknown;
   supabaseWriteOk: boolean;
   supabaseReadbackOk: boolean;
+  webhookLogReadbackOk?: boolean;
+  webhookLogId?: string | null;
   inboxApiOk: boolean | null;
   inboxMessageCount: number | null;
   inboxError: string | null;

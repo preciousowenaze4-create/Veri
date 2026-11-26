@@ -840,6 +840,31 @@ function extractTargetRecipients(rawTo: unknown): string[] {
   return out;
 }
 
+function normalizeRecipientString(recipientAddress: unknown): string {
+  if (typeof recipientAddress === 'string') {
+    return recipientAddress.trim().toLowerCase();
+  }
+  if (Array.isArray(recipientAddress)) {
+    return normalizeRecipientString(recipientAddress[0]);
+  }
+  if (recipientAddress && typeof recipientAddress === 'object') {
+    const obj = recipientAddress as {
+      address?: unknown;
+      email?: unknown;
+      recipient?: unknown;
+      recipientAddress?: unknown;
+    };
+    const inner = obj.address ?? obj.email ?? obj.recipient ?? obj.recipientAddress;
+    return typeof inner === 'string'
+      ? inner.trim().toLowerCase()
+      : normalizeRecipientString(inner ?? '');
+  }
+  if (recipientAddress === null || recipientAddress === undefined) {
+    return '';
+  }
+  return String(recipientAddress).trim().toLowerCase();
+}
+
 // ==========================================
 // Privacy-Safe Private Number Integration
 // ==========================================
@@ -2634,8 +2659,8 @@ export function createApiApp() {
     );
   }
 
-  function createSignedMailboxToken(rawAddress: string): string {
-    const addr = rawAddress.trim().toLowerCase();
+  function createSignedMailboxToken(rawAddress: unknown): string {
+    const addr = normalizeRecipientString(rawAddress);
     const nonce = crypto.randomBytes(16).toString('hex');
     const sig = crypto
       .createHmac('sha256', getMailboxSigningSecret())
@@ -2645,9 +2670,9 @@ export function createApiApp() {
     return `vbx1.${nonce}.${sig}`;
   }
 
-  function verifySignedMailboxToken(rawAddress: string, rawToken: string): boolean {
-    const addr = rawAddress.trim().toLowerCase();
-    const parts = rawToken.trim().split('.');
+  function verifySignedMailboxToken(rawAddress: unknown, rawToken: string): boolean {
+    const addr = normalizeRecipientString(rawAddress);
+    const parts = (typeof rawToken === 'string' ? rawToken : String(rawToken || '')).trim().split('.');
     if (parts.length !== 3 || parts[0] !== 'vbx1') return false;
     const [, nonce, providedSig] = parts;
     if (!nonce || !providedSig) return false;
@@ -2807,8 +2832,8 @@ export function createApiApp() {
     }
   }
 
-  async function findMailboxRecord(rawAddress: string): Promise<CustomMailboxRecord | null> {
-    const addr = rawAddress.trim().toLowerCase();
+  async function findMailboxRecord(rawAddress: unknown): Promise<CustomMailboxRecord | null> {
+    const addr = normalizeRecipientString(rawAddress);
     if (!addr) return null;
 
     const sb = getSupabaseServerClient();
@@ -2987,7 +3012,16 @@ export function createApiApp() {
       text: cleanStr(msg.text),
       html: cleanStr(msg.html),
     };
-    const recipient = sanitizedMsg.recipientAddress.trim().toLowerCase();
+    const recipient = normalizeRecipientString(sanitizedMsg.recipientAddress);
+    if (!recipient) {
+      return {
+        supabaseAttempted: false,
+        supabaseStored: false,
+        dbInsertMs: 0,
+        errorCode: 'MISSING_RECIPIENT',
+        errorMessage: 'Recipient email address is required.',
+      };
+    }
     const existing = mailboxMessagesMap.get(recipient) || [];
     const next = [sanitizedMsg, ...existing.filter((m) => m.id !== sanitizedMsg.id)].slice(0, 100);
     mailboxMessagesMap.set(recipient, next);
@@ -3063,10 +3097,18 @@ export function createApiApp() {
   }
 
   async function listInboxMessagesWithStatus(
-    recipientAddress: string,
+    recipientAddress: unknown,
     mailboxId?: string | null
   ): Promise<InboxListResult> {
-    const recipient = recipientAddress.trim().toLowerCase();
+    const recipient = normalizeRecipientString(recipientAddress);
+    if (!recipient) {
+      return {
+        rows: [],
+        supabaseError: 'Recipient email address is required.',
+        supabaseCode: 'MISSING_RECIPIENT',
+        supabaseStatus: 400,
+      };
+    }
     const sb = getSupabaseServerClient();
     if (sb) {
       try {
@@ -3147,16 +3189,17 @@ export function createApiApp() {
     };
   }
 
-  async function listInboxMessages(recipientAddress: string): Promise<CustomInboxMessageRecord[]> {
+  async function listInboxMessages(recipientAddress: unknown): Promise<CustomInboxMessageRecord[]> {
     const res = await listInboxMessagesWithStatus(recipientAddress);
     return res.rows;
   }
 
   async function findInboxMessage(
-    recipientAddress: string,
+    recipientAddress: unknown,
     messageId: string
   ): Promise<CustomInboxMessageRecord | null> {
-    const recipient = recipientAddress.trim().toLowerCase();
+    const recipient = normalizeRecipientString(recipientAddress);
+    if (!recipient) return null;
     const sb = getSupabaseServerClient();
     if (sb) {
       try {
@@ -3164,14 +3207,14 @@ export function createApiApp() {
           .from('mailbox_messages')
           .select('*')
           .eq('id', messageId)
-          .eq('recipient_address', recipient)
+          .ilike('recipient_address', recipient)
           .maybeSingle();
         if (!error && data) {
           await sb
             .from('mailbox_messages')
             .update({ seen: true })
             .eq('id', messageId)
-            .eq('recipient_address', recipient);
+            .ilike('recipient_address', recipient);
 
           return {
             id: String(data.id),
@@ -3197,8 +3240,9 @@ export function createApiApp() {
     return found;
   }
 
-  async function deleteInboxMessageById(recipientAddress: string, messageId: string): Promise<boolean> {
-    const recipient = recipientAddress.trim().toLowerCase();
+  async function deleteInboxMessageById(recipientAddress: unknown, messageId: string): Promise<boolean> {
+    const recipient = normalizeRecipientString(recipientAddress);
+    if (!recipient) return false;
     const memList = mailboxMessagesMap.get(recipient) || [];
     mailboxMessagesMap.set(
       recipient,
@@ -3212,7 +3256,7 @@ export function createApiApp() {
           .from('mailbox_messages')
           .delete()
           .eq('id', messageId)
-          .eq('recipient_address', recipient);
+          .ilike('recipient_address', recipient);
       } catch {
         // Ignore if table not applied
       }
@@ -4160,11 +4204,9 @@ export function createApiApp() {
       auth.replace(/^Bearer\s+/i, '').trim() ||
       (typeof req.query.token === 'string' ? req.query.token.trim() : '')
     );
-    const emailAddress = String(
-      req.headers['x-email-address'] || req.query.address || ''
-    )
-      .trim()
-      .toLowerCase();
+    const emailAddress = normalizeRecipientString(
+      req.headers['x-email-address'] ?? req.query.address
+    );
 
     if (!token || !emailAddress || !emailAddress.endsWith(`@${CUSTOM_EMAIL_DOMAIN}`)) {
       return null;
@@ -4261,6 +4303,18 @@ export function createApiApp() {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
+
+    const requestedEmail = normalizeRecipientString(
+      req.headers['x-email-address'] ?? req.query.address
+    );
+    if (!requestedEmail) {
+      res.status(400).json({
+        error: `Recipient email address is required (e.g. yourname@${CUSTOM_EMAIL_DOMAIN}).`,
+        code: 'MISSING_RECIPIENT',
+        messages: [],
+      });
+      return;
+    }
 
     const verified = await verifyMailboxRequest(req);
     if (!verified) {
@@ -5074,16 +5128,31 @@ export function createApiApp() {
     const verified = await verifyOwnerAdminRequest(req, res);
     if (!verified) return;
 
-    const rawTarget =
-      typeof req.body?.recipientAddress === 'string'
-        ? req.body.recipientAddress
-        : typeof req.body?.targetAddress === 'string'
-          ? req.body.targetAddress
-          : '';
-    const requestedAddr = rawTarget.trim().toLowerCase();
-    const targetAddress = requestedAddr.endsWith(`@${CUSTOM_EMAIL_DOMAIN}`)
-      ? requestedAddr
-      : `diag.test@${CUSTOM_EMAIL_DOMAIN}`;
+    const hasRecipientField = Boolean(
+      req.body &&
+        typeof req.body === 'object' &&
+        ('recipientAddress' in req.body || 'targetAddress' in req.body)
+    );
+    const rawTarget = req.body?.recipientAddress ?? req.body?.targetAddress;
+    const requestedAddr = normalizeRecipientString(rawTarget);
+
+    if (hasRecipientField && !requestedAddr) {
+      res.status(400).json({
+        ok: false,
+        error: `Recipient address is required (e.g. diag.test@${CUSTOM_EMAIL_DOMAIN}).`,
+      });
+      return;
+    }
+
+    if (requestedAddr && !requestedAddr.endsWith(`@${CUSTOM_EMAIL_DOMAIN}`)) {
+      res.status(422).json({
+        ok: false,
+        error: `Recipient address must belong to @${CUSTOM_EMAIL_DOMAIN} (got "${requestedAddr}").`,
+      });
+      return;
+    }
+
+    const targetAddress = requestedAddr || `diag.test@${CUSTOM_EMAIL_DOMAIN}`;
 
     const reqHost = req.get('host') || `127.0.0.1:${process.env.PORT || 3000}`;
     const forwardedProto =
@@ -5110,71 +5179,25 @@ export function createApiApp() {
     const prodProbePromise =
       origin !== prodDomainUrl
         ? (async () => {
-            // Only POST to production /api/email/inbound if this environment also has the inbound secret;
-            // otherwise probe GET /api/email/domains so preview tests never inject 401 audit errors.
-            if (!secret) {
-              try {
-                const healthRes = await fetch(`${prodDomainUrl}/api/email/domains`, {
-                  headers: { accept: 'application/json' },
-                  signal: AbortSignal.timeout(3000),
-                });
-                return {
-                  url: `${prodDomainUrl}/api/email/domains`,
-                  httpStatus: healthRes.status,
-                  reachable: healthRes.ok,
-                  detail: healthRes.ok
-                    ? 'Production domain API reachable (secret not set in local preview, skipped remote POST)'
-                    : `HTTP ${healthRes.status} from production domain API`,
-                };
-              } catch (err) {
-                return {
-                  url: `${prodDomainUrl}/api/email/domains`,
-                  httpStatus: null,
-                  reachable: false,
-                  detail: err instanceof Error ? err.message : 'Production domain unreachable',
-                };
-              }
-            }
             try {
-              const r = await fetch(`${prodDomainUrl}/api/email/inbound`, {
-                method: 'POST',
-                headers: {
-                  'content-type': 'application/json',
-                  'x-inbound-secret': secret,
-                },
-                body: JSON.stringify({
-                  to: targetAddress,
-                  from: 'TikTok <noreply@account.tiktok.com>',
-                  subject: `${testCode} is your verification code`,
-                  text: `[TikTok] ${testCode} is your verification code`,
-                  html: `<p>Your TikTok verification code is <strong>${testCode}</strong>.</p>`,
-                }),
-                signal: AbortSignal.timeout(3500),
+              const healthRes = await fetch(`${prodDomainUrl}/api/email/domains`, {
+                headers: { accept: 'application/json' },
+                signal: AbortSignal.timeout(3000),
               });
-              const txt = await r.text();
-              let parsed: unknown = txt;
-              try {
-                parsed = JSON.parse(txt);
-              } catch {
-                // Keep raw text
-              }
               return {
-                url: `${prodDomainUrl}/api/email/inbound`,
-                httpStatus: r.status,
-                reachable: r.ok,
-                detail:
-                  typeof parsed === 'object' && parsed && 'error' in parsed
-                    ? String((parsed as { error?: string }).error)
-                    : r.ok
-                      ? 'Live custom domain webhook accepted payload and stored message'
-                      : `HTTP ${r.status}: ${txt.slice(0, 180)}`,
+                url: `${prodDomainUrl}/api/email/domains`,
+                httpStatus: healthRes.status,
+                reachable: healthRes.ok,
+                detail: healthRes.ok
+                  ? 'Live custom domain API reachable'
+                  : `HTTP ${healthRes.status} from live custom domain API`,
               };
             } catch (err) {
               return {
-                url: `${prodDomainUrl}/api/email/inbound`,
+                url: `${prodDomainUrl}/api/email/domains`,
                 httpStatus: null,
                 reachable: false,
-                detail: err instanceof Error ? err.message : 'Production webhook unreachable',
+                detail: err instanceof Error ? err.message : 'Live custom domain unreachable',
               };
             }
           })()
@@ -5189,10 +5212,10 @@ export function createApiApp() {
         },
         body: JSON.stringify({
           to: targetAddress,
-          from: 'TikTok <noreply@account.tiktok.com>',
-          subject: `${testCode} is your verification code`,
-          text: `[TikTok] ${testCode} is your verification code`,
-          html: `<div style="font-family:sans-serif"><p>Your verification code is <strong>${testCode}</strong>. Valid for 10 minutes.</p></div>`,
+          from: `VeriBox Diagnostics <diag@${CUSTOM_EMAIL_DOMAIN}>`,
+          subject: `VeriBox Live Pipeline Test (${testCode})`,
+          text: `VeriBox live inbound webhook diagnostic test. Reference code: ${testCode}`,
+          html: `<div style="font-family:sans-serif"><p>VeriBox live inbound webhook diagnostic test. Reference code: <strong>${testCode}</strong>.</p></div>`,
         }),
         signal: AbortSignal.timeout(4500),
       });
@@ -5211,6 +5234,7 @@ export function createApiApp() {
     const parsedResp = (responseBody && typeof responseBody === 'object'
       ? responseBody
       : {}) as {
+      savedMessageId?: string | null;
       messageIds?: string[];
       otpDetected?: string | null;
       supabaseStored?: boolean;
@@ -5218,23 +5242,42 @@ export function createApiApp() {
       error?: string;
     };
 
-    const insertedId = Array.isArray(parsedResp.messageIds) ? parsedResp.messageIds[0] : null;
+    const insertedId =
+      parsedResp.savedMessageId ||
+      (Array.isArray(parsedResp.messageIds) ? parsedResp.messageIds[0] : null);
     let supabaseReadbackOk = false;
+    let webhookLogReadbackOk = false;
+    let webhookLogId: string | null = null;
     let readbackError: string | null = parsedResp.supabaseError || parsedResp.error || fetchError || null;
 
     if (insertedId) {
       try {
-        const { data, error } = await verified.supabase
-          .from('mailbox_messages')
-          .select('id, otp, recipient_address')
-          .eq('id', insertedId)
-          .maybeSingle();
-        if (error) {
-          readbackError = `${error.code || 'READBACK_ERR'}: ${error.message}`;
-        } else if (data?.id === insertedId) {
+        const [msgReadback, logReadback] = await Promise.all([
+          verified.supabase
+            .from('mailbox_messages')
+            .select('id, otp, recipient_address')
+            .eq('id', insertedId)
+            .maybeSingle(),
+          verified.supabase
+            .from('inbound_webhook_logs')
+            .select('id, http_status, status, recipient, otp_detected')
+            .ilike('recipient', targetAddress)
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle(),
+        ]);
+
+        if (msgReadback.error) {
+          readbackError = `${msgReadback.error.code || 'READBACK_ERR'}: ${msgReadback.error.message}`;
+        } else if (msgReadback.data?.id === insertedId) {
           supabaseReadbackOk = true;
         } else if (!readbackError) {
           readbackError = 'Inserted row not returned during Supabase readback (check RLS policies or SUPABASE_SERVICE_ROLE_KEY)';
+        }
+
+        if (!logReadback.error && logReadback.data?.id) {
+          webhookLogReadbackOk = true;
+          webhookLogId = String(logReadback.data.id);
         }
       } catch (err) {
         readbackError = err instanceof Error ? err.message : 'Readback failed';
@@ -5279,6 +5322,12 @@ export function createApiApp() {
       inboxError = `No registered mailbox found for ${targetAddress} — generate or select an active mailbox first to verify frontend inbox readback.`;
     }
 
+    // Remove the temporary synthetic test message from mailbox_messages after verifying DB + Inbox readback
+    // so real user inboxes stay free of test messages (while inbound_webhook_logs retains the real webhook audit row).
+    if (insertedId) {
+      await deleteInboxMessageById(targetAddress, insertedId).catch(() => undefined);
+    }
+
     const [dnsCheck, productionProbe] = await Promise.all([dnsCheckPromise, prodProbePromise]);
 
     res.json({
@@ -5290,6 +5339,8 @@ export function createApiApp() {
       responseBody,
       supabaseWriteOk: Boolean(parsedResp.supabaseStored),
       supabaseReadbackOk,
+      webhookLogReadbackOk,
+      webhookLogId,
       inboxApiOk,
       inboxMessageCount,
       inboxError,
@@ -5305,14 +5356,22 @@ export function createApiApp() {
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
 
-    const verifiedAddress = await verifyMailboxRequest(req);
-    if (!verifiedAddress) {
+    const requestedEmail = normalizeRecipientString(
+      req.headers['x-email-address'] ?? req.query.address
+    );
+    if (!requestedEmail) {
+      res.status(400).json({ error: 'Recipient email address is required.' });
+      return;
+    }
+
+    const verified = await verifyMailboxRequest(req);
+    if (!verified) {
       res.status(401).json({ error: 'Unauthorized mailbox request' });
       return;
     }
 
     try {
-      const found = await findInboxMessage(verifiedAddress, req.params.id);
+      const found = await findInboxMessage(verified.address, req.params.id);
       if (!found) {
         res.status(404).json({ error: 'Email not found' });
         return;
@@ -5335,14 +5394,22 @@ export function createApiApp() {
   });
 
   app.delete('/api/email/messages/:id', async (req, res) => {
-    const verifiedAddress = await verifyMailboxRequest(req);
-    if (!verifiedAddress) {
+    const requestedEmail = normalizeRecipientString(
+      req.headers['x-email-address'] ?? req.query.address
+    );
+    if (!requestedEmail) {
+      res.status(400).json({ error: 'Recipient email address is required.' });
+      return;
+    }
+
+    const verified = await verifyMailboxRequest(req);
+    if (!verified) {
       res.status(401).json({ error: 'Unauthorized mailbox request' });
       return;
     }
 
     try {
-      await deleteInboxMessageById(verifiedAddress, req.params.id);
+      await deleteInboxMessageById(verified.address, req.params.id);
       res.json({ deleted: true });
     } catch (error) {
       res.status(502).json({

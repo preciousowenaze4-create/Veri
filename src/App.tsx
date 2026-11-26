@@ -551,12 +551,35 @@ export default function App() {
           );
         }
         setAdminTestResult(data);
+        const directErrors: string[] = [];
+        if (Array.isArray(data.checks)) {
+          for (const check of data.checks) {
+            if (check.ok === false) {
+              directErrors.push(`${check.label}: ${check.error || check.detail}`);
+            }
+          }
+        }
         if (data.productionProbe && !data.productionProbe.reachable) {
+          directErrors.push(
+            `${data.productionProbe.url} -> HTTP ${data.productionProbe.httpStatus ?? 'ERR'}: ${data.productionProbe.detail}`
+          );
+        }
+        if (data.supabaseError && !directErrors.some((e) => e.includes(data.supabaseError!))) {
+          directErrors.push(data.supabaseError);
+        }
+        if (data.webhookLogError && !directErrors.some((e) => e.includes(data.webhookLogError!))) {
+          directErrors.push(data.webhookLogError);
+        }
+        if (data.inboxError && data.inboxApiOk === false) {
+          directErrors.push(data.inboxError);
+        }
+        if (directErrors.length > 0 || data.ready === false || data.httpStatus >= 400) {
           setDomainErrorPopup({
-            title: `Live Webhook Connection Failed (${emailDomain})`,
-            errors: [
-              `${data.productionProbe.url} -> HTTP ${data.productionProbe.httpStatus ?? 'ERR'}: ${data.productionProbe.detail}`,
-            ],
+            title: `System Readiness Check Failed (${emailDomain})`,
+            errors:
+              directErrors.length > 0
+                ? directErrors
+                : [`Webhook readiness endpoint returned HTTP ${data.httpStatus}`],
             timestamp: data.testedAt || new Date().toISOString(),
           });
         }
@@ -566,12 +589,12 @@ export default function App() {
         const message =
           err instanceof Error
             ? err.name === 'TimeoutError' || err.name === 'AbortError'
-              ? 'Request timed out while testing inbound pipeline'
+              ? 'Request timed out while checking system readiness'
               : err.message
-            : 'Inbound pipeline test failed';
+            : 'System readiness check failed';
         setAdminTestError(message);
         setDomainErrorPopup({
-          title: `Live Pipeline Test Error (${emailDomain})`,
+          title: `System Readiness Check Error (${emailDomain})`,
           errors: [message],
           timestamp: new Date().toISOString(),
         });
@@ -1795,14 +1818,19 @@ export default function App() {
         setEmailError(null);
       }
       try {
+        const sbToken = await getAuthAccessToken();
+        const headers: Record<string, string> = {
+          Authorization: `Bearer ${target.token}`,
+          'x-email-provider': 'veribox',
+          'x-email-address': target.address,
+          'Cache-Control': 'no-cache',
+        };
+        if (sbToken) {
+          headers['x-supabase-token'] = sbToken;
+        }
         const res = await fetch('/api/email/messages', {
           cache: 'no-store',
-          headers: {
-            Authorization: `Bearer ${target.token}`,
-            'x-email-provider': 'veribox',
-            'x-email-address': target.address,
-            'Cache-Control': 'no-cache',
-          },
+          headers,
           signal: AbortSignal.timeout(8000),
         });
 
@@ -1836,7 +1864,7 @@ export default function App() {
         }
       }
     },
-    [activeEmail, applyInboxSnapshot]
+    [activeEmail, applyInboxSnapshot, getAuthAccessToken]
   );
 
   const handleGenerateCustomEmail = useCallback(async () => {
@@ -1912,12 +1940,17 @@ export default function App() {
       if (!activeEmail) return;
       setLoadingEmailDetail(true);
       try {
+        const sbToken = await getAuthAccessToken();
+        const headers: Record<string, string> = {
+          Authorization: `Bearer ${activeEmail.token}`,
+          'x-email-provider': 'veribox',
+          'x-email-address': activeEmail.address,
+        };
+        if (sbToken) {
+          headers['x-supabase-token'] = sbToken;
+        }
         const res = await fetch(`/api/email/messages/${encodeURIComponent(id)}`, {
-          headers: {
-            Authorization: `Bearer ${activeEmail.token}`,
-            'x-email-provider': 'veribox',
-            'x-email-address': activeEmail.address,
-          },
+          headers,
           signal: AbortSignal.timeout(8000),
         });
         const data = await parseJsonResponse<EmailMessageDetail & { error?: string }>(res);
@@ -1941,20 +1974,25 @@ export default function App() {
         setLoadingEmailDetail(false);
       }
     },
-    [activeEmail, showToast]
+    [activeEmail, getAuthAccessToken, showToast]
   );
 
   const handleDeleteEmailMessage = useCallback(
     async (id: string) => {
       if (!activeEmail) return;
       try {
+        const sbToken = await getAuthAccessToken();
+        const headers: Record<string, string> = {
+          Authorization: `Bearer ${activeEmail.token}`,
+          'x-email-provider': 'veribox',
+          'x-email-address': activeEmail.address,
+        };
+        if (sbToken) {
+          headers['x-supabase-token'] = sbToken;
+        }
         await fetch(`/api/email/messages/${encodeURIComponent(id)}`, {
           method: 'DELETE',
-          headers: {
-            Authorization: `Bearer ${activeEmail.token}`,
-            'x-email-provider': 'veribox',
-            'x-email-address': activeEmail.address,
-          },
+          headers,
           signal: AbortSignal.timeout(6000),
         });
         setEmailMessages((prev) => prev.filter((m) => m.id !== id));
@@ -1964,7 +2002,7 @@ export default function App() {
         showToast('Could not delete email');
       }
     },
-    [activeEmail, showToast]
+    [activeEmail, getAuthAccessToken, showToast]
   );
 
   useEffect(() => {
@@ -2121,9 +2159,11 @@ export default function App() {
             setLastEmailCheckedAt(new Date().toISOString());
           }
         )
-        .subscribe((status) => {
-          if (!cancelled) {
-            setSupabaseRealtimeConnected(status === 'SUBSCRIBED');
+        .subscribe((status, err) => {
+          if (cancelled) return;
+          setSupabaseRealtimeConnected(status === 'SUBSCRIBED');
+          if ((status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') && err?.message) {
+            setEmailError((prev) => prev || `Realtime channel (${status}): ${err.message}`);
           }
         });
 
@@ -2181,9 +2221,12 @@ export default function App() {
     };
   }, [autoRefresh, activeTab, activeEmail?.address, activeEmail?.token, applyInboxSnapshot]);
 
-  // 3. Lightweight 3-second polling + immediate refresh when returning from another app/tab (zero 1Hz re-renders)
+  // 3. Lightweight 3-second polling + immediate refresh when returning to Home or switching back from another app
   useEffect(() => {
     if (!autoRefresh || activeTab !== 'home' || !activeEmail) return;
+    if (lastFetchedAddressRef.current === activeEmail.address.toLowerCase()) {
+      void refreshEmailInbox(activeEmail, true);
+    }
     const timer = window.setInterval(() => {
       if (document.visibilityState === 'hidden') return;
       void refreshEmailInbox(activeEmail, true);

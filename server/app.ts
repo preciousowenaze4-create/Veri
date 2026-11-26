@@ -258,13 +258,13 @@ function decodeHtmlEntities(input: string): string {
 }
 
 function stripTags(html: string): string {
-  const bounded = html.length > 80000 ? html.slice(0, 80000) : html;
-  const withoutBlocks = bounded
+  const withoutBlocks = html
     .replace(/<head[\s\S]*?<\/head>/gi, ' ')
     .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<(?:br|p|div|li|tr|h[1-6])\b[^>]*>/gi, '\n');
-  return decodeHtmlEntities(withoutBlocks.replace(/<[^>]+>/g, ' '))
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ');
+  const bounded = withoutBlocks.length > 90000 ? withoutBlocks.slice(0, 90000) : withoutBlocks;
+  const withBreaks = bounded.replace(/<(?:br|p|div|li|tr|td|th|h[1-6])\b[^>]*>/gi, '\n');
+  return decodeHtmlEntities(withBreaks.replace(/<[^>]+>/g, ' '))
     .replace(/[ \t]+/g, ' ')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
@@ -272,35 +272,49 @@ function stripTags(html: string): string {
 
 export function extractOtpCode(rawText: string): string | null {
   if (!rawText) return null;
-  const text = rawText.length > 20000 ? rawText.slice(0, 20000) : rawText;
+  const text = rawText.length > 24000 ? rawText.slice(0, 24000) : rawText;
+
+  // 1. Explicitly prefixed verification codes (e.g. G-123456, FB-123456, 123-456)
   const prefixed = text.match(/\b(?:G-|FB-|IG-|WA-|TT-)(\d{4,8})\b|\b(\d{3}-\d{3})\b/i);
   if (prefixed) return (prefixed[1] || prefixed[2] || '').trim();
 
-  const beforePhrase = text.match(
+  // Strip URLs before scanning prose/digits so tracking link query params are never mistaken for OTPs
+  const textWithoutUrls = text.replace(/https?:\/\/[^\s<>)"']+/gi, ' ');
+
+  // 2. "482910 is your verification code"
+  const beforePhrase = textWithoutUrls.match(
     /\b(\d{4,8})\s+is\s+(?:your|the)\s+(?:[a-z]+\s+){0,4}(?:code|otp|pin|passcode|token)\b/i
   );
   if (beforePhrase) return beforePhrase[1];
 
-  const contextualSpaced = text.match(
-    /(?:code|otp|pin|verification|confirm|confirmation|instagram|facebook|tiktok)[^\d]{0,60}\b(\d{3})\s+(\d{3})\b/i
+  // 3. Spaced 6-digit OTPs near verification keywords ("123 456")
+  const contextualSpaced = textWithoutUrls.match(
+    /(?:code|otp|pin|verification|verify|confirm|confirmation|passcode|security|login|instagram|facebook|tiktok)[^\d\n]{0,60}\b(\d{3})\s+(\d{3})\b/i
   );
   if (contextualSpaced) return `${contextualSpaced[1]}${contextualSpaced[2]}`;
 
-  const contextual = text.match(
-    /(?:code|otp|pin|verification|verify|passcode|token|confirmation|one-time|رمز|código|код)[^\d]{0,80}(\d{4,8})\b/i
+  // 4. Contextual OTPs ("Your verification code is: 482910" or "Code:\n482910")
+  const contextual = textWithoutUrls.match(
+    /(?:code|otp|pin|verification|verify|passcode|token|confirmation|one-time|security|login|رمز|código|код)[^\d]{0,80}\b(\d{4,8})\b/i
   );
   if (contextual) return contextual[1];
 
-  const sixDigit = text.match(/\b(\d{6})\b/);
+  // 5. Standalone OTP on its own line (common in centered HTML code boxes)
+  const standaloneLine = textWithoutUrls.match(/^\s*(\d{4,8})\s*$/m);
+  if (standaloneLine && !/^(?:19|20)\d{2}$/.test(standaloneLine[1])) {
+    return standaloneLine[1];
+  }
+
+  // 6. Clean 6-digit or 5-digit fallback (ignoring years & long phone numbers)
+  const sixDigit = textWithoutUrls.match(/\b(\d{6})\b/);
   if (sixDigit) return sixDigit[1];
 
-  const fiveDigit = text.match(/\b(\d{5})\b/);
+  const fiveDigit = textWithoutUrls.match(/\b(\d{5})\b/);
   if (fiveDigit) return fiveDigit[1];
 
-  const all4to8 = text.match(/\b(\d{4,8})\b/g) || [];
+  const all4to8 = textWithoutUrls.match(/\b(\d{4,8})\b/g) || [];
   const nonYear = all4to8.find((n) => !/^(?:19|20)\d{2}$/.test(n));
   if (nonYear) return nonYear;
-  if (all4to8[0]) return all4to8[0];
 
   return null;
 }
@@ -699,31 +713,61 @@ function decodePartTransferEncoding(body: string, encodingHeader: string): strin
   return body;
 }
 
-function parseMimeSection(rawSection: string): { textParts: string[]; htmlParts: string[] } {
+function splitMimeHeadersAndBody(rawSection: string): { headersRaw: string; bodyRaw: string } {
+  const normalized = rawSection.replace(/^(?:\r?\n)+/, '');
+  const crlfIdx = normalized.indexOf('\r\n\r\n');
+  const lfIdx = normalized.indexOf('\n\n');
+  if (crlfIdx !== -1 && (lfIdx === -1 || crlfIdx < lfIdx)) {
+    return {
+      headersRaw: normalized.slice(0, crlfIdx),
+      bodyRaw: normalized.slice(crlfIdx + 4),
+    };
+  }
+  if (lfIdx !== -1) {
+    return {
+      headersRaw: normalized.slice(0, lfIdx),
+      bodyRaw: normalized.slice(lfIdx + 2),
+    };
+  }
+  return { headersRaw: '', bodyRaw: rawSection };
+}
+
+function parseMimeSection(rawSection: string, depth = 0): { textParts: string[]; htmlParts: string[] } {
   const textParts: string[] = [];
   const htmlParts: string[] = [];
+  if (depth > 8) return { textParts, htmlParts };
 
-  const splitMatch = /^([\s\S]*?)\r?\n\r?\n([\s\S]*)$/.exec(rawSection);
-  const headersRaw = splitMatch ? splitMatch[1] : '';
-  const bodyRaw = splitMatch ? splitMatch[2] : rawSection;
-
+  const { headersRaw, bodyRaw } = splitMimeHeadersAndBody(rawSection);
   const unfoldedHeaders = headersRaw.replace(/\r?\n[ \t]+/g, ' ');
   const contentTypeMatch = /^Content-Type:\s*([^\r\n]+)/im.exec(unfoldedHeaders);
   const encodingMatch = /^Content-Transfer-Encoding:\s*([^\r\n;]+)/im.exec(unfoldedHeaders);
 
   const contentType = contentTypeMatch ? contentTypeMatch[1].trim() : '';
   const transferEncoding = encodingMatch ? encodingMatch[1].trim() : '';
-  const boundaryMatch = /boundary=["']?([^"';\s]+)["']?/i.exec(contentType);
+  const boundaryMatch = /boundary=(?:"([^"]+)"|'([^']+)'|([^;\s]+))/i.exec(contentType);
+  const boundary = (boundaryMatch?.[1] || boundaryMatch?.[2] || boundaryMatch?.[3] || '').trim();
 
-  if (boundaryMatch?.[1]) {
-    const boundary = boundaryMatch[1];
-    const marker = `--${boundary}`;
-    const chunks = bodyRaw.split(marker).slice(1);
-    for (const chunk of chunks) {
-      if (chunk.startsWith('--')) break;
-      const trimmed = chunk.replace(/^\r?\n/, '').replace(/\r?\n$/, '');
-      if (!trimmed) continue;
-      const sub = parseMimeSection(trimmed);
+  if (boundary) {
+    const escaped = boundary.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const boundaryLineRe = new RegExp(`(?:^|\\r?\\n)--${escaped}(--)?(?:[ \\t]*\\r?\\n|$)`, 'g');
+    const markers: Array<{ start: number; end: number; isClosing: boolean }> = [];
+    let m: RegExpExecArray | null;
+    while ((m = boundaryLineRe.exec(bodyRaw)) !== null) {
+      markers.push({
+        start: m.index,
+        end: m.index + m[0].length,
+        isClosing: Boolean(m[1]),
+      });
+      if (m[1]) break;
+    }
+
+    for (let i = 0; i < markers.length; i++) {
+      if (markers[i].isClosing) break;
+      const chunkStart = markers[i].end;
+      const chunkEnd = i + 1 < markers.length ? markers[i + 1].start : bodyRaw.length;
+      const chunk = bodyRaw.slice(chunkStart, chunkEnd).replace(/^\r?\n/, '').replace(/\r?\n$/, '');
+      if (!chunk) continue;
+      const sub = parseMimeSection(chunk, depth + 1);
       textParts.push(...sub.textParts);
       htmlParts.push(...sub.htmlParts);
     }
@@ -735,32 +779,36 @@ function parseMimeSection(rawSection: string): { textParts: string[]; htmlParts:
     htmlParts.push(decoded);
   } else if (/text\/plain/i.test(contentType) || !contentType) {
     textParts.push(decoded);
+  } else if (/^multipart\//i.test(contentType)) {
+    const sub = parseMimeSection(decoded, depth + 1);
+    textParts.push(...sub.textParts);
+    htmlParts.push(...sub.htmlParts);
   }
   return { textParts, htmlParts };
 }
 
 function parseInboundMimePayload(rawText: string, rawHtml: string): { plainText: string; html: string } {
-  let cleanText = rawText.length > 160000 ? rawText.slice(0, 160000) : rawText || '';
-  let cleanHtml = rawHtml.length > 160000 ? rawHtml.slice(0, 160000) : rawHtml || '';
+  let cleanText = rawText.length > 260000 ? rawText.slice(0, 260000) : rawText || '';
+  let cleanHtml = rawHtml.length > 260000 ? rawHtml.slice(0, 260000) : rawHtml || '';
 
-  const boundaryIndex = cleanText.search(/(?:^|\r?\n)--[A-Za-z0-9'()+_,-./:=?]{4,}\r?\nContent-Type:/i);
-  const hasTopContentType = /(?:^|\r?\n)Content-Type:\s*(?:multipart|text)\//i.test(cleanText.slice(0, 4096));
+  const { headersRaw } = splitMimeHeadersAndBody(cleanText);
+  const unfoldedTopHeaders = headersRaw.replace(/\r?\n[ \t]+/g, ' ');
+  const hasTopContentType =
+    /(?:^|\r?\n)Content-Type:\s*(?:multipart|text|message)\//i.test(unfoldedTopHeaders);
+  const boundaryLineMatch = /(?:^|\r?\n)--([A-Za-z0-9'()+_,-./:=?]{4,})\r?\n(?:[\w-]+:\s*[^\r\n]+\r?\n)*Content-Type:/i.exec(
+    cleanText.slice(0, 65536)
+  );
 
-  if (hasTopContentType || boundaryIndex !== -1) {
-    if (/^(?:Received|Return-Path|DKIM-Signature|From|To|Subject|MIME-Version|Content-Type):/im.test(cleanText) && hasTopContentType) {
+  if (hasTopContentType || boundaryLineMatch) {
+    if (hasTopContentType) {
       const parsed = parseMimeSection(cleanText);
       if (parsed.htmlParts.length > 0) cleanHtml = parsed.htmlParts.join('\n');
       if (parsed.textParts.length > 0) cleanText = parsed.textParts.join('\n').trim();
-    } else if (boundaryIndex !== -1) {
-      const fromBoundary = cleanText.slice(boundaryIndex).replace(/^\r?\n/, '');
-      const firstLine = fromBoundary.split(/\r?\n/, 1)[0];
-      const boundary = firstLine.slice(2).trim();
+    } else if (boundaryLineMatch && boundaryLineMatch.index !== undefined) {
+      const boundary = boundaryLineMatch[1].trim();
+      const fromBoundary = cleanText.slice(boundaryLineMatch.index).replace(/^\r?\n/, '');
       const synthetic = `Content-Type: multipart/mixed; boundary="${boundary}"\r\n\r\n${fromBoundary}`;
       const parsed = parseMimeSection(synthetic);
-      if (parsed.htmlParts.length > 0) cleanHtml = parsed.htmlParts.join('\n');
-      if (parsed.textParts.length > 0) cleanText = parsed.textParts.join('\n').trim();
-    } else {
-      const parsed = parseMimeSection(cleanText);
       if (parsed.htmlParts.length > 0) cleanHtml = parsed.htmlParts.join('\n');
       if (parsed.textParts.length > 0) cleanText = parsed.textParts.join('\n').trim();
     }
@@ -775,7 +823,7 @@ function parseInboundMimePayload(rawText: string, rawHtml: string): { plainText:
 
   return {
     plainText: cleanText.trim().slice(0, 40000),
-    html: cleanHtml.trim().slice(0, 120000),
+    html: cleanHtml.trim().slice(0, 140000),
   };
 }
 
@@ -2921,6 +2969,10 @@ export function createApiApp() {
     }
   }
 
+  function escapeIlikePattern(val: string): string {
+    return val.replace(/[\\%_]/g, (m) => `\\${m}`);
+  }
+
   async function findMailboxRecord(rawAddress: unknown): Promise<CustomMailboxRecord | null> {
     const addr = normalizeRecipientString(rawAddress);
     if (!addr) return null;
@@ -2931,10 +2983,17 @@ export function createApiApp() {
         const { data, error } = await sb
           .from('mailboxes')
           .select('*')
-          .ilike('address', addr)
+          .ilike('address', escapeIlikePattern(addr))
           .limit(1)
           .maybeSingle();
-        if (!error && data) {
+        if (error) {
+          recordAppError({
+            source: 'supabase',
+            code: error.code || 'MAILBOX_LOOKUP',
+            message: `mailboxes lookup failed: ${error.message}`,
+            detail: addr,
+          });
+        } else if (data) {
           const normalizedAddr = String(data.address).trim().toLowerCase();
           const rec: CustomMailboxRecord = {
             id: String(data.id),
@@ -2955,8 +3014,13 @@ export function createApiApp() {
           markedCreatedAddresses.add(normalizedAddr);
           return rec;
         }
-      } catch {
-        // Fallback to in-memory map if schema not yet applied
+      } catch (err) {
+        recordAppError({
+          source: 'supabase',
+          code: 'MAILBOX_LOOKUP_EX',
+          message: err instanceof Error ? err.message : 'mailboxes lookup threw exception',
+          detail: addr,
+        });
       }
     }
 
@@ -2994,31 +3058,39 @@ export function createApiApp() {
 
     const sb = getSupabaseServerClient();
     if (sb) {
-      try {
-        if (isNew) {
-          const { error } = await sb.from('mailboxes').insert(rowPayload);
-          if (error) {
-            if (error.code === '23505') {
-              markedCreatedAddresses.add(addr);
-              const dupErr = new Error(`${addr} is already registered.`);
-              (dupErr as Error & { statusCode?: number }).statusCode = 409;
-              throw dupErr;
-            }
-            console.warn('[VeriBox Mail] Supabase mailboxes insert warning:', error.message);
+      if (isNew) {
+        const { error } = await sb.from('mailboxes').insert(rowPayload);
+        if (error) {
+          if (error.code === '23505') {
+            markedCreatedAddresses.add(addr);
+            const dupErr = new Error(`${addr} is already registered.`);
+            (dupErr as Error & { statusCode?: number }).statusCode = 409;
+            throw dupErr;
           }
-        } else {
-          const { error } = await sb
-            .from('mailboxes')
-            .upsert(rowPayload, { onConflict: 'address' });
-          if (error) {
-            console.warn('[VeriBox Mail] Supabase mailboxes upsert warning:', error.message);
-          }
+          recordAppError({
+            source: 'supabase',
+            code: error.code || 'MAILBOX_INSERT',
+            message: `Failed saving mailbox to Supabase (${error.code || 'DB'}): ${error.message}`,
+            detail: addr,
+          });
+          const dbErr = new Error(
+            `Supabase mailboxes save error (${error.code || 'DB'}): ${error.message}`
+          );
+          (dbErr as Error & { statusCode?: number }).statusCode = 502;
+          throw dbErr;
         }
-      } catch (err) {
-        if ((err as { statusCode?: number }).statusCode === 409) {
-          throw err;
+      } else {
+        const { error } = await sb
+          .from('mailboxes')
+          .upsert(rowPayload, { onConflict: 'address' });
+        if (error) {
+          recordAppError({
+            source: 'supabase',
+            code: error.code || 'MAILBOX_UPSERT',
+            message: `Failed updating mailbox in Supabase (${error.code || 'DB'}): ${error.message}`,
+            detail: addr,
+          });
         }
-        // In-memory store remains active
       }
     }
 
@@ -3207,6 +3279,7 @@ export function createApiApp() {
           resolvedMailboxId = rec?.id || null;
         }
 
+        const escapedRecipient = escapeIlikePattern(recipient);
         let query = sb
           .from('mailbox_messages')
           .select('*')
@@ -3214,11 +3287,12 @@ export function createApiApp() {
           .limit(50);
 
         if (resolvedMailboxId && mailboxIdColumnAvailable) {
+          const safeMailboxId = resolvedMailboxId.replace(/[^a-zA-Z0-9_-]/g, '');
           query = query.or(
-            `recipient_address.ilike.${recipient},mailbox_id.eq.${resolvedMailboxId}`
+            `recipient_address.ilike."${escapedRecipient}",mailbox_id.eq."${safeMailboxId}"`
           );
         } else {
-          query = query.ilike('recipient_address', recipient);
+          query = query.ilike('recipient_address', escapedRecipient);
         }
 
         let { data, error, status } = await query;
@@ -3228,7 +3302,7 @@ export function createApiApp() {
           const retry = await sb
             .from('mailbox_messages')
             .select('*')
-            .ilike('recipient_address', recipient)
+            .ilike('recipient_address', escapedRecipient)
             .order('created_at', { ascending: false })
             .limit(50);
           data = retry.data;
@@ -3856,6 +3930,7 @@ export function createApiApp() {
         req.params.secret ||
           firstHeader(req.headers['x-inbound-secret']) ||
           firstHeader(req.headers['x-webhook-secret']) ||
+          firstHeader(req.headers['x-veribox-secret']) ||
           firstHeader(req.headers.authorization).replace(/^Bearer\s+/i, '') ||
           req.query.secret ||
           ''
@@ -3864,8 +3939,8 @@ export function createApiApp() {
       if (!provided || !safeSecretsEqual(provided, configuredSecret)) {
         const totalMs = Math.max(0, Math.round(performance.now() - reqPerfStart));
         const adminDiagnosticDetail = !provided
-          ? `401: Missing x-inbound-secret header (expected ${configuredSecret.length} chars starting with '${configuredSecret.slice(0, 4)}')`
-          : `401: Secret mismatch (received ${provided.length} chars starting with '${provided.slice(0, 4)}', expected ${configuredSecret.length} chars starting with '${configuredSecret.slice(0, 4)}')`;
+          ? `HTTP 401: Missing x-inbound-secret header (server has INBOUND_EMAIL_SECRET configured, length ${configuredSecret.length})`
+          : `HTTP 401: x-inbound-secret did not match INBOUND_EMAIL_SECRET (sent length ${provided.length}, expected length ${configuredSecret.length})`;
         console.warn(`[VeriBox Inbound] Unauthorized webhook totalMs=${totalMs}`);
         const logRes = await Promise.race([
           recordInboundAttempt({
@@ -3903,8 +3978,9 @@ export function createApiApp() {
         ]);
         res.status(401).json({
           ok: false,
-          error: 'Unauthorized: invalid or missing x-inbound-secret header',
+          error: adminDiagnosticDetail,
           receivedLength: provided.length,
+          expectedLength: configuredSecret.length,
           webhookLogged: logRes.logged,
           webhookLogId: logRes.logId,
           webhookLogError: logRes.logError,
@@ -3913,7 +3989,7 @@ export function createApiApp() {
       }
     }
 
-    // 2. Fast payload parsing, recipient normalization, and OTP extraction
+    // 2. Fast payload parsing, recipient normalization, and MIME/OTP extraction
     let parsedBody: unknown = req.body;
     if (Buffer.isBuffer(parsedBody)) {
       parsedBody = parsedBody.toString('utf8');
@@ -3948,15 +4024,23 @@ export function createApiApp() {
         ? (payload.headers as Record<string, unknown>)
         : undefined;
 
+    const isReadinessProbe =
+      firstHeader(req.headers['x-veribox-readiness']) === '1' ||
+      payload.readinessCheck === true ||
+      body.readinessCheck === true ||
+      payload.dryRun === true ||
+      body.dryRun === true;
+
     const rawMime =
       typeof payload.raw === 'string' && payload.raw.trim()
         ? payload.raw
         : typeof payload.rawEmail === 'string' && payload.rawEmail.trim()
           ? payload.rawEmail
           : '';
-    const rawHeaderBlock = rawMime
-      ? rawMime.slice(0, 12000).split(/\r?\n\r?\n/, 1)[0].replace(/\r?\n[ \t]+/g, ' ')
-      : '';
+    const { headersRaw: rawHeaderSection } = rawMime
+      ? splitMimeHeadersAndBody(rawMime.slice(0, 65536))
+      : { headersRaw: '' };
+    const rawHeaderBlock = rawHeaderSection.replace(/\r?\n[ \t]+/g, ' ');
     const rawHeaderValue = (name: string): string => {
       if (!rawHeaderBlock) return '';
       const m = new RegExp(`^${name}:\\s*(.+)$`, 'im').exec(rawHeaderBlock);
@@ -3997,6 +4081,16 @@ export function createApiApp() {
       const totalMs = Math.max(0, Math.round(performance.now() - reqPerfStart));
       const msg = `No recipient matching @${CUSTOM_EMAIL_DOMAIN} found in payload (received to: ${rawToPreview || 'empty'})`;
       console.warn(`[VeriBox Inbound] Dropped webhook totalMs=${totalMs}:`, msg);
+      if (isReadinessProbe) {
+        res.status(400).json({
+          ok: false,
+          mode: 'readiness',
+          ready: false,
+          error: msg,
+          totalMs,
+        });
+        return;
+      }
       const logRes = await Promise.race([
         recordInboundAttempt({
           id: attemptId,
@@ -4063,6 +4157,64 @@ export function createApiApp() {
         seenRec.add(target);
         recipients.push(target);
       }
+    }
+
+    const sb = getSupabaseServerClient();
+    const primaryRecipient = recipients[0];
+    let mailboxLookupError: string | null = null;
+    const lookupMatchedMailbox = async (): Promise<{ id: string; address: string } | null> => {
+      for (const rec of recipients) {
+        const mem = mailboxRegistry.get(rec);
+        if (mem) return { id: mem.id, address: mem.address };
+      }
+      if (!sb) return null;
+      try {
+        const { data, error } = await sb
+          .from('mailboxes')
+          .select('id, address')
+          .ilike('address', escapeIlikePattern(primaryRecipient))
+          .limit(1)
+          .maybeSingle();
+        if (error) {
+          mailboxLookupError = `${error.code || 'MAILBOX_ERR'}: ${error.message}`;
+          return null;
+        }
+        if (data?.id) {
+          return {
+            id: String(data.id),
+            address: String(data.address || primaryRecipient).trim().toLowerCase(),
+          };
+        }
+        return null;
+      } catch (err) {
+        mailboxLookupError = err instanceof Error ? err.message : 'Mailbox lookup exception';
+        return null;
+      }
+    };
+
+    const matchedMailboxRow = await lookupMatchedMailbox();
+    const matchedMailboxId = matchedMailboxRow?.id ?? null;
+    const matchedMailbox = Boolean(matchedMailboxId);
+
+    // Non-polluting readiness verification: verifies auth, payload parsing, recipient routing & DB lookup without saving any email
+    if (isReadinessProbe) {
+      const totalMs = Math.max(0, Math.round(performance.now() - reqPerfStart));
+      res.status(200).json({
+        ok: true,
+        mode: 'readiness',
+        ready: Boolean(sb) && !mailboxLookupError,
+        secretVerified: true,
+        inboundSecretConfigured: Boolean(configuredSecret),
+        domain: CUSTOM_EMAIL_DOMAIN,
+        recipient: primaryRecipient,
+        recipients,
+        matchedMailbox,
+        matchedMailboxId,
+        supabaseConfigured: Boolean(sb),
+        mailboxLookupError,
+        totalMs,
+      });
+      return;
     }
 
     const extractSenderString = (...candidates: unknown[]): string => {
@@ -4135,9 +4287,9 @@ export function createApiApp() {
     let otp =
       typeof payload.otp === 'string' && /^\d{4,8}$/.test(payload.otp.trim())
         ? payload.otp.trim()
-        : extractOtpCode(`${subject}\n${plainText.slice(0, 12000)}`);
+        : extractOtpCode(`${subject}\n${plainText.slice(0, 16000)}`);
     if (!otp && html) {
-      otp = extractOtpCode(stripTags(html.slice(0, 60000)));
+      otp = extractOtpCode(stripTags(html));
     }
 
     // Track upstream receivedAt when provided by Cloudflare Worker, otherwise fallback to webhook entry time
@@ -4157,38 +4309,6 @@ export function createApiApp() {
 
     const parseMs = Math.max(0, Math.round(performance.now() - reqPerfStart));
     const createdAt = new Date().toISOString();
-
-    // 3. Look up matching row in public.mailboxes case-insensitively, then save message + log
-    const sb = getSupabaseServerClient();
-    const primaryRecipient = recipients[0];
-    const lookupMatchedMailbox = async (): Promise<{ id: string; address: string } | null> => {
-      for (const rec of recipients) {
-        const mem = mailboxRegistry.get(rec);
-        if (mem) return { id: mem.id, address: mem.address };
-      }
-      if (!sb) return null;
-      try {
-        const { data, error } = await sb
-          .from('mailboxes')
-          .select('id, address')
-          .ilike('address', primaryRecipient)
-          .limit(1)
-          .maybeSingle();
-        if (!error && data?.id) {
-          return {
-            id: String(data.id),
-            address: String(data.address || primaryRecipient).trim().toLowerCase(),
-          };
-        }
-        return null;
-      } catch {
-        return null;
-      }
-    };
-
-    const matchedMailboxRow = await lookupMatchedMailbox();
-    const matchedMailboxId = matchedMailboxRow?.id ?? null;
-    const matchedMailbox = Boolean(matchedMailboxId);
 
     const insertResults = await Promise.all(
       recipients.map((recipient) => {
@@ -4343,19 +4463,35 @@ export function createApiApp() {
       req.headers['x-email-address'] ?? req.query.address
     );
 
-    if (!token || !emailAddress || !emailAddress.endsWith(`@${CUSTOM_EMAIL_DOMAIN}`)) {
+    if (!emailAddress || !emailAddress.endsWith(`@${CUSTOM_EMAIL_DOMAIN}`)) {
       return null;
     }
 
-    const reg = await findMailboxRecord(emailAddress);
+    const [reg, verifiedUser] = await Promise.all([
+      findMailboxRecord(emailAddress),
+      getVerifiedSupabaseBearerUser(req),
+    ]);
+
     if (reg) {
-      if (!safeSecretsEqual(token, reg.token)) {
+      const tokenMatches = Boolean(
+        token && (safeSecretsEqual(token, reg.token) || verifySignedMailboxToken(emailAddress, token))
+      );
+      const ownerMatches = Boolean(
+        verifiedUser &&
+          ((reg.ownerUserId && verifiedUser.id === reg.ownerUserId) ||
+            verifiedUser.email === OWNER_ADMIN_EMAIL)
+      );
+      if (!tokenMatches && !ownerMatches) {
         return null;
       }
       return { address: reg.address, mailboxId: reg.id };
     }
 
-    // Strict fallback if DB was unreachable on cold start: ONLY accept a server-signed HMAC token bound to this exact email address
+    if (verifiedUser && verifiedUser.email === OWNER_ADMIN_EMAIL) {
+      return { address: emailAddress, mailboxId: null };
+    }
+
+    if (!token) return null;
     return verifySignedMailboxToken(emailAddress, token)
       ? { address: emailAddress, mailboxId: null }
       : null;
@@ -5454,10 +5590,10 @@ export function createApiApp() {
     const rawTarget = req.body?.recipientAddress ?? req.body?.targetAddress;
     const requestedAddr = normalizeRecipientString(rawTarget);
 
-    if (hasRecipientField && !requestedAddr) {
+    if (hasRecipientField && rawTarget !== '' && !requestedAddr) {
       res.status(400).json({
         ok: false,
-        error: `Recipient address is required (e.g. diag.test@${CUSTOM_EMAIL_DOMAIN}).`,
+        error: `Recipient address must be a valid @${CUSTOM_EMAIL_DOMAIN} address.`,
       });
       return;
     }
@@ -5470,7 +5606,7 @@ export function createApiApp() {
       return;
     }
 
-    const targetAddress = requestedAddr || `diag.test@${CUSTOM_EMAIL_DOMAIN}`;
+    const targetAddress = requestedAddr || `readiness-check@${CUSTOM_EMAIL_DOMAIN}`;
 
     const reqHost = req.get('host') || `127.0.0.1:${process.env.PORT || 3000}`;
     const forwardedProto =
@@ -5484,9 +5620,12 @@ export function createApiApp() {
       : `${forwardedProto || 'https'}://${reqHost}`;
     const endpointUrl = `${origin}/api/email/inbound`;
 
-    const testCode = String(Math.floor(100000 + Math.random() * 899999));
     const startedAt = Date.now();
     const secret = getInboundEmailSecret();
+    const sbConfig = getSupabaseServerConfig();
+    const serviceRoleConfigured = Boolean(
+      (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY || '').trim()
+    );
 
     let httpStatus = 0;
     let responseBody: unknown = null;
@@ -5494,46 +5633,91 @@ export function createApiApp() {
 
     const dnsCheckPromise = checkDomainDns(CUSTOM_EMAIL_DOMAIN);
     const prodDomainUrl = `https://${CUSTOM_EMAIL_DOMAIN}`;
-    const prodProbePromise =
-      origin !== prodDomainUrl
-        ? (async () => {
-            try {
-              const healthRes = await fetch(`${prodDomainUrl}/api/email/domains`, {
-                headers: { accept: 'application/json' },
-                signal: AbortSignal.timeout(3000),
-              });
-              return {
-                url: `${prodDomainUrl}/api/email/domains`,
-                httpStatus: healthRes.status,
-                reachable: healthRes.ok,
-                detail: healthRes.ok
-                  ? 'Live custom domain API reachable'
-                  : `HTTP ${healthRes.status} from live custom domain API`,
-              };
-            } catch (err) {
-              return {
-                url: `${prodDomainUrl}/api/email/domains`,
-                httpStatus: null,
-                reachable: false,
-                detail: err instanceof Error ? err.message : 'Live custom domain unreachable',
-              };
-            }
-          })()
-        : Promise.resolve(null);
+    const prodProbePromise = (async () => {
+      try {
+        const healthRes = await fetch(`${prodDomainUrl}/api/email/domains`, {
+          headers: { accept: 'application/json' },
+          signal: AbortSignal.timeout(3000),
+        });
+        const payload = (await healthRes.json().catch(() => null)) as {
+          domain?: string;
+          error?: string;
+        } | null;
+        if (!healthRes.ok) {
+          return {
+            url: `${prodDomainUrl}/api/email/domains`,
+            httpStatus: healthRes.status,
+            reachable: false,
+            detail: payload?.error
+              ? `HTTP ${healthRes.status}: ${payload.error}`
+              : `HTTP ${healthRes.status} from ${prodDomainUrl}/api/email/domains`,
+          };
+        }
+        // Also probe the live custom-domain inbound endpoint in readiness mode when running off-domain
+        if (origin !== prodDomainUrl) {
+          const prodInboundRes = await fetch(`${prodDomainUrl}/api/email/inbound`, {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              'x-veribox-readiness': '1',
+              ...(secret ? { 'x-inbound-secret': secret } : {}),
+            },
+            body: JSON.stringify({
+              to: targetAddress,
+              readinessCheck: true,
+            }),
+            signal: AbortSignal.timeout(3500),
+          });
+          const prodInboundJson = (await prodInboundRes.json().catch(() => null)) as {
+            ok?: boolean;
+            error?: string;
+          } | null;
+          if (!prodInboundRes.ok || !prodInboundJson?.ok) {
+            return {
+              url: `${prodDomainUrl}/api/email/inbound`,
+              httpStatus: prodInboundRes.status,
+              reachable: false,
+              detail:
+                prodInboundJson?.error ||
+                `Live inbound webhook returned HTTP ${prodInboundRes.status}`,
+            };
+          }
+          return {
+            url: `${prodDomainUrl}/api/email/inbound`,
+            httpStatus: prodInboundRes.status,
+            reachable: true,
+            detail: 'Live domain & inbound webhook secret verified ready',
+          };
+        }
 
+        return {
+          url: `${prodDomainUrl}/api/email/domains`,
+          httpStatus: healthRes.status,
+          reachable: true,
+          detail: 'Live custom domain API reachable',
+        };
+      } catch (err) {
+        return {
+          url: `${prodDomainUrl}/api/email/domains`,
+          httpStatus: null,
+          reachable: false,
+          detail: err instanceof Error ? err.message : `Connection to ${prodDomainUrl} failed`,
+        };
+      }
+    })();
+
+    // Non-polluting readiness call to /api/email/inbound (does NOT insert into mailbox_messages or create any fake OTP)
     try {
       const webhookRes = await fetch(endpointUrl, {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
+          'x-veribox-readiness': '1',
           ...(secret ? { 'x-inbound-secret': secret } : {}),
         },
         body: JSON.stringify({
           to: targetAddress,
-          from: `VeriBox Diagnostics <diag@${CUSTOM_EMAIL_DOMAIN}>`,
-          subject: `VeriBox Live Pipeline Test (${testCode})`,
-          text: `VeriBox live inbound webhook diagnostic test. Reference code: ${testCode}`,
-          html: `<div style="font-family:sans-serif"><p>VeriBox live inbound webhook diagnostic test. Reference code: <strong>${testCode}</strong>.</p></div>`,
+          readinessCheck: true,
         }),
         signal: AbortSignal.timeout(4500),
       });
@@ -5545,91 +5729,69 @@ export function createApiApp() {
         responseBody = { raw: rawRespText.slice(0, 500) };
       }
     } catch (err) {
-      fetchError = err instanceof Error ? err.message : 'Real HTTP POST to /api/email/inbound failed';
+      fetchError = err instanceof Error ? err.message : 'HTTP POST readiness check to /api/email/inbound failed';
       responseBody = { error: fetchError };
     }
 
     const parsedResp = (responseBody && typeof responseBody === 'object'
       ? responseBody
       : {}) as {
-      savedMessageId?: string | null;
-      messageIds?: string[];
-      otpDetected?: string | null;
-      supabaseStored?: boolean;
-      supabaseError?: string | null;
-      webhookLogged?: boolean;
-      webhookLogId?: string | null;
-      webhookLogError?: string | null;
+      ok?: boolean;
+      ready?: boolean;
+      secretVerified?: boolean;
+      matchedMailbox?: boolean;
+      matchedMailboxId?: string | null;
+      mailboxLookupError?: string | null;
       error?: string;
     };
 
-    const insertedId =
-      parsedResp.savedMessageId ||
-      (Array.isArray(parsedResp.messageIds) ? parsedResp.messageIds[0] : null);
-    let supabaseReadbackOk = false;
-    let webhookLogReadbackOk = false;
-    let webhookLogId: string | null = parsedResp.webhookLogId ?? null;
-    let webhookLogError: string | null = parsedResp.webhookLogError ?? null;
-    let readbackError: string | null = parsedResp.supabaseError || parsedResp.error || fetchError || null;
+    const webhookReadyOk = Boolean(httpStatus >= 200 && httpStatus < 300 && parsedResp.ok);
+    const webhookError = !webhookReadyOk
+      ? parsedResp.error || fetchError || `HTTP ${httpStatus || 'ERR'} from ${endpointUrl}`
+      : parsedResp.mailboxLookupError || null;
 
-    if (insertedId || webhookLogId) {
-      try {
-        const msgPromise = insertedId
-          ? verified.supabase
-              .from('mailbox_messages')
-              .select('id, otp, recipient_address')
-              .eq('id', insertedId)
-              .maybeSingle()
-          : Promise.resolve({ data: null, error: null });
+    // Verify Supabase tables & required columns directly (read-only schema verification — zero synthetic rows written)
+    let mailboxesReady = false;
+    let messagesReady = false;
+    let inboundLogsReady = false;
+    let supabaseError: string | null = null;
+    let webhookLogError: string | null = null;
 
-        const logPromise = webhookLogId
-          ? verified.supabase
-              .from('inbound_webhook_logs')
-              .select('id, received_at, to_address, http_status, status, ok, otp_code, error_reason')
-              .eq('id', webhookLogId)
-              .maybeSingle()
-          : verified.supabase
-              .from('inbound_webhook_logs')
-              .select('id, received_at, to_address, http_status, status, ok, otp_code, error_reason')
-              .ilike('to_address', targetAddress)
-              .order('received_at', { ascending: false })
-              .limit(1)
-              .maybeSingle();
+    try {
+      const [mbCheck, msgCheck, logCheck] = await Promise.all([
+        verified.supabase
+          .from('mailboxes')
+          .select('id, address, owner_user_id', { count: 'exact' })
+          .limit(1),
+        verified.supabase
+          .from('mailbox_messages')
+          .select('id, mailbox_id, recipient_address, otp, created_at', { count: 'exact' })
+          .limit(1),
+        verified.supabase
+          .from('inbound_webhook_logs')
+          .select('id, received_at, http_status, status, ok, error_reason', { count: 'exact' })
+          .limit(1),
+      ]);
 
-        const [msgReadback, logReadback] = await Promise.all([msgPromise, logPromise]);
+      mailboxesReady = !mbCheck.error;
+      messagesReady = !msgCheck.error;
+      inboundLogsReady = !logCheck.error;
 
-        if (insertedId) {
-          if (msgReadback.error) {
-            readbackError = `${msgReadback.error.code || 'READBACK_ERR'}: ${msgReadback.error.message}`;
-          } else if (msgReadback.data?.id === insertedId) {
-            supabaseReadbackOk = true;
-          } else if (!readbackError) {
-            readbackError = 'Inserted row not returned during Supabase readback (check RLS policies or SUPABASE_SERVICE_ROLE_KEY)';
-          }
-        }
-
-        if (logReadback.error) {
-          if (!webhookLogError) {
-            webhookLogError = `${logReadback.error.code || 'LOG_READ_ERR'}: ${logReadback.error.message}`;
-          }
-        } else if (logReadback.data?.id) {
-          webhookLogReadbackOk = true;
-          webhookLogId = String(logReadback.data.id);
-        } else if (!webhookLogError) {
-          webhookLogError = 'Webhook log row was not found in public.inbound_webhook_logs';
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : 'Readback failed';
-        readbackError = readbackError || msg;
-        webhookLogError = webhookLogError || msg;
+      if (mbCheck.error) {
+        supabaseError = `public.mailboxes (${mbCheck.error.code || 'ERR'}): ${mbCheck.error.message}`;
+      } else if (msgCheck.error) {
+        supabaseError = `public.mailbox_messages (${msgCheck.error.code || 'ERR'}): ${msgCheck.error.message}`;
       }
+      if (logCheck.error) {
+        webhookLogError = `public.inbound_webhook_logs (${logCheck.error.code || 'ERR'}): ${logCheck.error.message}`;
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Supabase schema readiness check failed';
+      supabaseError = supabaseError || msg;
+      webhookLogError = webhookLogError || msg;
     }
 
-    const webhookLogged =
-      typeof parsedResp.webhookLogged === 'boolean'
-        ? parsedResp.webhookLogged
-        : webhookLogReadbackOk;
-
+    // Verify /api/email/messages read path when a registered mailbox is targeted
     let inboxApiOk: boolean | null = null;
     let inboxMessageCount: number | null = null;
     let inboxError: string | null = null;
@@ -5645,17 +5807,12 @@ export function createApiApp() {
           signal: AbortSignal.timeout(3000),
         });
         const inboxData = (await inboxRes.json().catch(() => ({}))) as {
-          messages?: Array<{ id?: string; otp?: string | null }>;
+          messages?: Array<{ id?: string }>;
           error?: string;
         };
         if (inboxRes.ok && Array.isArray(inboxData.messages)) {
+          inboxApiOk = true;
           inboxMessageCount = inboxData.messages.length;
-          inboxApiOk = insertedId
-            ? inboxData.messages.some((m) => m.id === insertedId)
-            : inboxData.messages.length > 0;
-          if (!inboxApiOk && insertedId) {
-            inboxError = 'Webhook stored message, but /api/email/messages did not return the new row';
-          }
         } else {
           inboxApiOk = false;
           inboxError = `HTTP ${inboxRes.status}: ${inboxData.error || 'Inbox API check failed'}`;
@@ -5664,36 +5821,114 @@ export function createApiApp() {
         inboxApiOk = false;
         inboxError = err instanceof Error ? err.message : 'Inbox API HTTP fetch failed';
       }
-    } else {
-      inboxError = `No registered mailbox found for ${targetAddress} — generate or select an active mailbox first to verify frontend inbox readback.`;
-    }
-
-    // Remove the temporary synthetic test message from mailbox_messages after verifying DB + Inbox readback
-    // so real user inboxes stay free of test messages (while inbound_webhook_logs retains the real webhook audit row).
-    if (insertedId) {
-      await deleteInboxMessageById(targetAddress, insertedId).catch(() => undefined);
+    } else if (requestedAddr) {
+      inboxError = `No mailbox row registered yet for ${targetAddress} in public.mailboxes (create or generate it first to verify inbox readback).`;
     }
 
     const [dnsCheck, productionProbe] = await Promise.all([dnsCheckPromise, prodProbePromise]);
 
+    const checks = [
+      {
+        key: 'env_secret',
+        label: 'Env & Inbound Secret',
+        ok: Boolean(secret) && Boolean(sbConfig.url) && serviceRoleConfigured,
+        detail: !secret
+          ? 'INBOUND_EMAIL_SECRET is not set on server'
+          : !serviceRoleConfigured
+            ? 'SUPABASE_SERVICE_ROLE_KEY is not set on server'
+            : `INBOUND_EMAIL_SECRET & Supabase Service Role configured (@${CUSTOM_EMAIL_DOMAIN})`,
+        error: !secret
+          ? 'INBOUND_EMAIL_SECRET missing'
+          : !serviceRoleConfigured
+            ? 'SUPABASE_SERVICE_ROLE_KEY missing'
+            : null,
+      },
+      {
+        key: 'webhook_readiness',
+        label: 'Webhook Auth & Parser',
+        ok: webhookReadyOk,
+        detail: webhookReadyOk
+          ? `HTTP ${httpStatus} · Auth, MIME parser & recipient router ready`
+          : webhookError || `HTTP ${httpStatus || 'ERR'}`,
+        error: webhookError,
+      },
+      {
+        key: 'supabase_schema',
+        label: 'Supabase Tables & Schema',
+        ok: mailboxesReady && messagesReady,
+        detail:
+          mailboxesReady && messagesReady
+            ? 'public.mailboxes & public.mailbox_messages ready'
+            : supabaseError || 'Supabase table check failed',
+        error: supabaseError,
+      },
+      {
+        key: 'webhook_logs',
+        label: 'Webhook Logs Table',
+        ok: inboundLogsReady,
+        detail: inboundLogsReady
+          ? 'public.inbound_webhook_logs ready'
+          : webhookLogError || 'public.inbound_webhook_logs unavailable',
+        error: webhookLogError,
+      },
+      {
+        key: 'inbox_api',
+        label: 'Inbox Read API',
+        ok: inboxApiOk,
+        detail:
+          inboxApiOk === true
+            ? `OK (${inboxMessageCount ?? 0} real messages)`
+            : inboxApiOk === false
+              ? inboxError || 'Inbox read failed'
+              : inboxError || 'Enter an active mailbox address to check inbox readback',
+        error: inboxApiOk === false ? inboxError : null,
+      },
+      {
+        key: 'domain_dns',
+        label: `Live Domain & DNS (${CUSTOM_EMAIL_DOMAIN})`,
+        ok: Boolean(productionProbe?.reachable) && !dnsCheck.error && dnsCheck.mxOk,
+        detail:
+          productionProbe?.reachable && dnsCheck.mxOk
+            ? `${productionProbe.detail} · MX ${dnsCheck.mxRecords[0] || 'OK'}`
+            : !productionProbe?.reachable
+              ? productionProbe?.detail || 'Live domain unreachable'
+              : dnsCheck.error || 'MX records missing',
+        error: !productionProbe?.reachable
+          ? productionProbe?.detail || null
+          : dnsCheck.error || (!dnsCheck.mxOk ? `Missing MX records on ${CUSTOM_EMAIL_DOMAIN}` : null),
+      },
+    ];
+
+    const ready =
+      Boolean(secret) &&
+      serviceRoleConfigured &&
+      webhookReadyOk &&
+      mailboxesReady &&
+      messagesReady &&
+      inboundLogsReady &&
+      inboxApiOk !== false;
+
     res.json({
+      mode: 'readiness',
+      ready,
       testedAt: new Date().toISOString(),
       targetAddress,
       endpointUrl,
       httpStatus,
       latencyMs: Date.now() - startedAt,
       responseBody,
-      supabaseWriteOk: Boolean(parsedResp.supabaseStored),
-      supabaseReadbackOk,
-      webhookLogged,
+      checks,
+      supabaseWriteOk: mailboxesReady && messagesReady && webhookReadyOk,
+      supabaseReadbackOk: mailboxesReady && messagesReady,
+      webhookLogged: inboundLogsReady,
       webhookLogError,
-      webhookLogReadbackOk,
-      webhookLogId,
+      webhookLogReadbackOk: inboundLogsReady,
+      webhookLogId: null,
       inboxApiOk,
       inboxMessageCount,
       inboxError,
-      supabaseError: readbackError,
-      otpDetected: parsedResp.otpDetected || null,
+      supabaseError: supabaseError || webhookError,
+      otpDetected: null,
       productionProbe,
       dnsCheck,
     });

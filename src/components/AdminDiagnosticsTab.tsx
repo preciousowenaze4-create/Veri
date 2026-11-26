@@ -610,16 +610,16 @@ export function AdminDiagnosticsTab({
         ) : null}
       </section>
 
-      {/* Test Inbound Pipeline */}
+      {/* System Readiness Check */}
       <section className="rounded-2xl border border-[#D4AF37]/30 bg-white p-4 sm:p-5 space-y-3 dark:bg-[#14120D]">
         <div className="flex items-center gap-2">
           <Server className="h-4 w-4 text-[#D4AF37]" />
           <h2 className="font-display text-sm sm:text-base font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
-            Test Inbound Pipeline (Live HTTP + DB + Inbox API)
+            System Readiness Check (Live Endpoint, Schema &amp; DNS)
           </h2>
         </div>
         <p className="text-xs text-[#6E6552] dark:text-[#A89F8C]">
-          Sends a real HTTP POST request to <code className="font-mono">/api/email/inbound</code> with a live VeriBox diagnostic payload, verifies DNS routing, confirms Supabase write + readback in <code className="font-mono">mailbox_messages</code> and <code className="font-mono">inbound_webhook_logs</code>, and tests <code className="font-mono">/api/email/messages</code> retrieval.
+          Verifies <code className="font-mono">/api/email/inbound</code> secret authentication, live custom domain reachability, Supabase tables (<code className="font-mono">mailboxes</code>, <code className="font-mono">mailbox_messages</code>, <code className="font-mono">inbound_webhook_logs</code>), optional mailbox inbox reads, and DNS records without inserting any test email or fake OTP into any inbox.
         </p>
 
         <div className="flex flex-col sm:flex-row gap-2">
@@ -627,7 +627,7 @@ export function AdminDiagnosticsTab({
             type="text"
             value={testAddress}
             onChange={(e) => setTestAddress(e.target.value)}
-            placeholder={`diag.test@${emailDomain}`}
+            placeholder={`Optional mailbox address to read-check (e.g. user@${emailDomain})`}
             className="min-h-[42px] flex-1 rounded-xl border border-[#D4AF37]/30 bg-[#FAF7F0] px-3 py-2 font-mono text-xs text-[#1A160D] focus:border-[#D4AF37] focus:outline-none dark:bg-[#0B0A07] dark:text-[#FAF6EC]"
           />
           <button
@@ -641,7 +641,7 @@ export function AdminDiagnosticsTab({
             ) : (
               <Play className="h-4 w-4" />
             )}
-            <span>{testingInbound ? 'Testing Live...' : 'Run Live Pipeline Test'}</span>
+            <span>{testingInbound ? 'Checking Readiness...' : 'Run Readiness Check'}</span>
           </button>
         </div>
 
@@ -657,41 +657,27 @@ export function AdminDiagnosticsTab({
               <div className="flex flex-wrap items-center gap-2">
                 <span
                   className={`rounded-md px-2 py-0.5 font-mono font-bold ${
-                    testResult.httpStatus >= 200 && testResult.httpStatus < 300
-                      ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
-                      : 'bg-rose-500/15 text-rose-700 dark:text-rose-300'
+                    testResult.ready === false || testResult.httpStatus < 200 || testResult.httpStatus >= 300
+                      ? 'bg-rose-500/15 text-rose-700 dark:text-rose-300'
+                      : 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
                   }`}
                 >
-                  HTTP {testResult.httpStatus || 'ERR'}
+                  {testResult.ready === false ? 'NOT READY' : 'SYSTEM READY'} · HTTP {testResult.httpStatus || 'ERR'}
                 </span>
                 <span className="font-mono text-[#6E6552] dark:text-[#A89F8C]">
                   {testResult.latencyMs}ms
                 </span>
-                {testResult.otpDetected && (
-                  <span className="rounded-md bg-[#D4AF37]/20 px-2 py-0.5 font-mono font-bold text-[#8A6208] dark:text-[#F5D77A]">
-                    OTP: {testResult.otpDetected}
-                  </span>
-                )}
               </div>
 
               <div className="flex flex-wrap items-center gap-2 font-mono text-[11px]">
                 <span
                   className={
-                    testResult.supabaseWriteOk
+                    testResult.supabaseWriteOk && testResult.supabaseReadbackOk
                       ? 'text-emerald-600 dark:text-emerald-400'
                       : 'text-rose-600 dark:text-rose-400'
                   }
                 >
-                  DB Write: {testResult.supabaseWriteOk ? 'OK' : 'FAILED'}
-                </span>
-                <span
-                  className={
-                    testResult.supabaseReadbackOk
-                      ? 'text-emerald-600 dark:text-emerald-400'
-                      : 'text-rose-600 dark:text-rose-400'
-                  }
-                >
-                  DB Read: {testResult.supabaseReadbackOk ? 'OK' : 'FAILED'}
+                  Schema: {testResult.supabaseWriteOk && testResult.supabaseReadbackOk ? 'OK' : 'FAILED'}
                 </span>
                 {(() => {
                   const isWebhookLogged =
@@ -707,7 +693,7 @@ export function AdminDiagnosticsTab({
                           : 'text-rose-600 dark:text-rose-400'
                       }
                     >
-                      Webhook Log: {isWebhookLogged ? 'OK' : 'FAILED'}
+                      Log Table: {isWebhookLogged ? 'OK' : 'FAILED'}
                     </span>
                   );
                 })()}
@@ -720,7 +706,7 @@ export function AdminDiagnosticsTab({
                         : 'text-amber-600 dark:text-amber-400'
                   }
                 >
-                  Inbox API:{' '}
+                  Inbox Read:{' '}
                   {testResult.inboxApiOk === true
                     ? `OK (${testResult.inboxMessageCount ?? 0} msgs)`
                     : testResult.inboxApiOk === false
@@ -730,9 +716,31 @@ export function AdminDiagnosticsTab({
               </div>
             </div>
 
+            {Array.isArray(testResult.checks) && testResult.checks.length > 0 && (
+              <div className="space-y-1.5">
+                {testResult.checks.map((check) => (
+                  <div
+                    key={check.key}
+                    className={`rounded-lg border p-2 font-mono text-[11px] break-words ${
+                      check.ok === true
+                        ? 'border-emerald-500/25 bg-emerald-500/5 text-emerald-700 dark:text-emerald-300'
+                        : check.ok === false
+                          ? 'border-rose-500/35 bg-rose-500/10 text-rose-700 dark:text-rose-200'
+                          : 'border-amber-500/25 bg-amber-500/5 text-amber-800 dark:text-amber-200'
+                    }`}
+                  >
+                    <p className="font-bold">
+                      [{check.ok === true ? 'OK' : check.ok === false ? 'FAILED' : 'SKIPPED'}] {check.label}
+                    </p>
+                    <p className="mt-0.5 opacity-95">{check.error || check.detail}</p>
+                  </div>
+                ))}
+              </div>
+            )}
+
             {testResult.endpointUrl && (
               <p className="font-mono text-[11px] text-[#6E6552] dark:text-[#A89F8C] break-all">
-                Tested HTTP Endpoint: {testResult.endpointUrl}
+                Checked HTTP Endpoint: {testResult.endpointUrl}
               </p>
             )}
 

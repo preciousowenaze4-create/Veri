@@ -1567,7 +1567,7 @@ export function ProfileTab({
               )}
             </div>
 
-            {/* Collapsible Inbound Test (hidden by default to keep Admin compact) */}
+            {/* Collapsible System Readiness Check (non-polluting: does not insert emails or fake codes) */}
             {onTestInbound && (
               <div>
                 <button
@@ -1575,7 +1575,7 @@ export function ProfileTab({
                   onClick={() => setShowInboundTools((prev) => !prev)}
                   className="flex w-full items-center justify-between rounded-xl border border-[#D4AF37]/20 px-3 py-2 text-xs font-bold text-[#6E6552] hover:bg-[#D4AF37]/5 cursor-pointer dark:text-[#D5CCB8]"
                 >
-                  <span>Live Inbound Email Test &amp; DNS</span>
+                  <span>System Readiness Check &amp; DNS</span>
                   {showInboundTools ? (
                     <ChevronUp className="h-3.5 w-3.5" />
                   ) : (
@@ -1585,12 +1585,15 @@ export function ProfileTab({
 
                 {showInboundTools && (
                   <div className="mt-2.5 space-y-2.5 rounded-xl border border-[#D4AF37]/20 bg-[#FAF7F0] p-3 dark:bg-[#0B0A07]">
+                    <p className="text-[11px] text-[#6E6552] dark:text-[#A89F8C]">
+                      Verifies webhook secret auth, Supabase schema, custom domain routing, and DNS without creating fake codes or inserting emails.
+                    </p>
                     <div className="flex flex-col sm:flex-row gap-2">
                       <input
                         type="text"
                         value={testAddress}
                         onChange={(e) => setTestAddress(e.target.value)}
-                        placeholder={`diag.test@${emailDomain}`}
+                        placeholder={`Optional mailbox check (e.g. user@${emailDomain})`}
                         className="min-h-[36px] flex-1 rounded-lg border border-[#D4AF37]/25 bg-white px-2.5 font-mono text-xs text-[#1A160D] focus:border-[#D4AF37] focus:outline-none dark:bg-[#14120D] dark:text-[#FAF6EC]"
                       />
                       <button
@@ -1604,25 +1607,48 @@ export function ProfileTab({
                         ) : (
                           <Play className="h-3.5 w-3.5" />
                         )}
-                        <span>{testingInbound ? 'Testing...' : 'Test Inbound'}</span>
+                        <span>{testingInbound ? 'Checking...' : 'Check Readiness'}</span>
                       </button>
                     </div>
                     {adminTestError && (
-                      <p className="font-mono text-[11px] text-rose-600 dark:text-rose-300">
+                      <p className="font-mono text-[11px] text-rose-600 dark:text-rose-300 break-words">
                         {adminTestError}
                       </p>
                     )}
                     {adminTestResult && (
-                      <div className="flex flex-wrap items-center gap-2 font-mono text-[11px]">
-                        <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-emerald-700 dark:text-emerald-300">
-                          HTTP {adminTestResult.httpStatus} · {adminTestResult.latencyMs}ms
-                        </span>
-                        <span>
-                          DB Write: {adminTestResult.supabaseWriteOk ? 'OK' : 'FAILED'}
-                        </span>
-                        <span>
-                          Webhook Log: {adminTestResult.webhookLogged ? 'OK' : 'FAILED'}
-                        </span>
+                      <div className="space-y-1.5">
+                        <div className="flex flex-wrap items-center gap-2 font-mono text-[11px]">
+                          <span
+                            className={`rounded px-1.5 py-0.5 font-bold ${
+                              adminTestResult.ready === false || adminTestResult.httpStatus >= 400
+                                ? 'bg-rose-500/15 text-rose-700 dark:text-rose-300'
+                                : 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+                            }`}
+                          >
+                            {adminTestResult.ready === false ? 'NOT READY' : 'READY'} · HTTP {adminTestResult.httpStatus || 'ERR'} · {adminTestResult.latencyMs}ms
+                          </span>
+                        </div>
+                        {Array.isArray(adminTestResult.checks) && adminTestResult.checks.length > 0 && (
+                          <div className="space-y-1">
+                            {adminTestResult.checks.map((item) => (
+                              <div
+                                key={item.key}
+                                className={`rounded-lg border px-2 py-1 font-mono text-[10px] break-words ${
+                                  item.ok === true
+                                    ? 'border-emerald-500/25 bg-emerald-500/5 text-emerald-700 dark:text-emerald-300'
+                                    : item.ok === false
+                                      ? 'border-rose-500/35 bg-rose-500/10 text-rose-700 dark:text-rose-200'
+                                      : 'border-amber-500/25 bg-amber-500/5 text-amber-700 dark:text-amber-300'
+                                }`}
+                              >
+                                <span className="font-bold">
+                                  [{item.ok === true ? 'OK' : item.ok === false ? 'ERR' : 'SKIP'}] {item.label}:
+                                </span>{' '}
+                                {item.error || item.detail}
+                              </div>
+                            ))}
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>

@@ -371,8 +371,18 @@ export interface AdminManagedUser {
   moderationReason: string | null;
 }
 
+export interface AdminReadinessCheckItem {
+  key: string;
+  label: string;
+  ok: boolean | null;
+  detail: string;
+  error?: string | null;
+}
+
 export interface AdminInboundTestResult {
   testedAt: string;
+  mode?: 'readiness';
+  ready?: boolean;
   targetAddress: string;
   endpointUrl: string;
   httpStatus: number;
@@ -389,6 +399,7 @@ export interface AdminInboundTestResult {
   inboxError: string | null;
   supabaseError: string | null;
   otpDetected: string | null;
+  checks?: AdminReadinessCheckItem[];
   productionProbe?: {
     url: string;
     httpStatus: number | null;

@@ -2165,6 +2165,54 @@ export function createApiApp() {
   const inboundAttemptLogs: InboundAttemptLog[] = [];
   let mailboxIdColumnAvailable = true;
 
+  interface AppErrorLogItem {
+    id: string;
+    timestamp: string;
+    source: 'supabase' | 'webhook' | 'wallet' | 'routing' | 'app';
+    severity: 'error' | 'warning';
+    code: string | null;
+    message: string;
+    detail: string | null;
+  }
+
+  const appErrorLogs: AppErrorLogItem[] = [];
+
+  function recordAppError(params: {
+    source: AppErrorLogItem['source'];
+    severity?: AppErrorLogItem['severity'];
+    code?: string | null;
+    message: string;
+    detail?: string | null;
+  }) {
+    const entry: AppErrorLogItem = {
+      id: `err_${Date.now().toString(36)}_${crypto.randomBytes(3).toString('hex')}`,
+      timestamp: new Date().toISOString(),
+      source: params.source,
+      severity: params.severity || 'error',
+      code: params.code ?? null,
+      message: (params.message || 'Unknown error').slice(0, 400),
+      detail: params.detail ? params.detail.slice(0, 500) : null,
+    };
+    appErrorLogs.unshift(entry);
+    if (appErrorLogs.length > 60) {
+      appErrorLogs.length = 60;
+    }
+
+    const sb = getSupabaseServerClient();
+    if (sb) {
+      void sb
+        .from('app_error_logs')
+        .insert({
+          source: entry.source,
+          severity: entry.severity,
+          code: entry.code,
+          message: entry.message,
+          detail: entry.detail,
+        })
+        .then(() => undefined, () => undefined);
+    }
+  }
+
   const UUID_V4_OR_ANY_REGEX =
     /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -2178,6 +2226,16 @@ export function createApiApp() {
     inboundAttemptLogs.unshift(entry);
     if (inboundAttemptLogs.length > 50) {
       inboundAttemptLogs.length = 50;
+    }
+
+    if (entry.httpStatus >= 400 || entry.status === 'db_error' || entry.error) {
+      recordAppError({
+        source: entry.status === 'db_error' ? 'supabase' : 'webhook',
+        severity: entry.httpStatus >= 400 ? 'error' : 'warning',
+        code: `HTTP ${entry.httpStatus}`,
+        message: entry.error || `Inbound webhook ${entry.status}`,
+        detail: `To: ${entry.recipients[0] || entry.rawToPreview || '(none)'} · From: ${entry.fromAddress || '(unknown)'}`,
+      });
     }
 
     const sb = getSupabaseServerClient();
@@ -2229,6 +2287,11 @@ export function createApiApp() {
 
       if (logError) {
         console.warn('[VeriBox Inbound] inbound_webhook_logs insert error:', logError.message);
+        recordAppError({
+          source: 'supabase',
+          code: logError.code || 'LOG_INSERT',
+          message: `inbound_webhook_logs insert failed: ${logError.message}`,
+        });
         return {
           logged: false,
           logId: null,
@@ -2245,6 +2308,11 @@ export function createApiApp() {
       const msg =
         err instanceof Error ? err.message : 'Exception inserting into public.inbound_webhook_logs';
       console.warn('[VeriBox Inbound] inbound_webhook_logs insert exception:', msg);
+      recordAppError({
+        source: 'supabase',
+        code: 'EXCEPTION',
+        message: msg,
+      });
       return {
         logged: false,
         logId: null,
@@ -4640,15 +4708,29 @@ export function createApiApp() {
     const forceProbe = req.query.force === '1' || req.query.force === 'true';
 
     const inboundSecretConfigured = Boolean(getInboundEmailSecret());
-    const supabaseConfigured = Boolean(getSupabaseServerConfig().url);
+    const sbConfig = getSupabaseServerConfig();
+    const supabaseConfigured = Boolean(sbConfig.url);
+    let supabaseProjectHost: string | null = null;
+    if (sbConfig.url) {
+      try {
+        supabaseProjectHost = new URL(sbConfig.url).host;
+      } catch {
+        supabaseProjectHost = sbConfig.url.replace(/^https?:\/\//i, '').split('/')[0] || null;
+      }
+    }
     const serviceRoleConfigured = Boolean(
       (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY || '').trim()
     );
 
     const probeTable = async (
-      table: 'mailboxes' | 'mailbox_messages' | 'inbound_webhook_logs',
+      table:
+        | 'mailboxes'
+        | 'mailbox_messages'
+        | 'inbound_webhook_logs'
+        | 'wallets'
+        | 'wallet_transactions',
       columns: string,
-      orderColumn: 'created_at' | 'received_at' = 'created_at'
+      orderColumn: 'created_at' | 'received_at' | 'updated_at' = 'created_at'
     ) => {
       try {
         let query = sb
@@ -4770,6 +4852,30 @@ export function createApiApp() {
       return parsed;
     };
 
+    const fetchPersistedAppErrors = async (): Promise<AppErrorLogItem[]> => {
+      try {
+        const { data, error } = await sb
+          .from('app_error_logs')
+          .select('id, created_at, source, severity, code, message, detail')
+          .order('created_at', { ascending: false })
+          .limit(25);
+        if (error || !Array.isArray(data)) return [];
+        return data.map((row) => ({
+          id: String(row.id),
+          timestamp: String(row.created_at || new Date().toISOString()),
+          source: (['supabase', 'webhook', 'wallet', 'routing', 'app'].includes(String(row.source))
+            ? String(row.source)
+            : 'app') as AppErrorLogItem['source'],
+          severity: row.severity === 'warning' ? 'warning' : 'error',
+          code: row.code ? String(row.code) : null,
+          message: String(row.message || 'Unknown error'),
+          detail: row.detail ? String(row.detail) : null,
+        }));
+      } catch {
+        return [];
+      }
+    };
+
     const fetchLegacyAuditLogs = async (): Promise<InboundAttemptLog[]> => {
       try {
         const { data, error } = await sb
@@ -4817,7 +4923,10 @@ export function createApiApp() {
       mailboxesProbe,
       messagesProbe,
       inboundLogsProbe,
+      walletsProbe,
+      walletTxProbe,
       persistedWebhookLogs,
+      persistedAppErrors,
       legacyAuditLogs,
       dnsCheck,
       domainConnection,
@@ -4832,7 +4941,10 @@ export function createApiApp() {
         'id, received_at, http_status, status, ok',
         'received_at'
       ),
+      probeTable('wallets', 'user_id, balance, updated_at', 'updated_at'),
+      probeTable('wallet_transactions', 'reference, user_id, amount, status, created_at'),
       fetchPersistedWebhookLogs(),
+      fetchPersistedAppErrors(),
       fetchLegacyAuditLogs(),
       getDnsCheckCached(),
       getDomainConnectionCached(),
@@ -4853,34 +4965,71 @@ export function createApiApp() {
     ).length;
 
     const connectionErrors: string[] = [];
+    const recentErrors: AppErrorLogItem[] = [];
+    const pushLiveError = (item: Omit<AppErrorLogItem, 'id' | 'timestamp'>) => {
+      recentErrors.push({
+        id: `live_${recentErrors.length}_${item.source}`,
+        timestamp: new Date().toISOString(),
+        ...item,
+      });
+    };
+
     if (!domainConnection.ok && domainConnection.error) {
       connectionErrors.push(domainConnection.error);
+      pushLiveError({
+        source: 'routing',
+        severity: 'error',
+        code: domainConnection.httpStatus ? `HTTP ${domainConnection.httpStatus}` : 'CONN_ERR',
+        message: domainConnection.error,
+        detail: domainConnection.url,
+      });
     }
     if (dnsCheck.error) {
-      connectionErrors.push(`DNS lookup error (${CUSTOM_EMAIL_DOMAIN}): ${dnsCheck.error}`);
+      const msg = `DNS lookup error (${CUSTOM_EMAIL_DOMAIN}): ${dnsCheck.error}`;
+      connectionErrors.push(msg);
+      pushLiveError({ source: 'routing', severity: 'error', code: 'DNS_ERR', message: msg, detail: null });
     } else {
       if (!dnsCheck.mxOk) {
-        connectionErrors.push(`Missing Cloudflare MX records for ${CUSTOM_EMAIL_DOMAIN}`);
+        const msg = `Missing Cloudflare MX records for ${CUSTOM_EMAIL_DOMAIN}`;
+        connectionErrors.push(msg);
+        pushLiveError({ source: 'routing', severity: 'warning', code: 'MX_MISSING', message: msg, detail: null });
       }
       if (!dnsCheck.spfOk) {
-        connectionErrors.push(`Missing SPF TXT record on ${CUSTOM_EMAIL_DOMAIN}`);
+        const msg = `Missing SPF TXT record on ${CUSTOM_EMAIL_DOMAIN}`;
+        connectionErrors.push(msg);
+        pushLiveError({ source: 'routing', severity: 'warning', code: 'SPF_MISSING', message: msg, detail: null });
       }
     }
     if (!inboundSecretConfigured) {
-      connectionErrors.push('INBOUND_EMAIL_SECRET is not configured on backend server');
+      const msg = 'INBOUND_EMAIL_SECRET is not configured on backend server';
+      connectionErrors.push(msg);
+      pushLiveError({ source: 'app', severity: 'warning', code: 'ENV_MISSING', message: msg, detail: null });
     }
     if (!serviceRoleConfigured) {
-      connectionErrors.push('SUPABASE_SERVICE_ROLE_KEY is missing (backend may hit RLS blocks)');
+      const msg = 'SUPABASE_SERVICE_ROLE_KEY is missing (backend may hit RLS blocks)';
+      connectionErrors.push(msg);
+      pushLiveError({ source: 'supabase', severity: 'error', code: 'RLS_KEY_MISSING', message: msg, detail: null });
     }
-    if (!mailboxesProbe.ok) {
-      connectionErrors.push(
-        `Supabase mailboxes table error (${mailboxesProbe.errorCode || `HTTP ${mailboxesProbe.httpStatus}`}): ${mailboxesProbe.errorMessage || 'Query failed'}`
-      );
-    }
-    if (!messagesProbe.ok) {
-      connectionErrors.push(
-        `Supabase mailbox_messages table error (${messagesProbe.errorCode || `HTTP ${messagesProbe.httpStatus}`}): ${messagesProbe.errorMessage || 'Query failed'}`
-      );
+    for (const [label, probe] of [
+      ['mailboxes', mailboxesProbe],
+      ['mailbox_messages', messagesProbe],
+      ['inbound_webhook_logs', inboundLogsProbe],
+      ['wallets', walletsProbe],
+      ['wallet_transactions', walletTxProbe],
+    ] as const) {
+      if (!probe.ok) {
+        const msg = `Supabase ${label} table error (${probe.errorCode || `HTTP ${probe.httpStatus}`}): ${probe.errorMessage || 'Query failed'}`;
+        if (label === 'mailboxes' || label === 'mailbox_messages') {
+          connectionErrors.push(msg);
+        }
+        pushLiveError({
+          source: 'supabase',
+          severity: 'error',
+          code: probe.errorCode || `HTTP ${probe.httpStatus}`,
+          message: msg,
+          detail: probe.errorHint || null,
+        });
+      }
     }
 
     const recentFailedCutoff = Date.now() - 10 * 60 * 1000;
@@ -4894,6 +5043,31 @@ export function createApiApp() {
         `Recent inbound webhook failure (${latestAttempt.status} · HTTP ${latestAttempt.httpStatus}): ${latestAttempt.error || latestAttempt.subject}`
       );
     }
+
+    for (const att of mergedAttempts) {
+      if (att.httpStatus >= 400 || att.status === 'db_error' || (!att.supabaseStored && att.error)) {
+        recentErrors.push({
+          id: `wh_${att.id}`,
+          timestamp: att.timestamp,
+          source: att.status === 'db_error' ? 'supabase' : 'webhook',
+          severity: 'error',
+          code: `HTTP ${att.httpStatus}`,
+          message: att.error || `Inbound webhook ${att.status}`,
+          detail: `To: ${att.recipients[0] || att.rawToPreview || '(none)'} · From: ${att.fromAddress || '(unknown)'}`,
+        });
+      }
+    }
+
+    const errorDedup = new Map<string, AppErrorLogItem>();
+    for (const item of [...recentErrors, ...persistedAppErrors, ...appErrorLogs]) {
+      const key = `${item.source}|${item.code || ''}|${item.message}|${item.timestamp.slice(0, 16)}`;
+      if (!errorDedup.has(key)) {
+        errorDedup.set(key, item);
+      }
+    }
+    const unifiedRecentErrors = Array.from(errorDedup.values())
+      .sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp))
+      .slice(0, 30);
 
     const latestMessagesFromDb = (
       messagesProbe.rows as unknown as Array<Record<string, unknown>>
@@ -4969,6 +5143,7 @@ export function createApiApp() {
       checkedAt: new Date().toISOString(),
       ownerEmail: verified.email,
       publicWebhookUrl: `https://${CUSTOM_EMAIL_DOMAIN}/api/email/inbound`,
+      supabaseProjectHost,
       environment: {
         emailDomain: CUSTOM_EMAIL_DOMAIN,
         inboundSecretConfigured,
@@ -4978,6 +5153,7 @@ export function createApiApp() {
       dnsCheck,
       domainConnection,
       connectionErrors,
+      recentErrors: unifiedRecentErrors,
       inboundTraffic24hCount,
       timingSummary: {
         latestTotalMs: latestTimed?.totalMs ?? null,
@@ -5016,6 +5192,22 @@ export function createApiApp() {
           errorMessage: inboundLogsProbe.errorMessage,
           errorHint: inboundLogsProbe.errorHint,
         },
+        wallets: {
+          ok: walletsProbe.ok,
+          httpStatus: walletsProbe.httpStatus,
+          rowCount: walletsProbe.rowCount,
+          errorCode: walletsProbe.errorCode,
+          errorMessage: walletsProbe.errorMessage,
+          errorHint: walletsProbe.errorHint,
+        },
+        walletTransactions: {
+          ok: walletTxProbe.ok,
+          httpStatus: walletTxProbe.httpStatus,
+          rowCount: walletTxProbe.rowCount,
+          errorCode: walletTxProbe.errorCode,
+          errorMessage: walletTxProbe.errorMessage,
+          errorHint: walletTxProbe.errorHint,
+        },
       },
       recentInboundAttempts: mergedAttempts,
       rawInboundLogs: mergedAttempts.slice(0, 20),
@@ -5029,6 +5221,7 @@ export function createApiApp() {
     if (!verified) return;
 
     inboundAttemptLogs.length = 0;
+    appErrorLogs.length = 0;
     try {
       await Promise.allSettled([
         verified.supabase
@@ -5040,6 +5233,10 @@ export function createApiApp() {
           .from('inbound_webhook_logs')
           .delete()
           .eq('ok', false),
+        verified.supabase
+          .from('app_error_logs')
+          .delete()
+          .neq('id', '00000000-0000-0000-0000-000000000000'),
       ]);
     } catch {
       // Non-blocking
@@ -6382,12 +6579,22 @@ export function createApiApp() {
   // ==========================================
   // Secure Naira Wallet, Paystack Webhook & Supabase Sync Endpoints
   // ==========================================
+  type TransferKind = 'p2p_transfer' | 'deposit' | 'debit' | 'refund';
+
   interface WalletTxRecord {
     reference: string;
     userId: string;
-    email?: string;
+    email?: string | null;
     amount: number;
-    channel?: string;
+    status: string;
+    channel?: string | null;
+    provider: string;
+    txType: TransferKind;
+    senderUserId?: string | null;
+    senderEmail?: string | null;
+    recipientUserId?: string | null;
+    recipientEmail?: string | null;
+    details?: string | null;
     createdAt: string;
   }
 
@@ -6399,6 +6606,70 @@ export function createApiApp() {
       return raw.trim().slice(0, 128);
     }
     return 'default-wallet';
+  }
+
+  function isMissingColumnError(err: { code?: string; message?: string } | null | undefined): boolean {
+    if (!err) return false;
+    return (
+      err.code === '42703' ||
+      err.code === 'PGRST204' ||
+      /column .* does not exist/i.test(err.message || '') ||
+      /could not find the .* column/i.test(err.message || '')
+    );
+  }
+
+  async function insertWalletTransactionSafe(
+    sb: SupabaseClient,
+    row: {
+      reference: string;
+      user_id: string;
+      email: string | null;
+      amount: number;
+      status: string;
+      channel: string | null;
+      provider: string;
+      tx_type: TransferKind;
+      sender_user_id: string | null;
+      sender_email: string | null;
+      recipient_user_id: string | null;
+      recipient_email: string | null;
+      details: string | null;
+    }
+  ): Promise<{ error: { code?: string; message?: string } | null }> {
+    const first = await sb.from('wallet_transactions').insert(row);
+    if (!first.error) return { error: null };
+    if (isMissingColumnError(first.error)) {
+      const encodedChannel =
+        row.tx_type === 'p2p_transfer' && row.sender_email && row.recipient_email
+          ? `p2p:${row.sender_email}->${row.recipient_email}`
+          : row.channel;
+      const fallback = await sb.from('wallet_transactions').insert({
+        reference: row.reference,
+        user_id: row.user_id,
+        email: row.email,
+        amount: row.amount,
+        status: row.status,
+        channel: encodedChannel,
+        provider: row.provider,
+      });
+      return { error: fallback.error };
+    }
+    return { error: first.error };
+  }
+
+  async function lookupWalletEmail(sb: SupabaseClient | null, userId: string): Promise<string | null> {
+    if (!sb || !userId || userId === 'default-wallet') return null;
+    try {
+      const { data } = await sb
+        .from('wallets')
+        .select('email')
+        .eq('user_id', userId)
+        .maybeSingle();
+      if (data?.email) return String(data.email).trim().toLowerCase();
+    } catch {
+      // Non-blocking
+    }
+    return null;
   }
 
   async function getUserWalletBalance(userId: string): Promise<{
@@ -6423,8 +6694,19 @@ export function createApiApp() {
           const memBal = walletBalancesMap.get(safeUserId) ?? 0;
           return { balance: memBal, supabasePersisted: true };
         }
-      } catch {
-        // Fall back to in-memory balance if schema not yet applied
+        if (error) {
+          recordAppError({
+            source: 'supabase',
+            code: error.code || 'WALLET_READ',
+            message: `wallets balance query failed: ${error.message}`,
+          });
+        }
+      } catch (err) {
+        recordAppError({
+          source: 'supabase',
+          code: 'WALLET_EX',
+          message: err instanceof Error ? err.message : 'wallets balance query threw exception',
+        });
       }
     }
     return {
@@ -6439,6 +6721,8 @@ export function createApiApp() {
     amountNgn: number;
     reference: string;
     channel?: string;
+    details?: string;
+    provider?: string;
   }): Promise<{
     alreadyProcessed: boolean;
     amount: number;
@@ -6448,10 +6732,18 @@ export function createApiApp() {
     const safeUserId = normalizeWalletUserId(params.userId);
     const amountNgn = Math.max(0, Math.round(params.amountNgn));
     const sb = getSupabaseServerClient();
+    const resolvedEmail =
+      (params.email ? params.email.trim().toLowerCase() : null) ||
+      (await lookupWalletEmail(sb, safeUserId));
+    const providerLabel = params.provider || (params.channel === 'test_credit' ? 'veribox_demo' : 'paystack');
+    const detailsText =
+      params.details ||
+      (params.channel === 'test_credit'
+        ? 'Test wallet top-up'
+        : `Wallet deposit (${params.channel || 'Paystack'})`);
 
     if (sb) {
       try {
-        // Check if transaction reference already exists in Supabase
         const { data: existingTx, error: txLookupErr } = await sb
           .from('wallet_transactions')
           .select('reference, amount, user_id')
@@ -6476,30 +6768,45 @@ export function createApiApp() {
         }
 
         if (!txLookupErr) {
-          const { error: insertTxErr } = await sb.from('wallet_transactions').insert({
+          const { error: insertTxErr } = await insertWalletTransactionSafe(sb, {
             reference: params.reference,
             user_id: safeUserId,
-            email: params.email || null,
+            email: resolvedEmail,
             amount: amountNgn,
             status: 'success',
             channel: params.channel || null,
-            provider: 'paystack',
+            provider: providerLabel,
+            tx_type: 'deposit',
+            sender_user_id: null,
+            sender_email: providerLabel === 'paystack' ? 'Paystack Checkout' : 'VeriBox Test Credit',
+            recipient_user_id: safeUserId,
+            recipient_email: resolvedEmail,
+            details: detailsText,
           });
 
-          if (!insertTxErr) {
+          if (insertTxErr) {
+            recordAppError({
+              source: 'wallet',
+              code: insertTxErr.code || 'TX_INSERT',
+              message: `wallet_transactions deposit insert failed: ${insertTxErr.message}`,
+            });
+          } else {
             const { data: walletRow } = await sb
               .from('wallets')
-              .select('balance')
+              .select('balance, email')
               .eq('user_id', safeUserId)
               .maybeSingle();
 
-            const prevBal = Math.max(0, Number(walletRow?.balance ?? walletBalancesMap.get(safeUserId) ?? 0));
+            const prevBal = Math.max(
+              0,
+              Number(walletRow?.balance ?? walletBalancesMap.get(safeUserId) ?? 0)
+            );
             const newBal = prevBal + amountNgn;
 
             const { error: upsertErr } = await sb.from('wallets').upsert(
               {
                 user_id: safeUserId,
-                email: params.email || null,
+                email: resolvedEmail || walletRow?.email || null,
                 balance: newBal,
                 updated_at: new Date().toISOString(),
               },
@@ -6511,9 +6818,17 @@ export function createApiApp() {
               walletTxMap.set(params.reference, {
                 reference: params.reference,
                 userId: safeUserId,
-                email: params.email,
+                email: resolvedEmail,
                 amount: amountNgn,
-                channel: params.channel,
+                status: 'success',
+                channel: params.channel || null,
+                provider: providerLabel,
+                txType: 'deposit',
+                senderUserId: null,
+                senderEmail: providerLabel === 'paystack' ? 'Paystack Checkout' : 'VeriBox Test Credit',
+                recipientUserId: safeUserId,
+                recipientEmail: resolvedEmail,
+                details: detailsText,
                 createdAt: new Date().toISOString(),
               });
               return {
@@ -6523,10 +6838,19 @@ export function createApiApp() {
                 supabasePersisted: true,
               };
             }
+            recordAppError({
+              source: 'wallet',
+              code: upsertErr.code || 'WALLET_UPSERT',
+              message: `wallets credit upsert failed: ${upsertErr.message}`,
+            });
           }
         }
-      } catch {
-        // Fall through to in-memory credit
+      } catch (err) {
+        recordAppError({
+          source: 'wallet',
+          code: 'CREDIT_EX',
+          message: err instanceof Error ? err.message : 'creditUserWallet exception',
+        });
       }
     }
 
@@ -6546,9 +6870,17 @@ export function createApiApp() {
     walletTxMap.set(params.reference, {
       reference: params.reference,
       userId: safeUserId,
-      email: params.email,
+      email: resolvedEmail,
       amount: amountNgn,
-      channel: params.channel,
+      status: 'success',
+      channel: params.channel || null,
+      provider: providerLabel,
+      txType: 'deposit',
+      senderUserId: null,
+      senderEmail: providerLabel === 'paystack' ? 'Paystack Checkout' : 'VeriBox Test Credit',
+      recipientUserId: safeUserId,
+      recipientEmail: resolvedEmail,
+      details: detailsText,
       createdAt: new Date().toISOString(),
     });
 
@@ -6562,8 +6894,10 @@ export function createApiApp() {
 
   async function adjustUserWalletBalance(params: {
     userId: string;
+    email?: string | null;
     deltaNgn: number;
     reference: string;
+    details?: string | null;
   }): Promise<{
     balance: number | null;
     supabasePersisted: boolean;
@@ -6573,6 +6907,17 @@ export function createApiApp() {
     const safeUserId = normalizeWalletUserId(params.userId);
     const delta = Math.round(params.deltaNgn);
     const ref = (params.reference || '').trim() || `adj-${Date.now()}`;
+    const txType: TransferKind = delta < 0 ? 'debit' : 'refund';
+    const txStatus = delta < 0 ? 'debit' : 'refund';
+    const detailsText =
+      params.details ||
+      (delta < 0
+        ? ref.startsWith('order-')
+          ? 'Private SMS number purchase'
+          : ref.startsWith('email-')
+            ? 'Custom @veribox.name.ng email creation'
+            : 'VeriBox service charge'
+        : 'Cancelled order wallet refund');
 
     const existingMem = walletAdjustmentRefs.get(ref);
     if (existingMem) {
@@ -6584,6 +6929,9 @@ export function createApiApp() {
     }
 
     const sb = getSupabaseServerClient();
+    const resolvedEmail =
+      (params.email ? params.email.trim().toLowerCase() : null) ||
+      (await lookupWalletEmail(sb, safeUserId));
 
     if (sb) {
       try {
@@ -6607,7 +6955,7 @@ export function createApiApp() {
 
         const { data: walletRow, error: readErr } = await sb
           .from('wallets')
-          .select('balance')
+          .select('balance, email')
           .eq('user_id', safeUserId)
           .maybeSingle();
 
@@ -6618,34 +6966,61 @@ export function createApiApp() {
             return { balance: prevBal, supabasePersisted: true, insufficient: true };
           }
           const newBal = Math.max(0, prevBal + delta);
+          const ownerEmail = resolvedEmail || (walletRow?.email ? String(walletRow.email) : null);
           const { error: upsertErr } = await sb.from('wallets').upsert(
             {
               user_id: safeUserId,
+              email: ownerEmail,
               balance: newBal,
               updated_at: new Date().toISOString(),
             },
             { onConflict: 'user_id' }
           );
           if (!upsertErr) {
-            await sb
-              .from('wallet_transactions')
-              .insert({
-                reference: ref,
-                user_id: safeUserId,
-                amount: Math.abs(delta),
-                status: delta < 0 ? 'debit' : 'refund',
-                channel: delta < 0 ? 'wallet_debit' : 'wallet_refund',
-                provider: 'veribox',
-              })
-              .then(() => undefined, () => undefined);
+            await insertWalletTransactionSafe(sb, {
+              reference: ref,
+              user_id: safeUserId,
+              email: ownerEmail,
+              amount: Math.abs(delta),
+              status: txStatus,
+              channel: delta < 0 ? 'wallet_debit' : 'wallet_refund',
+              provider: 'veribox',
+              tx_type: txType,
+              sender_user_id: delta < 0 ? safeUserId : null,
+              sender_email: delta < 0 ? ownerEmail : 'VeriBox Refund',
+              recipient_user_id: delta < 0 ? null : safeUserId,
+              recipient_email: delta < 0 ? 'VeriBox Service' : ownerEmail,
+              details: detailsText,
+            }).catch(() => undefined);
+
+            walletTxMap.set(ref, {
+              reference: ref,
+              userId: safeUserId,
+              email: ownerEmail,
+              amount: Math.abs(delta),
+              status: txStatus,
+              channel: delta < 0 ? 'wallet_debit' : 'wallet_refund',
+              provider: 'veribox',
+              txType,
+              senderUserId: delta < 0 ? safeUserId : null,
+              senderEmail: delta < 0 ? ownerEmail : 'VeriBox Refund',
+              recipientUserId: delta < 0 ? null : safeUserId,
+              recipientEmail: delta < 0 ? 'VeriBox Service' : ownerEmail,
+              details: detailsText,
+              createdAt: new Date().toISOString(),
+            });
 
             walletBalancesMap.set(safeUserId, newBal);
             walletAdjustmentRefs.set(ref, { balance: newBal, delta });
             return { balance: newBal, supabasePersisted: true };
           }
         }
-      } catch {
-        // Fallback to memory
+      } catch (err) {
+        recordAppError({
+          source: 'wallet',
+          code: 'ADJ_EX',
+          message: err instanceof Error ? err.message : 'adjustUserWalletBalance exception',
+        });
       }
     }
 
@@ -6656,6 +7031,22 @@ export function createApiApp() {
     const newBal = Math.max(0, prevBal + delta);
     walletBalancesMap.set(safeUserId, newBal);
     walletAdjustmentRefs.set(ref, { balance: newBal, delta });
+    walletTxMap.set(ref, {
+      reference: ref,
+      userId: safeUserId,
+      email: resolvedEmail,
+      amount: Math.abs(delta),
+      status: txStatus,
+      channel: delta < 0 ? 'wallet_debit' : 'wallet_refund',
+      provider: 'veribox',
+      txType,
+      senderUserId: delta < 0 ? safeUserId : null,
+      senderEmail: delta < 0 ? resolvedEmail : 'VeriBox Refund',
+      recipientUserId: delta < 0 ? null : safeUserId,
+      recipientEmail: delta < 0 ? 'VeriBox Service' : resolvedEmail,
+      details: detailsText,
+      createdAt: new Date().toISOString(),
+    });
     return { balance: newBal, supabasePersisted: false };
   }
 
@@ -6978,12 +7369,16 @@ export function createApiApp() {
       res.status(400).json({ error: 'Invalid deduction amount' });
       return;
     }
-    const userId = normalizeWalletUserId(req.body?.userId);
+    const caller = await getVerifiedSupabaseBearerUser(req);
+    const userId = normalizeWalletUserId(caller?.id || req.body?.userId);
     const reference = String(req.body?.reference || `deduct-${Date.now()}`);
+    const details = typeof req.body?.details === 'string' ? req.body.details.trim().slice(0, 140) : null;
     const result = await adjustUserWalletBalance({
       userId,
+      email: caller?.email || (typeof req.body?.email === 'string' ? req.body.email : null),
       deltaNgn: -amount,
       reference,
+      details,
     });
     if (result.insufficient) {
       res.status(402).json({
@@ -7004,30 +7399,44 @@ export function createApiApp() {
       res.status(400).json({ error: 'Invalid refund amount' });
       return;
     }
-    const userId = normalizeWalletUserId(req.body?.userId);
+    const caller = await getVerifiedSupabaseBearerUser(req);
+    const userId = normalizeWalletUserId(caller?.id || req.body?.userId);
     const reference = String(req.body?.reference || `refund-${Date.now()}`);
+    const details = typeof req.body?.details === 'string' ? req.body.details.trim().slice(0, 140) : null;
     const result = await adjustUserWalletBalance({
       userId,
+      email: caller?.email || (typeof req.body?.email === 'string' ? req.body.email : null),
       deltaNgn: amount,
       reference,
+      details,
     });
     res.json({ success: true, ...result });
   });
 
   app.post('/api/wallet/demo-credit', async (req, res) => {
+    if (getPaystackSecretKey()) {
+      res.status(403).json({
+        error: 'Test credit is disabled when live Paystack checkout is configured.',
+      });
+      return;
+    }
     const amount = Number(req.body?.amount);
     if (!Number.isFinite(amount) || amount < 100 || amount > 500000) {
       res.status(400).json({ error: 'Invalid amount' });
       return;
     }
-    const userId = normalizeWalletUserId(req.body?.userId);
+    const caller = await getVerifiedSupabaseBearerUser(req);
+    const userId = normalizeWalletUserId(caller?.id || req.body?.userId);
     const rounded = Math.round(amount);
     const demoRef = `demo-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const result = await creditUserWallet({
       userId,
+      email: caller?.email || (typeof req.body?.email === 'string' ? req.body.email : undefined),
       amountNgn: rounded,
       reference: demoRef,
       channel: 'test_credit',
+      details: 'Test wallet top-up',
+      provider: 'veribox_demo',
     });
     res.json({
       success: true,
@@ -7037,6 +7446,644 @@ export function createApiApp() {
       demo: true,
       message: `Credit of ₦${rounded.toLocaleString()} added`,
     });
+  });
+
+  function normalizeTransferRow(
+    raw: Record<string, unknown>,
+    userDirectory?: Map<string, { email: string; fullName: string | null }>
+  ) {
+    const reference = String(raw.reference || '');
+    const userId = raw.user_id ? String(raw.user_id) : raw.userId ? String(raw.userId) : '';
+    const rowEmail = raw.email ? String(raw.email).trim().toLowerCase() : null;
+    const amount = Math.max(0, Number(raw.amount) || 0);
+    const status = String(raw.status || 'success').toLowerCase();
+    const channel = raw.channel ? String(raw.channel) : null;
+    const provider = String(raw.provider || 'veribox');
+    const createdAt = String(raw.created_at || raw.createdAt || new Date().toISOString());
+
+    let txType: TransferKind = 'deposit';
+    const explicitType = raw.tx_type ? String(raw.tx_type) : raw.txType ? String(raw.txType) : '';
+    if (
+      explicitType === 'p2p_transfer' ||
+      explicitType === 'deposit' ||
+      explicitType === 'debit' ||
+      explicitType === 'refund'
+    ) {
+      txType = explicitType;
+    } else if (channel?.startsWith('p2p:') || channel === 'p2p_transfer' || reference.startsWith('xfer-')) {
+      txType = 'p2p_transfer';
+    } else if (status === 'debit' || channel === 'wallet_debit') {
+      txType = 'debit';
+    } else if (status === 'refund' || channel === 'wallet_refund') {
+      txType = 'refund';
+    }
+
+    let senderUserId =
+      raw.sender_user_id ? String(raw.sender_user_id) : raw.senderUserId ? String(raw.senderUserId) : null;
+    let senderEmail =
+      raw.sender_email ? String(raw.sender_email).trim().toLowerCase() : raw.senderEmail ? String(raw.senderEmail).trim().toLowerCase() : null;
+    let recipientUserId =
+      raw.recipient_user_id ? String(raw.recipient_user_id) : raw.recipientUserId ? String(raw.recipientUserId) : null;
+    let recipientEmail =
+      raw.recipient_email ? String(raw.recipient_email).trim().toLowerCase() : raw.recipientEmail ? String(raw.recipientEmail).trim().toLowerCase() : null;
+
+    if (txType === 'p2p_transfer' && channel && channel.startsWith('p2p:') && (!senderEmail || !recipientEmail)) {
+      const [sPart, rPart] = channel.slice(4).split('->');
+      if (sPart && !senderEmail) senderEmail = sPart.trim().toLowerCase();
+      if (rPart && !recipientEmail) recipientEmail = rPart.trim().toLowerCase();
+    }
+
+    const ownerDir = userId ? userDirectory?.get(userId) : undefined;
+    const resolvedOwnerEmail = rowEmail || ownerDir?.email || null;
+
+    if (txType === 'p2p_transfer') {
+      if (!senderUserId && userId) senderUserId = userId;
+      if (!senderEmail && resolvedOwnerEmail) senderEmail = resolvedOwnerEmail;
+    } else if (txType === 'deposit') {
+      if (!recipientUserId && userId) recipientUserId = userId;
+      if (!recipientEmail && resolvedOwnerEmail) recipientEmail = resolvedOwnerEmail;
+      if (!senderEmail) {
+        senderEmail = provider === 'paystack' ? 'Paystack Checkout' : 'VeriBox Top-up';
+      }
+    } else if (txType === 'debit') {
+      if (!senderUserId && userId) senderUserId = userId;
+      if (!senderEmail && resolvedOwnerEmail) senderEmail = resolvedOwnerEmail;
+      if (!recipientEmail) recipientEmail = 'VeriBox Service';
+    } else if (txType === 'refund') {
+      if (!recipientUserId && userId) recipientUserId = userId;
+      if (!recipientEmail && resolvedOwnerEmail) recipientEmail = resolvedOwnerEmail;
+      if (!senderEmail) senderEmail = 'VeriBox Refund';
+    }
+
+    const senderDir = senderUserId ? userDirectory?.get(senderUserId) : undefined;
+    const recipientDir = recipientUserId ? userDirectory?.get(recipientUserId) : undefined;
+    const senderName = senderDir?.fullName || null;
+    const recipientName = recipientDir?.fullName || null;
+
+    const senderLabel =
+      senderName && senderEmail && senderEmail.includes('@')
+        ? `${senderName} (${senderEmail})`
+        : senderEmail || senderUserId || 'External';
+    const recipientLabel =
+      recipientName && recipientEmail && recipientEmail.includes('@')
+        ? `${recipientName} (${recipientEmail})`
+        : recipientEmail || recipientUserId || 'VeriBox';
+
+    const details =
+      (typeof raw.details === 'string' && raw.details.trim()) ||
+      (txType === 'p2p_transfer'
+        ? 'Wallet-to-Wallet Transfer'
+        : txType === 'deposit'
+          ? `Deposit via ${channel || provider || 'Paystack'}`
+          : txType === 'refund'
+            ? 'Wallet Refund'
+            : reference.startsWith('order-')
+              ? 'Private SMS Number'
+              : reference.startsWith('email-')
+                ? 'Custom Email Address'
+                : 'Wallet Spend');
+
+    return {
+      reference,
+      userId,
+      txType,
+      amount,
+      status,
+      channel,
+      provider,
+      details,
+      senderUserId,
+      senderEmail,
+      senderName,
+      senderLabel,
+      recipientUserId,
+      recipientEmail,
+      recipientName,
+      recipientLabel,
+      createdAt,
+    };
+  }
+
+  app.get('/api/wallet/transfers', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    const caller = await getVerifiedSupabaseBearerUser(req);
+    if (!caller) {
+      res.status(401).json({ error: 'Sign in required to view your transfer history', transfers: [] });
+      return;
+    }
+
+    const callerId = caller.id;
+    const callerEmail = caller.email;
+    const sb = getSupabaseServerClient();
+    const collected = new Map<string, ReturnType<typeof normalizeTransferRow>>();
+
+    const safeFilterId = callerId.replace(/[^a-zA-Z0-9_-]/g, '');
+    const safeLikeEmail = callerEmail.replace(/[\\%_]/g, (m: string) => `\\${m}`);
+
+    if (sb) {
+      try {
+        let rows: Array<Record<string, unknown>> = [];
+        const queryExt = safeFilterId
+          ? await sb
+              .from('wallet_transactions')
+              .select('*')
+              .or(
+                `user_id.eq.${safeFilterId},sender_user_id.eq.${safeFilterId},recipient_user_id.eq.${safeFilterId}`
+              )
+              .order('created_at', { ascending: false })
+              .limit(120)
+          : { data: [], error: null };
+
+        if (!queryExt.error && Array.isArray(queryExt.data)) {
+          rows = queryExt.data as Array<Record<string, unknown>>;
+        } else if (isMissingColumnError(queryExt.error)) {
+          const queryBase = await sb
+            .from('wallet_transactions')
+            .select('reference, user_id, email, amount, status, channel, provider, created_at')
+            .order('created_at', { ascending: false })
+            .limit(200);
+          if (!queryBase.error && Array.isArray(queryBase.data)) {
+            rows = queryBase.data as Array<Record<string, unknown>>;
+          }
+        } else if (queryExt.error) {
+          recordAppError({
+            source: 'supabase',
+            code: queryExt.error.code || 'USER_TX_ERR',
+            message: `User wallet_transactions query failed: ${queryExt.error.message}`,
+          });
+        }
+
+        // Also include any rows matched strictly by caller email (for legacy Paystack credits)
+        if (safeLikeEmail) {
+          const emailMatch = await sb
+            .from('wallet_transactions')
+            .select('*')
+            .ilike('email', safeLikeEmail)
+            .order('created_at', { ascending: false })
+            .limit(60);
+          if (!emailMatch.error && Array.isArray(emailMatch.data)) {
+            rows = [...rows, ...(emailMatch.data as Array<Record<string, unknown>>)];
+          }
+        }
+
+        for (const r of rows) {
+          const norm = normalizeTransferRow(r);
+          if (norm.reference && !collected.has(norm.reference)) {
+            collected.set(norm.reference, norm);
+          }
+        }
+      } catch (err) {
+        recordAppError({
+          source: 'wallet',
+          code: 'USER_TX_EX',
+          message: err instanceof Error ? err.message : 'Failed to load user transfers',
+        });
+      }
+    }
+
+    for (const mem of walletTxMap.values()) {
+      const norm = normalizeTransferRow(mem as unknown as Record<string, unknown>);
+      if (norm.reference && !collected.has(norm.reference)) {
+        collected.set(norm.reference, norm);
+      }
+    }
+
+    // Strict defense-in-depth per-user isolation: ONLY include rows belonging to callerId / callerEmail
+    const userTransfers = Array.from(collected.values())
+      .filter((t) => {
+        const matchId =
+          t.userId === callerId ||
+          t.senderUserId === callerId ||
+          t.recipientUserId === callerId;
+        const matchEmail =
+          Boolean(callerEmail) &&
+          (t.senderEmail === callerEmail || t.recipientEmail === callerEmail);
+        return matchId || matchEmail;
+      })
+      .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
+      .slice(0, 100)
+      .map((t) => {
+        let direction: 'sent' | 'received' | 'deposit' | 'debit' | 'refund' = t.txType === 'p2p_transfer'
+          ? t.recipientUserId === callerId || t.recipientEmail === callerEmail
+            ? 'received'
+            : 'sent'
+          : t.txType;
+
+        const counterpartyLabel =
+          direction === 'sent'
+            ? `To ${t.recipientEmail || t.recipientLabel}`
+            : direction === 'received'
+              ? `From ${t.senderEmail || t.senderLabel}`
+              : direction === 'deposit'
+                ? t.senderLabel
+                : direction === 'refund'
+                  ? 'VeriBox Refund'
+                  : t.recipientLabel;
+
+        return {
+          reference: t.reference,
+          txType: t.txType,
+          direction,
+          amount: t.amount,
+          status: t.status,
+          channel: t.channel,
+          provider: t.provider,
+          details: t.details,
+          senderLabel: t.senderLabel,
+          senderEmail: t.senderEmail,
+          recipientLabel: t.recipientLabel,
+          recipientEmail: t.recipientEmail,
+          counterpartyLabel,
+          createdAt: t.createdAt,
+        };
+      });
+
+    res.json({ transfers: userTransfers });
+  });
+
+  app.post('/api/wallet/transfer', async (req, res) => {
+    const caller = await getVerifiedSupabaseBearerUser(req);
+    if (!caller) {
+      res.status(401).json({ error: 'Please sign in to send a Naira transfer.' });
+      return;
+    }
+
+    const modCheck = await assertCallerNotModerated(req, res);
+    if (!modCheck) return;
+
+    const sb = getSupabaseServerClient();
+    if (!sb) {
+      res.status(503).json({ error: 'Supabase database is not configured for wallet transfers.' });
+      return;
+    }
+
+    const recipientEmail =
+      typeof req.body?.recipientEmail === 'string'
+        ? req.body.recipientEmail.trim().toLowerCase()
+        : '';
+    const amount = Math.round(Number(req.body?.amount));
+    const note =
+      typeof req.body?.note === 'string'
+        ? req.body.note.trim().slice(0, 120)
+        : typeof req.body?.details === 'string'
+          ? req.body.details.trim().slice(0, 120)
+          : '';
+
+    if (!recipientEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipientEmail)) {
+      res.status(400).json({ error: 'Please enter a valid recipient email address.' });
+      return;
+    }
+    if (recipientEmail === caller.email) {
+      res.status(400).json({ error: 'You cannot transfer funds to your own account.' });
+      return;
+    }
+    if (!Number.isFinite(amount) || amount < 50 || amount > 500000) {
+      res.status(400).json({ error: 'Transfer amount must be between ₦50 and ₦500,000.' });
+      return;
+    }
+
+    try {
+      // Locate recipient registered user in Supabase Auth (or wallets table)
+      let recipientUser: { id: string; email: string; fullName: string | null } | null = null;
+      const { data: usersPage, error: listErr } = await sb.auth.admin.listUsers({
+        page: 1,
+        perPage: 500,
+      });
+      if (!listErr && Array.isArray(usersPage?.users)) {
+        const matched = usersPage.users.find(
+          (u) => (u.email || '').trim().toLowerCase() === recipientEmail
+        );
+        if (matched) {
+          const meta = (matched.user_metadata || {}) as Record<string, unknown>;
+          recipientUser = {
+            id: matched.id,
+            email: (matched.email || recipientEmail).trim().toLowerCase(),
+            fullName:
+              typeof meta.full_name === 'string'
+                ? meta.full_name
+                : typeof meta.name === 'string'
+                  ? meta.name
+                  : null,
+          };
+        }
+      }
+
+      if (!recipientUser) {
+        const safeRecipientLike = recipientEmail.replace(/[\\%_]/g, (m: string) => `\\${m}`);
+        const { data: walletMatch } = await sb
+          .from('wallets')
+          .select('user_id, email')
+          .ilike('email', safeRecipientLike)
+          .maybeSingle();
+        if (walletMatch?.user_id) {
+          recipientUser = {
+            id: String(walletMatch.user_id),
+            email: String(walletMatch.email || recipientEmail).trim().toLowerCase(),
+            fullName: null,
+          };
+        }
+      }
+
+      if (!recipientUser) {
+        res.status(404).json({
+          error: `No registered VeriBox account found for ${recipientEmail}.`,
+        });
+        return;
+      }
+
+      // Check sender balance and perform atomic conditional debit
+      const { data: senderWallet, error: senderReadErr } = await sb
+        .from('wallets')
+        .select('balance, user_id')
+        .eq('user_id', caller.id)
+        .maybeSingle();
+
+      if (senderReadErr) {
+        recordAppError({
+          source: 'supabase',
+          code: senderReadErr.code || 'TRANSFER_SENDER_READ',
+          message: `Failed reading sender wallet: ${senderReadErr.message}`,
+        });
+        res.status(500).json({ error: `Could not verify wallet balance: ${senderReadErr.message}` });
+        return;
+      }
+
+      const senderPrevBal = Math.max(0, Number(senderWallet?.balance ?? 0));
+
+      if (!senderWallet || senderPrevBal < amount) {
+        res.status(402).json({
+          error: `Insufficient wallet balance (₦${senderPrevBal.toLocaleString()}). Needed: ₦${amount.toLocaleString()}.`,
+          balance: senderPrevBal,
+        });
+        return;
+      }
+
+      const senderNewBal = senderPrevBal - amount;
+      const { data: debitedRow, error: debitErr } = await sb
+        .from('wallets')
+        .update({
+          balance: senderNewBal,
+          email: caller.email,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('user_id', caller.id)
+        .gte('balance', amount)
+        .select('balance')
+        .maybeSingle();
+
+      if (debitErr) {
+        recordAppError({
+          source: 'wallet',
+          code: debitErr.code || 'TRANSFER_DEBIT',
+          message: `P2P transfer debit failed: ${debitErr.message}`,
+        });
+        res.status(500).json({ error: `Transfer failed: ${debitErr.message}` });
+        return;
+      }
+
+      if (!debitedRow) {
+        res.status(409).json({
+          error: 'Wallet balance changed or is insufficient — please refresh and retry.',
+        });
+        return;
+      }
+
+      const { data: recWallet, error: recReadErr } = await sb
+        .from('wallets')
+        .select('balance')
+        .eq('user_id', recipientUser.id)
+        .maybeSingle();
+      if (recReadErr) {
+        try {
+          await sb
+            .from('wallets')
+            .update({
+              balance: Number(debitedRow.balance) + amount,
+              updated_at: new Date().toISOString(),
+            })
+            .eq('user_id', caller.id);
+        } catch {
+          // Best-effort rollback
+        }
+        recordAppError({
+          source: 'supabase',
+          code: recReadErr.code || 'TRANSFER_REC_READ',
+          message: `Failed reading recipient wallet (rolled back): ${recReadErr.message}`,
+        });
+        res.status(500).json({ error: `Could not read recipient wallet: ${recReadErr.message}` });
+        return;
+      }
+
+      const recPrevBal = Math.max(
+        0,
+        Number(recWallet?.balance ?? walletBalancesMap.get(recipientUser.id) ?? 0)
+      );
+      const recNewBal = recPrevBal + amount;
+
+      const { error: creditErr } = await sb.from('wallets').upsert(
+        {
+          user_id: recipientUser.id,
+          email: recipientUser.email,
+          balance: recNewBal,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: 'user_id' }
+      );
+
+      if (creditErr) {
+        // Roll back sender debit on recipient credit failure
+        try {
+          await sb
+            .from('wallets')
+            .update({
+              balance: Number(debitedRow.balance) + amount,
+              email: caller.email,
+              updated_at: new Date().toISOString(),
+            })
+            .eq('user_id', caller.id);
+        } catch {
+          // Best-effort rollback
+        }
+        recordAppError({
+          source: 'wallet',
+          code: creditErr.code || 'TRANSFER_CREDIT',
+          message: `P2P transfer credit failed (rolled back): ${creditErr.message}`,
+        });
+        res.status(500).json({ error: `Transfer failed while crediting recipient: ${creditErr.message}` });
+        return;
+      }
+
+      const reference = `xfer-${Date.now().toString(36)}-${crypto.randomBytes(3).toString('hex')}`;
+      const detailsText = note || `Transfer to ${recipientUser.email}`;
+      const createdAt = new Date().toISOString();
+
+      await insertWalletTransactionSafe(sb, {
+        reference,
+        user_id: caller.id,
+        email: caller.email,
+        amount,
+        status: 'success',
+        channel: 'p2p_transfer',
+        provider: 'veribox',
+        tx_type: 'p2p_transfer',
+        sender_user_id: caller.id,
+        sender_email: caller.email,
+        recipient_user_id: recipientUser.id,
+        recipient_email: recipientUser.email,
+        details: detailsText,
+      });
+
+      walletBalancesMap.set(caller.id, senderNewBal);
+      walletBalancesMap.set(recipientUser.id, recNewBal);
+      walletTxMap.set(reference, {
+        reference,
+        userId: caller.id,
+        email: caller.email,
+        amount,
+        status: 'success',
+        channel: 'p2p_transfer',
+        provider: 'veribox',
+        txType: 'p2p_transfer',
+        senderUserId: caller.id,
+        senderEmail: caller.email,
+        recipientUserId: recipientUser.id,
+        recipientEmail: recipientUser.email,
+        details: detailsText,
+        createdAt,
+      });
+
+      res.json({
+        ok: true,
+        reference,
+        balance: senderNewBal,
+        transfer: {
+          reference,
+          txType: 'p2p_transfer',
+          direction: 'sent',
+          amount,
+          status: 'success',
+          channel: 'p2p_transfer',
+          provider: 'veribox',
+          details: detailsText,
+          senderLabel: caller.email,
+          senderEmail: caller.email,
+          recipientLabel: recipientUser.fullName
+            ? `${recipientUser.fullName} (${recipientUser.email})`
+            : recipientUser.email,
+          recipientEmail: recipientUser.email,
+          counterpartyLabel: `To ${recipientUser.email}`,
+          createdAt,
+        },
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Transfer failed';
+      recordAppError({ source: 'wallet', code: 'TRANSFER_EX', message: msg });
+      res.status(500).json({ error: msg });
+    }
+  });
+
+  app.get('/api/admin/transfers', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    const verified = await verifyOwnerAdminRequest(req, res);
+    if (!verified) return;
+    const sb = verified.supabase;
+
+    try {
+      const [txRes, usersRes, walletsRes] = await Promise.all([
+        sb
+          .from('wallet_transactions')
+          .select('*')
+          .order('created_at', { ascending: false })
+          .limit(200),
+        sb.auth.admin.listUsers({ page: 1, perPage: 500 }),
+        sb.from('wallets').select('user_id, email'),
+      ]);
+
+      if (txRes.error) {
+        recordAppError({
+          source: 'supabase',
+          code: txRes.error.code || 'ADMIN_TX_ERR',
+          message: `Admin wallet_transactions query failed: ${txRes.error.message}`,
+        });
+      }
+
+      const userDir = new Map<string, { email: string; fullName: string | null }>();
+      if (!usersRes.error && Array.isArray(usersRes.data?.users)) {
+        for (const u of usersRes.data.users) {
+          const meta = (u.user_metadata || {}) as Record<string, unknown>;
+          userDir.set(u.id, {
+            email: (u.email || '').trim().toLowerCase(),
+            fullName:
+              typeof meta.full_name === 'string'
+                ? meta.full_name
+                : typeof meta.name === 'string'
+                  ? meta.name
+                  : null,
+          });
+        }
+      }
+      if (!walletsRes.error && Array.isArray(walletsRes.data)) {
+        for (const w of walletsRes.data) {
+          const uid = String(w.user_id || '');
+          const wEmail = w.email ? String(w.email).trim().toLowerCase() : '';
+          if (uid && wEmail && !userDir.has(uid)) {
+            userDir.set(uid, { email: wEmail, fullName: null });
+          }
+        }
+      }
+
+      const merged = new Map<string, ReturnType<typeof normalizeTransferRow>>();
+      if (!txRes.error && Array.isArray(txRes.data)) {
+        for (const row of txRes.data) {
+          const norm = normalizeTransferRow(row as Record<string, unknown>, userDir);
+          if (norm.reference && !merged.has(norm.reference)) {
+            merged.set(norm.reference, norm);
+          }
+        }
+      }
+      for (const mem of walletTxMap.values()) {
+        const norm = normalizeTransferRow(mem as unknown as Record<string, unknown>, userDir);
+        if (norm.reference && !merged.has(norm.reference)) {
+          merged.set(norm.reference, norm);
+        }
+      }
+
+      const q = typeof req.query.q === 'string' ? req.query.q.trim().toLowerCase() : '';
+      const filter = typeof req.query.filter === 'string' ? req.query.filter.trim().toLowerCase() : 'all';
+
+      const transfers = Array.from(merged.values())
+        .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
+        .filter((t) => {
+          if (filter === 'p2p' && t.txType !== 'p2p_transfer') return false;
+          if (filter === 'deposit' && t.txType !== 'deposit') return false;
+          if (filter === 'debit' && t.txType !== 'debit') return false;
+          if (filter === 'refund' && t.txType !== 'refund') return false;
+          if (filter === 'issues' && !['pending', 'failed', 'error'].includes(t.status)) {
+            return false;
+          }
+          if (!q) return true;
+          return (
+            t.reference.toLowerCase().includes(q) ||
+            t.senderLabel.toLowerCase().includes(q) ||
+            t.recipientLabel.toLowerCase().includes(q) ||
+            (t.senderEmail || '').toLowerCase().includes(q) ||
+            (t.recipientEmail || '').toLowerCase().includes(q) ||
+            t.details.toLowerCase().includes(q) ||
+            t.status.toLowerCase().includes(q)
+          );
+        })
+        .slice(0, 150)
+        .map(({ userId: _uid, ...rest }) => rest);
+
+      res.json({
+        transfers,
+        probeError: txRes.error ? txRes.error.message : null,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to load transfer history';
+      recordAppError({ source: 'wallet', code: 'ADMIN_TX_EX', message: msg });
+      res.status(500).json({ error: msg, transfers: [] });
+    }
   });
 
   // ==========================================

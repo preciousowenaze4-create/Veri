@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
   ArrowLeft,
+  ArrowLeftRight,
   Ban,
   CheckCircle2,
   Clock,
@@ -16,6 +17,7 @@ import {
   Server,
   ShieldAlert,
   ShieldCheck,
+  Trash2,
   UserCheck,
   Users,
   XCircle,
@@ -25,7 +27,9 @@ import type {
   AdminInboundTestResult,
   AdminManagedUser,
   AdminTableProbe,
+  AdminTransferRecord,
   UserModerationAction,
+  UserModerationStatus,
 } from '../types';
 import { formatRelativeTime } from '../utils/clipboard';
 
@@ -44,10 +48,15 @@ interface AdminDiagnosticsTabProps {
   usersLoading?: boolean;
   usersError?: string | null;
   moderatingUserId?: string | null;
+  transfers?: AdminTransferRecord[];
+  transfersLoading?: boolean;
+  transfersError?: string | null;
   onRefresh: () => void;
   onTestInbound: (targetAddress: string) => void;
   onRefreshUsers?: () => void;
   onModerateUser?: (userId: string, action: UserModerationAction) => void;
+  onRefreshTransfers?: () => void;
+  onClearAlerts?: () => void;
   onSwitchToUserView: () => void;
 }
 
@@ -131,15 +140,25 @@ export function AdminDiagnosticsTab({
   usersLoading = false,
   usersError = null,
   moderatingUserId = null,
+  transfers = [],
+  transfersLoading = false,
+  transfersError = null,
   onRefresh,
   onTestInbound,
   onRefreshUsers,
   onModerateUser,
+  onRefreshTransfers,
+  onClearAlerts,
   onSwitchToUserView,
 }: AdminDiagnosticsTabProps) {
   const defaultTarget = activeEmailAddress || `diag.test@${emailDomain}`;
   const [testAddress, setTestAddress] = useState(defaultTarget);
   const [userSearch, setUserSearch] = useState('');
+  const [userStatusFilter, setUserStatusFilter] = useState<'all' | UserModerationStatus>('all');
+  const [transferSearch, setTransferSearch] = useState('');
+  const [transferFilter, setTransferFilter] = useState<
+    'all' | 'p2p_transfer' | 'deposit' | 'debit' | 'refund' | 'issues'
+  >('all');
 
   useEffect(() => {
     if (activeEmailAddress) {
@@ -149,6 +168,52 @@ export function AdminDiagnosticsTab({
 
   const env = diagnostics?.environment;
   const activeConnectionErrors = diagnostics?.connectionErrors || [];
+  const recentErrors = diagnostics?.recentErrors || [];
+
+  const supabaseHealthy = Boolean(
+    env?.supabaseConfigured &&
+      diagnostics?.probes.mailboxes.ok &&
+      diagnostics?.probes.mailboxMessages.ok &&
+      (diagnostics?.probes.wallets?.ok ?? true) &&
+      (diagnostics?.probes.walletTransactions?.ok ?? true)
+  );
+
+  const filteredTransfers = useMemo(() => {
+    const q = transferSearch.trim().toLowerCase();
+    return transfers.filter((t) => {
+      if (transferFilter === 'p2p_transfer' && t.txType !== 'p2p_transfer') return false;
+      if (transferFilter === 'deposit' && t.txType !== 'deposit') return false;
+      if (transferFilter === 'debit' && t.txType !== 'debit') return false;
+      if (transferFilter === 'refund' && t.txType !== 'refund') return false;
+      if (
+        transferFilter === 'issues' &&
+        !['pending', 'failed', 'error'].includes(t.status.toLowerCase())
+      ) {
+        return false;
+      }
+      if (!q) return true;
+      return (
+        t.reference.toLowerCase().includes(q) ||
+        t.senderLabel.toLowerCase().includes(q) ||
+        t.recipientLabel.toLowerCase().includes(q) ||
+        (t.senderEmail || '').toLowerCase().includes(q) ||
+        (t.recipientEmail || '').toLowerCase().includes(q) ||
+        t.details.toLowerCase().includes(q) ||
+        t.status.toLowerCase().includes(q)
+      );
+    });
+  }, [transfers, transferSearch, transferFilter]);
+
+  const userCounts = useMemo(
+    () => ({
+      all: users.length,
+      verified: users.filter((u) => u.status === 'verified').length,
+      restricted: users.filter((u) => u.status === 'restricted').length,
+      suspended: users.filter((u) => u.status === 'suspended').length,
+      banned: users.filter((u) => u.status === 'banned').length,
+    }),
+    [users]
+  );
 
   return (
     <div className="space-y-4">
@@ -240,26 +305,45 @@ export function AdminDiagnosticsTab({
         )}
       </section>
 
-      {/* Environment & Supabase Table Probes */}
+      {/* Supabase Status & Errors */}
       <section className="rounded-2xl border border-[#D4AF37]/30 bg-white p-4 sm:p-5 space-y-4 dark:bg-[#14120D]">
-        <div className="flex items-center justify-between gap-2">
-          <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <Database className="h-4 w-4 text-[#D4AF37]" />
             <h2 className="font-display text-sm sm:text-base font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
-              Supabase &amp; Backend Configuration
+              Supabase Status &amp; Errors
             </h2>
+            {diagnostics && (
+              <span
+                className={`inline-flex items-center gap-1 rounded-md px-2 py-0.5 font-mono text-[10px] font-bold ${
+                  supabaseHealthy
+                    ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+                    : 'bg-rose-500/15 text-rose-700 dark:text-rose-300'
+                }`}
+              >
+                <span
+                  className={`h-1.5 w-1.5 rounded-full ${
+                    supabaseHealthy ? 'bg-emerald-500' : 'bg-rose-500'
+                  }`}
+                />
+                {supabaseHealthy ? 'Connected' : 'Error Detected'}
+              </span>
+            )}
           </div>
-          {diagnostics?.checkedAt && (
-            <span className="text-[11px] text-[#6E6552] dark:text-[#A89F8C]">
-              Checked {formatRelativeTime(diagnostics.checkedAt)}
-            </span>
-          )}
+          <div className="flex flex-wrap items-center gap-2 text-[11px] text-[#6E6552] dark:text-[#A89F8C]">
+            {diagnostics?.supabaseProjectHost && (
+              <span className="font-mono">{diagnostics.supabaseProjectHost}</span>
+            )}
+            {diagnostics?.checkedAt && (
+              <span>Checked {formatRelativeTime(diagnostics.checkedAt)}</span>
+            )}
+          </div>
         </div>
 
         {loading && !diagnostics ? (
           <div className="flex items-center gap-2 py-6 text-xs text-[#6E6552] dark:text-[#A89F8C]">
             <Loader2 className="h-4 w-4 animate-spin text-[#D4AF37]" />
-            <span>Running live diagnostics on mailboxes, RLS policies, and inbound logs...</span>
+            <span>Checking Supabase connection, table probes, and recent errors...</span>
           </div>
         ) : diagnostics ? (
           <>
@@ -288,16 +372,18 @@ export function AdminDiagnosticsTab({
               </div>
               <div className="rounded-xl border border-[#D4AF37]/20 bg-[#FAF7F0] p-2.5 dark:bg-[#0B0A07]">
                 <p className="text-[10px] font-bold text-[#6E6552] dark:text-[#A89F8C]">
-                  Supabase URL
+                  Supabase Endpoint
                 </p>
                 <p
-                  className={`mt-0.5 text-xs font-extrabold ${
+                  className={`mt-0.5 text-xs font-extrabold truncate ${
                     env?.supabaseConfigured
                       ? 'text-emerald-600 dark:text-emerald-400'
                       : 'text-rose-600 dark:text-rose-400'
                   }`}
                 >
-                  {env?.supabaseConfigured ? 'Connected' : 'Missing'}
+                  {env?.supabaseConfigured
+                    ? diagnostics.supabaseProjectHost || 'Connected'
+                    : 'Missing'}
                 </p>
               </div>
               <div className="rounded-xl border border-[#D4AF37]/20 bg-[#FAF7F0] p-2.5 dark:bg-[#0B0A07]">
@@ -322,22 +408,101 @@ export function AdminDiagnosticsTab({
               </div>
             )}
 
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
               <ProbeCard
-                title="Mailboxes Table Query"
+                title="Mailboxes Table"
                 tableName="mailboxes"
                 probe={diagnostics.probes.mailboxes}
               />
               <ProbeCard
-                title="Inbound Messages Table Query"
+                title="Inbound Messages"
                 tableName="mailbox_messages"
                 probe={diagnostics.probes.mailboxMessages}
               />
               <ProbeCard
-                title="Inbound Webhook Logs Query"
+                title="Webhook Logs"
                 tableName="inbound_webhook_logs"
                 probe={diagnostics.probes.inboundWebhookLogs}
               />
+              {diagnostics.probes.wallets && (
+                <ProbeCard
+                  title="User Wallets"
+                  tableName="wallets"
+                  probe={diagnostics.probes.wallets}
+                />
+              )}
+              {diagnostics.probes.walletTransactions && (
+                <ProbeCard
+                  title="Wallet Transfers"
+                  tableName="wallet_transactions"
+                  probe={diagnostics.probes.walletTransactions}
+                />
+              )}
+            </div>
+
+            {/* Recent App / Supabase / Webhook / Routing Errors */}
+            <div className="rounded-xl border border-[#D4AF37]/25 bg-[#FAF7F0] p-3.5 space-y-2.5 dark:bg-[#0B0A07]">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <AlertTriangle
+                    className={`h-4 w-4 ${
+                      recentErrors.length > 0 ? 'text-rose-500' : 'text-emerald-500'
+                    }`}
+                  />
+                  <span className="text-xs font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
+                    Recent Errors Log ({recentErrors.length})
+                  </span>
+                </div>
+                {recentErrors.length > 0 && onClearAlerts && (
+                  <button
+                    type="button"
+                    onClick={onClearAlerts}
+                    className="inline-flex items-center gap-1 rounded-lg border border-[#D4AF37]/30 px-2.5 py-1 text-[11px] font-bold text-[#6E6552] hover:text-rose-600 cursor-pointer dark:text-[#D5CCB8]"
+                  >
+                    <Trash2 className="h-3 w-3" />
+                    <span>Clear Log</span>
+                  </button>
+                )}
+              </div>
+
+              {recentErrors.length === 0 ? (
+                <p className="text-xs text-emerald-700 dark:text-emerald-300 font-semibold">
+                  No recent Supabase, webhook, wallet, or routing errors detected.
+                </p>
+              ) : (
+                <div className="space-y-2 max-h-60 overflow-y-auto">
+                  {recentErrors.map((errItem) => (
+                    <div
+                      key={errItem.id}
+                      className="rounded-lg border border-rose-500/30 bg-rose-500/5 p-2.5 text-xs space-y-1"
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <span className="rounded bg-rose-500/20 px-1.5 py-0.5 font-mono text-[10px] font-bold uppercase text-rose-700 dark:text-rose-200">
+                            {errItem.source}
+                          </span>
+                          {errItem.code && (
+                            <span className="rounded bg-black/10 px-1.5 py-0.5 font-mono text-[10px] font-bold text-[#4F4736] dark:bg-white/10 dark:text-[#FAF6EC]">
+                              {errItem.code}
+                            </span>
+                          )}
+                        </div>
+                        <span className="font-mono text-[10px] text-[#6E6552] dark:text-[#A89F8C]">
+                          {formatRelativeTime(errItem.timestamp)}
+                        </span>
+                      </div>
+                      <p className="font-mono text-[11px] font-semibold text-rose-700 dark:text-rose-200 break-words">
+                        {errItem.message}
+                      </p>
+                      {errItem.detail && (
+                        <p className="font-mono text-[10px] text-[#6E6552] dark:text-[#A89F8C] break-all">
+                          {errItem.detail}
+                        </p>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
 
             {(diagnostics.dnsCheck || diagnostics.domainConnection) && (
@@ -810,6 +975,156 @@ export function AdminDiagnosticsTab({
         )}
       </section>
 
+      {/* Owner Transfer History (All Users) */}
+      <section className="rounded-2xl border border-[#D4AF37]/30 bg-white p-4 sm:p-5 space-y-3 dark:bg-[#14120D]">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <ArrowLeftRight className="h-4 w-4 text-[#D4AF37]" />
+            <h2 className="font-display text-sm sm:text-base font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
+              Transfer History ({transfers.length})
+            </h2>
+          </div>
+
+          {onRefreshTransfers && (
+            <button
+              type="button"
+              onClick={onRefreshTransfers}
+              disabled={transfersLoading}
+              className="inline-flex min-h-[34px] items-center gap-1.5 rounded-xl border border-[#D4AF37]/35 px-3 py-1 text-xs font-bold text-[#8A6208] hover:bg-[#D4AF37]/10 disabled:opacity-50 cursor-pointer dark:text-[#F5D77A]"
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${transfersLoading ? 'animate-spin' : ''}`} />
+              <span>{transfersLoading ? 'Loading...' : 'Refresh Transfers'}</span>
+            </button>
+          )}
+        </div>
+
+        <div className="relative">
+          <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[#8A7F6A]" />
+          <input
+            type="text"
+            value={transferSearch}
+            onChange={(e) => setTransferSearch(e.target.value)}
+            placeholder="Search by sender, recipient, email, reference, or details..."
+            className="h-10 w-full rounded-xl border border-[#D4AF37]/25 bg-[#FAF7F0] pl-9 pr-3 text-xs text-[#1A160D] placeholder:text-[#8A7F6A] focus:border-[#D4AF37] focus:outline-none dark:bg-[#0B0A07] dark:text-[#FAF6EC]"
+          />
+        </div>
+
+        <div className="flex flex-wrap items-center gap-1.5">
+          {(
+            [
+              { id: 'all', label: 'All' },
+              { id: 'p2p_transfer', label: 'P2P Transfers' },
+              { id: 'deposit', label: 'Deposits' },
+              { id: 'debit', label: 'Spends' },
+              { id: 'refund', label: 'Refunds' },
+              { id: 'issues', label: 'Pending / Failed' },
+            ] as const
+          ).map((chip) => (
+            <button
+              key={chip.id}
+              type="button"
+              onClick={() => setTransferFilter(chip.id)}
+              className={`rounded-lg px-2.5 py-1 text-[11px] font-bold transition-colors cursor-pointer ${
+                transferFilter === chip.id
+                  ? 'bg-[#D4AF37] text-[#0A0906]'
+                  : 'border border-[#D4AF37]/20 bg-[#FAF7F0] text-[#6E6552] hover:bg-[#D4AF37]/10 dark:bg-[#0B0A07] dark:text-[#D5CCB8]'
+              }`}
+            >
+              {chip.label}
+            </button>
+          ))}
+        </div>
+
+        {transfersError && (
+          <div className="rounded-xl border border-rose-500/40 bg-rose-500/10 p-3 font-mono text-[11px] text-rose-700 dark:text-rose-200 break-words">
+            {transfersError}
+          </div>
+        )}
+
+        {transfersLoading && transfers.length === 0 ? (
+          <div className="flex items-center gap-2 py-6 text-xs text-[#6E6552] dark:text-[#A89F8C]">
+            <Loader2 className="h-4 w-4 animate-spin text-[#D4AF37]" />
+            <span>Loading app-wide transfer history...</span>
+          </div>
+        ) : filteredTransfers.length === 0 ? (
+          <p className="rounded-xl border border-dashed border-[#D4AF37]/25 p-4 text-xs text-[#6E6552] dark:text-[#A89F8C]">
+            {transfers.length === 0
+              ? 'No transfers or wallet transactions recorded yet.'
+              : 'No transfers match the current search or filter.'}
+          </p>
+        ) : (
+          <div className="space-y-2.5 max-h-96 overflow-y-auto">
+            {filteredTransfers.map((tx) => {
+              const txTypeLabel =
+                tx.txType === 'p2p_transfer'
+                  ? 'P2P Transfer'
+                  : tx.txType === 'deposit'
+                    ? 'Deposit'
+                    : tx.txType === 'refund'
+                      ? 'Refund'
+                      : 'Spend';
+              const statusTone =
+                tx.status === 'failed' || tx.status === 'error'
+                  ? 'bg-rose-500/20 text-rose-700 dark:text-rose-300'
+                  : tx.status === 'pending'
+                    ? 'bg-amber-500/20 text-amber-800 dark:text-amber-300'
+                    : 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300';
+
+              return (
+                <div
+                  key={tx.reference}
+                  className="rounded-xl border border-[#D4AF37]/20 bg-[#FAF7F0] p-3 text-xs space-y-1.5 dark:bg-[#0B0A07]"
+                >
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <div className="flex flex-wrap items-center gap-1.5 min-w-0">
+                      <span className="rounded-md bg-[#D4AF37]/20 px-1.5 py-0.5 font-mono text-[10px] font-bold text-[#8A6208] dark:text-[#F5D77A]">
+                        {txTypeLabel}
+                      </span>
+                      <span
+                        className={`rounded-md px-1.5 py-0.5 font-mono text-[10px] font-bold uppercase ${statusTone}`}
+                      >
+                        {tx.status}
+                      </span>
+                      <span className="font-mono text-[10px] text-[#6E6552] dark:text-[#A89F8C]">
+                        {formatRelativeTime(tx.createdAt)}
+                      </span>
+                    </div>
+
+                    <p className="font-mono text-sm font-black tabular-nums text-[#1A160D] dark:text-[#F5D77A] shrink-0">
+                      ₦{tx.amount.toLocaleString()}
+                    </p>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 rounded-lg border border-[#D4AF37]/15 bg-white p-2 font-mono text-[11px] dark:bg-[#14120D]">
+                    <div className="min-w-0">
+                      <span className="text-[10px] font-bold uppercase text-[#8A7F6A] dark:text-[#A89F8C]">
+                        Sender:{' '}
+                      </span>
+                      <span className="font-bold text-[#1A160D] dark:text-[#FAF6EC] break-all">
+                        {tx.senderLabel}
+                      </span>
+                    </div>
+                    <div className="min-w-0">
+                      <span className="text-[10px] font-bold uppercase text-[#8A7F6A] dark:text-[#A89F8C]">
+                        Recipient:{' '}
+                      </span>
+                      <span className="font-bold text-[#1A160D] dark:text-[#FAF6EC] break-all">
+                        {tx.recipientLabel}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-[#6E6552] dark:text-[#A89F8C]">
+                    <span className="break-words">{tx.details}</span>
+                    <span className="font-mono text-[10px] break-all">Ref: {tx.reference}</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </section>
+
       {/* Registered Users Management (Verify, Restrict, Suspend, Ban) */}
       <section className="rounded-2xl border border-[#D4AF37]/30 bg-white p-4 sm:p-5 space-y-3 dark:bg-[#14120D]">
         <div className="flex flex-wrap items-center justify-between gap-2">
@@ -844,6 +1159,31 @@ export function AdminDiagnosticsTab({
           />
         </div>
 
+        <div className="flex flex-wrap items-center gap-1.5">
+          {(
+            [
+              { id: 'all', label: `All (${userCounts.all})` },
+              { id: 'verified', label: `Verified (${userCounts.verified})` },
+              { id: 'restricted', label: `Restricted (${userCounts.restricted})` },
+              { id: 'suspended', label: `Suspended (${userCounts.suspended})` },
+              { id: 'banned', label: `Banned (${userCounts.banned})` },
+            ] as const
+          ).map((chip) => (
+            <button
+              key={chip.id}
+              type="button"
+              onClick={() => setUserStatusFilter(chip.id)}
+              className={`rounded-lg px-2.5 py-1 text-[11px] font-bold transition-colors cursor-pointer ${
+                userStatusFilter === chip.id
+                  ? 'bg-[#D4AF37] text-[#0A0906]'
+                  : 'border border-[#D4AF37]/20 bg-[#FAF7F0] text-[#6E6552] hover:bg-[#D4AF37]/10 dark:bg-[#0B0A07] dark:text-[#D5CCB8]'
+              }`}
+            >
+              {chip.label}
+            </button>
+          ))}
+        </div>
+
         {usersError && (
           <div className="rounded-xl border border-rose-500/40 bg-rose-500/10 p-3 font-mono text-[11px] text-rose-700 dark:text-rose-200 break-words">
             {usersError}
@@ -863,6 +1203,7 @@ export function AdminDiagnosticsTab({
           <div className="space-y-2.5 max-h-96 overflow-y-auto">
             {users
               .filter((u) => {
+                if (userStatusFilter !== 'all' && u.status !== userStatusFilter) return false;
                 const q = userSearch.trim().toLowerCase();
                 if (!q) return true;
                 return (

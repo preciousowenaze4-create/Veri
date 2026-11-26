@@ -275,10 +275,59 @@ export interface AdminDomainConnectionCheck {
   error: string | null;
 }
 
+export interface AppErrorLogEntry {
+  id: string;
+  timestamp: string;
+  source: 'supabase' | 'webhook' | 'wallet' | 'routing' | 'app';
+  severity: 'error' | 'warning';
+  code: string | null;
+  message: string;
+  detail?: string | null;
+}
+
+export type TransferKind = 'p2p_transfer' | 'deposit' | 'debit' | 'refund';
+
+export interface WalletTransferRecord {
+  reference: string;
+  txType: TransferKind;
+  direction: 'sent' | 'received' | 'deposit' | 'debit' | 'refund';
+  amount: number;
+  status: string;
+  channel: string | null;
+  provider: string;
+  details: string;
+  senderLabel: string;
+  senderEmail: string | null;
+  recipientLabel: string;
+  recipientEmail: string | null;
+  counterpartyLabel: string;
+  createdAt: string;
+}
+
+export interface AdminTransferRecord {
+  reference: string;
+  txType: TransferKind;
+  amount: number;
+  status: string;
+  channel: string | null;
+  provider: string;
+  details: string;
+  senderUserId: string | null;
+  senderEmail: string | null;
+  senderName: string | null;
+  senderLabel: string;
+  recipientUserId: string | null;
+  recipientEmail: string | null;
+  recipientName: string | null;
+  recipientLabel: string;
+  createdAt: string;
+}
+
 export interface AdminDiagnosticsResponse {
   checkedAt: string;
   ownerEmail: string;
   publicWebhookUrl?: string;
+  supabaseProjectHost?: string | null;
   environment: {
     emailDomain: string;
     inboundSecretConfigured: boolean;
@@ -288,12 +337,15 @@ export interface AdminDiagnosticsResponse {
   dnsCheck?: AdminDnsCheck;
   domainConnection?: AdminDomainConnectionCheck;
   connectionErrors?: string[];
+  recentErrors?: AppErrorLogEntry[];
   timingSummary?: AdminTimingSummary;
   inboundTraffic24hCount?: number;
   probes: {
     mailboxes: AdminTableProbe;
     mailboxMessages: AdminTableProbe;
     inboundWebhookLogs?: AdminTableProbe;
+    wallets?: AdminTableProbe;
+    walletTransactions?: AdminTableProbe;
   };
   recentInboundAttempts: AdminInboundAttempt[];
   rawInboundLogs?: AdminInboundAttempt[];

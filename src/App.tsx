@@ -17,6 +17,7 @@ import type {
   AdminDiagnosticsResponse,
   AdminInboundTestResult,
   AdminManagedUser,
+  AdminTransferRecord,
   CopiedOtpRecord,
   EmailMessageDetail,
   EmailMessageSummary,
@@ -31,6 +32,7 @@ import type {
   TabId,
   TempEmailAccount,
   UserModerationAction,
+  WalletTransferRecord,
 } from './types';
 import { parseJsonResponse } from './utils/apiFetch';
 import { copyToClipboard } from './utils/clipboard';
@@ -221,6 +223,12 @@ export default function App() {
   const [adminUsersLoading, setAdminUsersLoading] = useState<boolean>(false);
   const [adminUsersError, setAdminUsersError] = useState<string | null>(null);
   const [moderatingUserId, setModeratingUserId] = useState<string | null>(null);
+  const [adminTransfers, setAdminTransfers] = useState<AdminTransferRecord[]>([]);
+  const [adminTransfersLoading, setAdminTransfersLoading] = useState<boolean>(false);
+  const [adminTransfersError, setAdminTransfersError] = useState<string | null>(null);
+  const [userTransfers, setUserTransfers] = useState<WalletTransferRecord[]>([]);
+  const [userTransfersLoading, setUserTransfersLoading] = useState<boolean>(false);
+  const [userTransfersError, setUserTransfersError] = useState<string | null>(null);
   const [domainErrorPopup, setDomainErrorPopup] = useState<{
     title: string;
     errors: string[];
@@ -657,6 +665,146 @@ export default function App() {
     [isOwnerAdmin, getAuthAccessToken, showToast]
   );
 
+  const fetchAdminTransfers = useCallback(async () => {
+    if (!isOwnerAdmin) return;
+    setAdminTransfersLoading(true);
+    setAdminTransfersError(null);
+    try {
+      const token = await getAuthAccessToken();
+      if (!token) {
+        throw new Error('HTTP 401: Missing active Supabase session token.');
+      }
+      const res = await fetch('/api/admin/transfers', {
+        cache: 'no-store',
+        headers: { Authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(9000),
+      });
+      const data = await parseJsonResponse<{
+        transfers?: AdminTransferRecord[];
+        error?: string;
+        probeError?: string | null;
+      }>(res);
+      if (!res.ok) {
+        throw new Error(
+          `HTTP ${res.status}: ${data.error || res.statusText || 'Failed to load transfer history'}`
+        );
+      }
+      setAdminTransfers(Array.isArray(data.transfers) ? data.transfers : []);
+      if (data.probeError) {
+        setAdminTransfersError(data.probeError);
+      }
+    } catch (err) {
+      setAdminTransfersError(
+        err instanceof Error ? err.message : 'Failed to load transfer history'
+      );
+    } finally {
+      setAdminTransfersLoading(false);
+    }
+  }, [isOwnerAdmin, getAuthAccessToken]);
+
+  const clearAdminAlerts = useCallback(async () => {
+    if (!isOwnerAdmin) return;
+    try {
+      const token = await getAuthAccessToken();
+      if (!token) return;
+      await fetch('/api/admin/diagnostics/clear-alerts', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      adminDiagnosticsInFlightRef.current = false;
+      await fetchAdminDiagnostics(true);
+      showToast('Error log cleared');
+    } catch {
+      // Non-blocking
+    }
+  }, [isOwnerAdmin, getAuthAccessToken, fetchAdminDiagnostics, showToast]);
+
+  const fetchUserTransfers = useCallback(async () => {
+    if (!authUser?.id) {
+      setUserTransfers([]);
+      setUserTransfersError(null);
+      return;
+    }
+    setUserTransfersLoading(true);
+    setUserTransfersError(null);
+    try {
+      const token = await getAuthAccessToken();
+      if (!token) {
+        throw new Error('Sign in required to view your transfer history.');
+      }
+      const res = await fetch('/api/wallet/transfers', {
+        cache: 'no-store',
+        headers: { Authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(9000),
+      });
+      const data = await parseJsonResponse<{
+        transfers?: WalletTransferRecord[];
+        error?: string;
+      }>(res);
+      if (!res.ok) {
+        throw new Error(data.error || `HTTP ${res.status}: Could not load transfers`);
+      }
+      setUserTransfers(Array.isArray(data.transfers) ? data.transfers : []);
+    } catch (err) {
+      setUserTransfersError(
+        err instanceof Error ? err.message : 'Failed to load your transfer history'
+      );
+    } finally {
+      setUserTransfersLoading(false);
+    }
+  }, [authUser?.id, getAuthAccessToken]);
+
+  const handleSendP2pTransfer = useCallback(
+    async (payload: {
+      recipientEmail: string;
+      amount: number;
+      note?: string;
+    }): Promise<{ ok: boolean; error?: string }> => {
+      try {
+        const token = await getAuthAccessToken();
+        if (!token) {
+          return { ok: false, error: 'Please sign in to send a Naira transfer.' };
+        }
+        const res = await fetch('/api/wallet/transfer', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(12000),
+        });
+        const data = await parseJsonResponse<{
+          ok?: boolean;
+          balance?: number;
+          transfer?: WalletTransferRecord;
+          error?: string;
+        }>(res);
+        if (!res.ok || !data.ok) {
+          return { ok: false, error: data.error || `Transfer failed (HTTP ${res.status})` };
+        }
+        if (typeof data.balance === 'number') {
+          setWalletBalance(data.balance);
+        }
+        if (data.transfer) {
+          setUserTransfers((prev) => [data.transfer!, ...prev]);
+        }
+        showToast(`Sent ₦${payload.amount.toLocaleString()} to ${payload.recipientEmail}`);
+        void fetchUserTransfers();
+        if (isOwnerAdmin) {
+          void fetchAdminTransfers();
+        }
+        return { ok: true };
+      } catch (err) {
+        return {
+          ok: false,
+          error: err instanceof Error ? err.message : 'Transfer failed',
+        };
+      }
+    },
+    [getAuthAccessToken, showToast, fetchUserTransfers, isOwnerAdmin, fetchAdminTransfers]
+  );
+
   // Auto-switch owner account (preciousddkid@gmail.com) to Owner Admin Diagnostics on sign-in,
   // and immediately lock out non-owner accounts if activeTab was ever 'admin'.
   useEffect(() => {
@@ -666,6 +814,7 @@ export default function App() {
         setActiveTab('admin');
         void fetchAdminDiagnostics(false);
         void fetchAdminUsers();
+        void fetchAdminTransfers();
       }
     } else {
       autoSwitchedAdminUserIdRef.current = null;
@@ -676,11 +825,13 @@ export default function App() {
       setAdminTestError(null);
       setAdminUsers([]);
       setAdminUsersError(null);
+      setAdminTransfers([]);
+      setAdminTransfersError(null);
       setDomainErrorPopup(null);
       setAdminRealtimeConnected(false);
       setActiveTab((prev) => (prev === 'admin' ? 'home' : prev));
     }
-  }, [isOwnerAdmin, authUser?.id, fetchAdminDiagnostics, fetchAdminUsers]);
+  }, [isOwnerAdmin, authUser?.id, fetchAdminDiagnostics, fetchAdminUsers, fetchAdminTransfers]);
 
   // Real-time Supabase Postgres subscription for owner admin: instant updates + immediate error pop-up on any event
   useEffect(() => {
@@ -717,6 +868,21 @@ export default function App() {
             void fetchAdminDiagnostics(true);
           }
         )
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'wallet_transactions' },
+          () => {
+            void fetchAdminTransfers();
+            void fetchAdminDiagnostics(true);
+          }
+        )
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'app_error_logs' },
+          () => {
+            void fetchAdminDiagnostics(true);
+          }
+        )
         .subscribe((status) => {
           if (!active) return;
           setAdminRealtimeConnected(status === 'SUBSCRIBED');
@@ -732,7 +898,7 @@ export default function App() {
       setAdminRealtimeConnected(false);
       cleanupChannel?.();
     };
-  }, [isOwnerAdmin, authUser?.id, fetchAdminDiagnostics]);
+  }, [isOwnerAdmin, authUser?.id, fetchAdminDiagnostics, fetchAdminTransfers]);
 
   // Real-time 4s silent polling while Owner Admin tab is active (plus instant resume refresh across tabs)
   useEffect(() => {
@@ -775,12 +941,16 @@ export default function App() {
     setEmailError(null);
     setAuthUser(null);
     setWalletBalance(0);
+    setUserTransfers([]);
+    setUserTransfersError(null);
     setAdminDiagnostics(null);
     setAdminError(null);
     setAdminTestResult(null);
     setAdminTestError(null);
     setAdminUsers([]);
     setAdminUsersError(null);
+    setAdminTransfers([]);
+    setAdminTransfersError(null);
     setDomainErrorPopup(null);
     setAdminRealtimeConnected(false);
     setActiveTab((prev) => (prev === 'admin' ? 'home' : prev));
@@ -925,13 +1095,16 @@ export default function App() {
     [walletUserId, showToast]
   );
 
-  // Sync wallet balance from server/Supabase + subscribe to Supabase Realtime updates when signed in
+  // Sync wallet balance & user's own transfer history from server/Supabase + subscribe to Supabase Realtime updates when signed in
   useEffect(() => {
     if (!authUser) {
+      setUserTransfers([]);
+      setUserTransfersError(null);
       return;
     }
 
     void syncServerWalletBalance();
+    void fetchUserTransfers();
 
     let active = true;
     let cleanupChannel: (() => void) | null = null;
@@ -961,6 +1134,7 @@ export default function App() {
                 return numeric;
               });
             }
+            void fetchUserTransfers();
           }
         )
         .subscribe();
@@ -974,7 +1148,7 @@ export default function App() {
       active = false;
       cleanupChannel?.();
     };
-  }, [authUser, walletUserId, syncServerWalletBalance, showToast]);
+  }, [authUser, walletUserId, syncServerWalletBalance, fetchUserTransfers, showToast]);
 
   // Automatically verify payment redirect / pending Paystack reference on mount & tab focus
   useEffect(() => {
@@ -2060,7 +2234,12 @@ export default function App() {
         onOpenDeposit={() =>
           requireAuth('Sign in to fund your Naira wallet', () => setDepositModalOpen(true))
         }
-        onOpenProfile={() => setActiveTab('profile')}
+        onOpenProfile={() => {
+          setActiveTab('profile');
+          if (authUser) {
+            void fetchUserTransfers();
+          }
+        }}
         onOpenAuth={() => openAuthModal()}
         onToggleAdmin={() => {
           if (!isOwnerAdmin) return;
@@ -2069,6 +2248,8 @@ export default function App() {
           } else {
             setActiveTab('admin');
             void fetchAdminDiagnostics();
+            void fetchAdminUsers();
+            void fetchAdminTransfers();
           }
         }}
       />
@@ -2093,7 +2274,12 @@ export default function App() {
             if (!isOwnerAdmin) return;
             setActiveTab('admin');
             void fetchAdminDiagnostics();
+            void fetchAdminUsers();
+            void fetchAdminTransfers();
             return;
+          }
+          if (tab === 'profile' && authUser) {
+            void fetchUserTransfers();
           }
           setActiveTab(tab);
         }}
@@ -2151,6 +2337,10 @@ export default function App() {
             setWalletBalance((prev) => prev + creditedAmount);
           }
           showToast(message);
+          void fetchUserTransfers();
+          if (isOwnerAdmin) {
+            void fetchAdminTransfers();
+          }
         }}
       />
 
@@ -2227,8 +2417,11 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => {
+                    if (!isOwnerAdmin) return;
                     setActiveTab('admin');
                     void fetchAdminDiagnostics(false);
+                    void fetchAdminUsers();
+                    void fetchAdminTransfers();
                   }}
                   className="inline-flex items-center gap-1.5 rounded-xl bg-rose-500 px-3.5 py-1.5 text-xs font-extrabold text-white hover:bg-rose-400 cursor-pointer"
                 >
@@ -2449,6 +2642,7 @@ export default function App() {
         {activeTab === 'profile' && (
           <ProfileTab
             isAuthenticated={isAuthenticated}
+            isOwnerAdmin={isOwnerAdmin}
             userEmail={authUser?.email ?? null}
             userName={
               (authUser?.user_metadata?.full_name as string | undefined) ||
@@ -2462,6 +2656,10 @@ export default function App() {
             otpHistory={otpHistory}
             autoRefresh={autoRefresh}
             isDark={isDark}
+            walletBalance={walletBalance}
+            transfers={userTransfers}
+            transfersLoading={userTransfersLoading}
+            transfersError={userTransfersError}
             onCreateEmail={() =>
               requireAuth('Sign in to create an email', () => setActiveTab('create'))
             }
@@ -2492,6 +2690,21 @@ export default function App() {
             onCopyText={(val, label) => void handleCopyText(val, label)}
             onOpenAuth={() => openAuthModal()}
             onSignOut={() => void handleSignOut()}
+            onRefreshTransfers={() => void fetchUserTransfers()}
+            onSendTransfer={handleSendP2pTransfer}
+            onOpenAdmin={
+              isOwnerAdmin
+                ? () => {
+                    setActiveTab('admin');
+                    void fetchAdminDiagnostics();
+                    void fetchAdminUsers();
+                    void fetchAdminTransfers();
+                  }
+                : undefined
+            }
+            onOpenDeposit={() =>
+              requireAuth('Sign in to fund your Naira wallet', () => setDepositModalOpen(true))
+            }
           />
         )}
 
@@ -2511,13 +2724,19 @@ export default function App() {
             usersLoading={adminUsersLoading}
             usersError={adminUsersError}
             moderatingUserId={moderatingUserId}
+            transfers={adminTransfers}
+            transfersLoading={adminTransfersLoading}
+            transfersError={adminTransfersError}
             onRefresh={() => {
               void fetchAdminDiagnostics(false);
               void fetchAdminUsers();
+              void fetchAdminTransfers();
             }}
             onTestInbound={(addr) => void handleTestInboundPipeline(addr)}
             onRefreshUsers={() => void fetchAdminUsers()}
             onModerateUser={(userId, action) => void handleModerateUser(userId, action)}
+            onRefreshTransfers={() => void fetchAdminTransfers()}
+            onClearAlerts={() => void clearAdminAlerts()}
             onSwitchToUserView={() => setActiveTab('home')}
           />
         )}
@@ -2533,7 +2752,11 @@ export default function App() {
             setActiveTab('admin');
             void fetchAdminDiagnostics();
             void fetchAdminUsers();
+            void fetchAdminTransfers();
             return;
+          }
+          if (tab === 'profile' && authUser) {
+            void fetchUserTransfers();
           }
           setActiveTab(tab);
         }}

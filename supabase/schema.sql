@@ -17,8 +17,31 @@ create table if not exists public.wallet_transactions (
   status text not null default 'success',
   channel text,
   provider text not null default 'paystack',
+  tx_type text not null default 'deposit',
+  sender_user_id text,
+  sender_email text,
+  recipient_user_id text,
+  recipient_email text,
+  details text,
   created_at timestamptz not null default now()
 );
+
+alter table public.wallet_transactions
+  add column if not exists tx_type text not null default 'deposit',
+  add column if not exists sender_user_id text,
+  add column if not exists sender_email text,
+  add column if not exists recipient_user_id text,
+  add column if not exists recipient_email text,
+  add column if not exists details text;
+
+create index if not exists idx_wallet_transactions_user_id
+  on public.wallet_transactions (user_id, created_at desc);
+create index if not exists idx_wallet_transactions_sender_user_id
+  on public.wallet_transactions (sender_user_id, created_at desc);
+create index if not exists idx_wallet_transactions_recipient_user_id
+  on public.wallet_transactions (recipient_user_id, created_at desc);
+create index if not exists idx_wallet_transactions_created_at
+  on public.wallet_transactions (created_at desc);
 
 create table if not exists public.mailboxes (
   address text primary key,
@@ -128,6 +151,19 @@ create table if not exists public.user_moderation (
   updated_at timestamptz not null default now()
 );
 
+create table if not exists public.app_error_logs (
+  id uuid primary key default gen_random_uuid(),
+  created_at timestamptz not null default now(),
+  source text not null default 'app',
+  severity text not null default 'error',
+  code text,
+  message text not null,
+  detail text
+);
+
+create index if not exists idx_app_error_logs_created_at
+  on public.app_error_logs (created_at desc);
+
 -- Enable Row Level Security (backend uses service role key for strict per-user isolation)
 alter table public.wallets enable row level security;
 alter table public.wallet_transactions enable row level security;
@@ -136,15 +172,35 @@ alter table public.created_email_registry enable row level security;
 alter table public.mailbox_messages enable row level security;
 alter table public.inbound_webhook_logs enable row level security;
 alter table public.user_moderation enable row level security;
+alter table public.app_error_logs enable row level security;
 
 do $$
 begin
-  if not exists (
-    select 1 from pg_policies where tablename = 'wallets' and policyname = 'Allow public read wallet by user_id'
-  ) then
-    create policy "Allow public read wallet by user_id"
-      on public.wallets for select using (true);
-  end if;
+  drop policy if exists "Allow public read wallet by user_id" on public.wallets;
+  drop policy if exists "Allow user read own wallet" on public.wallets;
+  create policy "Allow user read own wallet"
+    on public.wallets
+    for select
+    to authenticated
+    using (
+      user_id = auth.uid()::text
+      or lower(coalesce(auth.jwt() ->> 'email', '')) = 'preciousddkid@gmail.com'
+    );
+
+  drop policy if exists "Allow user read own wallet_transactions" on public.wallet_transactions;
+  create policy "Allow user read own wallet_transactions"
+    on public.wallet_transactions
+    for select
+    to authenticated
+    using (
+      user_id = auth.uid()::text
+      or sender_user_id = auth.uid()::text
+      or recipient_user_id = auth.uid()::text
+      or lower(coalesce(email, '')) = lower(coalesce(auth.jwt() ->> 'email', ''))
+      or lower(coalesce(sender_email, '')) = lower(coalesce(auth.jwt() ->> 'email', ''))
+      or lower(coalesce(recipient_email, '')) = lower(coalesce(auth.jwt() ->> 'email', ''))
+      or lower(coalesce(auth.jwt() ->> 'email', '')) = 'preciousddkid@gmail.com'
+    );
 
   if not exists (
     select 1 from pg_policies where tablename = 'mailboxes' and policyname = 'Allow owner read own mailboxes'
@@ -190,9 +246,23 @@ begin
       to authenticated
       using (lower(coalesce(auth.jwt() ->> 'email', '')) = 'preciousddkid@gmail.com');
   end if;
+
+  drop policy if exists "Allow owner admin read user_moderation" on public.user_moderation;
+  create policy "Allow owner admin read user_moderation"
+    on public.user_moderation
+    for select
+    to authenticated
+    using (lower(coalesce(auth.jwt() ->> 'email', '')) = 'preciousddkid@gmail.com');
+
+  drop policy if exists "Allow owner admin read app_error_logs" on public.app_error_logs;
+  create policy "Allow owner admin read app_error_logs"
+    on public.app_error_logs
+    for select
+    to authenticated
+    using (lower(coalesce(auth.jwt() ->> 'email', '')) = 'preciousddkid@gmail.com');
 end $$;
 
--- Enable Supabase Realtime on wallets, mailbox_messages, mailboxes, and inbound_webhook_logs
+-- Enable Supabase Realtime on wallets, wallet_transactions, mailbox_messages, mailboxes, and inbound_webhook_logs
 do $$
 begin
   if not exists (
@@ -200,6 +270,12 @@ begin
     where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'wallets'
   ) then
     alter publication supabase_realtime add table public.wallets;
+  end if;
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'wallet_transactions'
+  ) then
+    alter publication supabase_realtime add table public.wallet_transactions;
   end if;
   if not exists (
     select 1 from pg_publication_tables
@@ -218,5 +294,11 @@ begin
     where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'inbound_webhook_logs'
   ) then
     alter publication supabase_realtime add table public.inbound_webhook_logs;
+  end if;
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'app_error_logs'
+  ) then
+    alter publication supabase_realtime add table public.app_error_logs;
   end if;
 end $$;

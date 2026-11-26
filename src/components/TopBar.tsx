@@ -84,14 +84,14 @@ export function TopBar({
                     ? 'Switch to User Dashboard'
                     : 'Open Owner Admin Diagnostics'
                 }
-                className={`hidden sm:inline-flex min-h-[38px] items-center gap-1.5 rounded-xl border px-2.5 py-1.5 text-xs font-extrabold transition-colors cursor-pointer ${
+                className={`inline-flex min-h-[36px] sm:min-h-[38px] items-center gap-1 sm:gap-1.5 rounded-xl border px-2 sm:px-2.5 py-1.5 text-[11px] sm:text-xs font-extrabold transition-colors cursor-pointer ${
                   activeTab === 'admin'
                     ? 'border-[#D4AF37] bg-[#D4AF37] text-[#0A0906]'
                     : 'border-[#D4AF37]/45 bg-[#D4AF37]/15 text-[#8A6208] hover:bg-[#D4AF37]/25 dark:text-[#F5D77A]'
                 }`}
               >
                 <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
-                <span>{activeTab === 'admin' ? 'User View' : 'Admin'}</span>
+                <span>{activeTab === 'admin' ? 'User' : 'Admin'}</span>
               </button>
             )}
 

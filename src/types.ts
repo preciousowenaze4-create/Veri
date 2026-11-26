@@ -331,6 +331,8 @@ export interface AdminDiagnosticsResponse {
   environment: {
     emailDomain: string;
     inboundSecretConfigured: boolean;
+    resendApiKeyConfigured?: boolean;
+    resendWebhookSecretConfigured?: boolean;
     supabaseConfigured: boolean;
     supabaseServiceRoleConfigured: boolean;
   };

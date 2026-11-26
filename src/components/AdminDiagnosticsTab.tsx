@@ -358,7 +358,7 @@ export function AdminDiagnosticsTab({
               </div>
               <div className="rounded-xl border border-[#D4AF37]/20 bg-[#FAF7F0] p-2.5 dark:bg-[#0B0A07]">
                 <p className="text-[10px] font-bold text-[#6E6552] dark:text-[#A89F8C]">
-                  Inbound Secret
+                  Resend Inbound Keys
                 </p>
                 <p
                   className={`mt-0.5 text-xs font-extrabold ${
@@ -367,7 +367,13 @@ export function AdminDiagnosticsTab({
                       : 'text-amber-600 dark:text-amber-400'
                   }`}
                 >
-                  {env?.inboundSecretConfigured ? 'Configured' : 'Not Set'}
+                  {env?.inboundSecretConfigured
+                    ? 'API + Webhook Ready'
+                    : env?.resendApiKeyConfigured === false && env?.resendWebhookSecretConfigured !== false
+                      ? 'Missing API Key'
+                      : env?.resendWebhookSecretConfigured === false && env?.resendApiKeyConfigured !== false
+                        ? 'Missing Webhook Secret'
+                        : 'Not Set'}
                 </p>
               </div>
               <div className="rounded-xl border border-[#D4AF37]/20 bg-[#FAF7F0] p-2.5 dark:bg-[#0B0A07]">
@@ -582,7 +588,7 @@ export function AdminDiagnosticsTab({
                                 : 'text-rose-600 dark:text-rose-400'
                             }
                           >
-                            {diagnostics.dnsCheck.mxOk ? 'Cloudflare MX OK' : 'Missing MX'}
+                            {diagnostics.dnsCheck.mxOk ? 'Resend MX OK' : 'Missing MX'}
                           </span>
                         </p>
                         <p className="mt-0.5 font-mono text-[10px] text-[#1A160D] dark:text-[#FAF6EC] break-all">
@@ -640,7 +646,7 @@ export function AdminDiagnosticsTab({
           </h2>
         </div>
         <p className="text-xs text-[#6E6552] dark:text-[#A89F8C]">
-          Verifies <code className="font-mono">/api/email/inbound</code> secret authentication, live custom domain reachability, Supabase tables (<code className="font-mono">mailboxes</code>, <code className="font-mono">mailbox_messages</code>, <code className="font-mono">inbound_webhook_logs</code>), optional mailbox inbox reads, and DNS records without inserting any test email or fake OTP into any inbox.
+          Verifies <code className="font-mono">/api/email/inbound</code> Svix webhook signature enforcement (<code className="font-mono">RESEND_WEBHOOK_SECRET</code>), live <code className="font-mono">RESEND_API_KEY</code> receiving access, custom domain reachability, Supabase tables (<code className="font-mono">mailboxes</code>, <code className="font-mono">mailbox_messages</code>, <code className="font-mono">inbound_webhook_logs</code>), optional mailbox inbox reads, and DNS records without inserting any test email or fake OTP into any inbox.
         </p>
 
         <div className="flex flex-col sm:flex-row gap-2">
@@ -678,12 +684,14 @@ export function AdminDiagnosticsTab({
               <div className="flex flex-wrap items-center gap-2">
                 <span
                   className={`rounded-md px-2 py-0.5 font-mono font-bold ${
-                    testResult.ready === false || testResult.httpStatus < 200 || testResult.httpStatus >= 300
+                    testResult.ready === false ||
+                    (typeof testResult.ready !== 'boolean' &&
+                      (testResult.httpStatus < 200 || testResult.httpStatus >= 300))
                       ? 'bg-rose-500/15 text-rose-700 dark:text-rose-300'
                       : 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
                   }`}
                 >
-                  {testResult.ready === false ? 'NOT READY' : 'SYSTEM READY'} · HTTP {testResult.httpStatus || 'ERR'}
+                  {testResult.ready === false ? 'NOT READY' : 'SYSTEM READY'} · Svix Probe HTTP {testResult.httpStatus || 'ERR'}
                 </span>
                 <span className="font-mono text-[#6E6552] dark:text-[#A89F8C]">
                   {testResult.latencyMs}ms
@@ -920,7 +928,7 @@ export function AdminDiagnosticsTab({
               <span>No 24h Inbound Webhook Traffic Detected</span>
             </div>
             <p className="leading-relaxed">
-              No requests have reached <code className="font-mono">/api/email/inbound</code> from Cloudflare yet — check Cloudflare Email Routing -&gt; Catch-all / Routing Rules to make sure it sends to the <code className="font-mono">veribox-inbound</code> Worker.
+              No requests have reached <code className="font-mono">/api/email/inbound</code> from Resend yet — verify your Resend Receiving domain (<code className="font-mono">{emailDomain}</code>) and webhook endpoint (<code className="font-mono">email.received</code> → <code className="font-mono">https://{emailDomain}/api/email/inbound</code>).
             </p>
           </div>
         )}

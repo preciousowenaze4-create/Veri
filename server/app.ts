@@ -6,6 +6,7 @@ import vm from 'node:vm';
 import express from 'express';
 import { GoogleGenAI, Type, type GenerateContentResponse } from '@google/genai';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
+import { Resend } from 'resend';
 
 const USER_AGENT =
   'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36';
@@ -644,17 +645,23 @@ function getCustomEmailDomain(): string {
   return raw || 'veribox.name.ng';
 }
 
-function getInboundEmailSecret(): string {
-  const raw = (
-    process.env.INBOUND_EMAIL_SECRET ||
-    process.env.CLOUDFLARE_WEBHOOK_SECRET ||
-    process.env.EMAIL_WEBHOOK_SECRET ||
-    process.env.WEBHOOK_SECRET ||
-    ''
-  )
+function getResendApiKey(): string {
+  const raw = (process.env.RESEND_API_KEY || '')
     .trim()
     .replace(/^["'`]|["'`]$/g, '')
-    .replace(/^(INBOUND_EMAIL_SECRET|CLOUDFLARE_WEBHOOK_SECRET|EMAIL_WEBHOOK_SECRET|WEBHOOK_SECRET)\s*=\s*/i, '')
+    .replace(/^RESEND_API_KEY\s*=\s*/i, '')
+    .trim()
+    .replace(/^["'`]|["'`]$/g, '')
+    .trim();
+  if (!raw || raw.startsWith('MY_')) return '';
+  return raw;
+}
+
+function getResendWebhookSecret(): string {
+  const raw = (process.env.RESEND_WEBHOOK_SECRET || '')
+    .trim()
+    .replace(/^["'`]|["'`]$/g, '')
+    .replace(/^RESEND_WEBHOOK_SECRET\s*=\s*/i, '')
     .trim()
     .replace(/^["'`]|["'`]$/g, '')
     .trim();
@@ -702,135 +709,6 @@ function decodeMimeWord(input: string): string {
       return data;
     }
   });
-}
-
-function decodePartTransferEncoding(body: string, encodingHeader: string): string {
-  const enc = encodingHeader.toLowerCase().trim();
-  if (enc === 'base64') {
-    try {
-      return Buffer.from(body.replace(/\s+/g, ''), 'base64').toString('utf8');
-    } catch {
-      return body;
-    }
-  }
-  if (enc === 'quoted-printable') {
-    return decodeQuotedPrintable(body);
-  }
-  return body;
-}
-
-function splitMimeHeadersAndBody(rawSection: string): { headersRaw: string; bodyRaw: string } {
-  const normalized = rawSection.replace(/^(?:\r?\n)+/, '');
-  const crlfIdx = normalized.indexOf('\r\n\r\n');
-  const lfIdx = normalized.indexOf('\n\n');
-  if (crlfIdx !== -1 && (lfIdx === -1 || crlfIdx < lfIdx)) {
-    return {
-      headersRaw: normalized.slice(0, crlfIdx),
-      bodyRaw: normalized.slice(crlfIdx + 4),
-    };
-  }
-  if (lfIdx !== -1) {
-    return {
-      headersRaw: normalized.slice(0, lfIdx),
-      bodyRaw: normalized.slice(lfIdx + 2),
-    };
-  }
-  return { headersRaw: '', bodyRaw: rawSection };
-}
-
-function parseMimeSection(rawSection: string, depth = 0): { textParts: string[]; htmlParts: string[] } {
-  const textParts: string[] = [];
-  const htmlParts: string[] = [];
-  if (depth > 8) return { textParts, htmlParts };
-
-  const { headersRaw, bodyRaw } = splitMimeHeadersAndBody(rawSection);
-  const unfoldedHeaders = headersRaw.replace(/\r?\n[ \t]+/g, ' ');
-  const contentTypeMatch = /^Content-Type:\s*([^\r\n]+)/im.exec(unfoldedHeaders);
-  const encodingMatch = /^Content-Transfer-Encoding:\s*([^\r\n;]+)/im.exec(unfoldedHeaders);
-
-  const contentType = contentTypeMatch ? contentTypeMatch[1].trim() : '';
-  const transferEncoding = encodingMatch ? encodingMatch[1].trim() : '';
-  const boundaryMatch = /boundary=(?:"([^"]+)"|'([^']+)'|([^;\s]+))/i.exec(contentType);
-  const boundary = (boundaryMatch?.[1] || boundaryMatch?.[2] || boundaryMatch?.[3] || '').trim();
-
-  if (boundary) {
-    const escaped = boundary.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const boundaryLineRe = new RegExp(`(?:^|\\r?\\n)--${escaped}(--)?(?:[ \\t]*\\r?\\n|$)`, 'g');
-    const markers: Array<{ start: number; end: number; isClosing: boolean }> = [];
-    let m: RegExpExecArray | null;
-    while ((m = boundaryLineRe.exec(bodyRaw)) !== null) {
-      markers.push({
-        start: m.index,
-        end: m.index + m[0].length,
-        isClosing: Boolean(m[1]),
-      });
-      if (m[1]) break;
-    }
-
-    for (let i = 0; i < markers.length; i++) {
-      if (markers[i].isClosing) break;
-      const chunkStart = markers[i].end;
-      const chunkEnd = i + 1 < markers.length ? markers[i + 1].start : bodyRaw.length;
-      const chunk = bodyRaw.slice(chunkStart, chunkEnd).replace(/^\r?\n/, '').replace(/\r?\n$/, '');
-      if (!chunk) continue;
-      const sub = parseMimeSection(chunk, depth + 1);
-      textParts.push(...sub.textParts);
-      htmlParts.push(...sub.htmlParts);
-    }
-    return { textParts, htmlParts };
-  }
-
-  const decoded = decodePartTransferEncoding(bodyRaw, transferEncoding);
-  if (/text\/html/i.test(contentType)) {
-    htmlParts.push(decoded);
-  } else if (/text\/plain/i.test(contentType) || !contentType) {
-    textParts.push(decoded);
-  } else if (/^multipart\//i.test(contentType)) {
-    const sub = parseMimeSection(decoded, depth + 1);
-    textParts.push(...sub.textParts);
-    htmlParts.push(...sub.htmlParts);
-  }
-  return { textParts, htmlParts };
-}
-
-function parseInboundMimePayload(rawText: string, rawHtml: string): { plainText: string; html: string } {
-  let cleanText = rawText.length > 260000 ? rawText.slice(0, 260000) : rawText || '';
-  let cleanHtml = rawHtml.length > 260000 ? rawHtml.slice(0, 260000) : rawHtml || '';
-
-  const { headersRaw } = splitMimeHeadersAndBody(cleanText);
-  const unfoldedTopHeaders = headersRaw.replace(/\r?\n[ \t]+/g, ' ');
-  const hasTopContentType =
-    /(?:^|\r?\n)Content-Type:\s*(?:multipart|text|message)\//i.test(unfoldedTopHeaders);
-  const boundaryLineMatch = /(?:^|\r?\n)--([A-Za-z0-9'()+_,-./:=?]{4,})\r?\n(?:[\w-]+:\s*[^\r\n]+\r?\n)*Content-Type:/i.exec(
-    cleanText.slice(0, 65536)
-  );
-
-  if (hasTopContentType || boundaryLineMatch) {
-    if (hasTopContentType) {
-      const parsed = parseMimeSection(cleanText);
-      if (parsed.htmlParts.length > 0) cleanHtml = parsed.htmlParts.join('\n');
-      if (parsed.textParts.length > 0) cleanText = parsed.textParts.join('\n').trim();
-    } else if (boundaryLineMatch && boundaryLineMatch.index !== undefined) {
-      const boundary = boundaryLineMatch[1].trim();
-      const fromBoundary = cleanText.slice(boundaryLineMatch.index).replace(/^\r?\n/, '');
-      const synthetic = `Content-Type: multipart/mixed; boundary="${boundary}"\r\n\r\n${fromBoundary}`;
-      const parsed = parseMimeSection(synthetic);
-      if (parsed.htmlParts.length > 0) cleanHtml = parsed.htmlParts.join('\n');
-      if (parsed.textParts.length > 0) cleanText = parsed.textParts.join('\n').trim();
-    }
-  }
-
-  if (!cleanText && cleanHtml) {
-    cleanText = stripTags(cleanHtml);
-  } else if (cleanText && /<[a-z][\s\S]*>/i.test(cleanText) && !cleanHtml) {
-    cleanHtml = cleanText;
-    cleanText = stripTags(cleanText);
-  }
-
-  return {
-    plainText: cleanText.trim().slice(0, 40000),
-    html: cleanHtml.trim().slice(0, 140000),
-  };
 }
 
 function normalizeCustomEmailUsername(raw: string): string {
@@ -2375,6 +2253,9 @@ export function createApiApp() {
     }
   }
 
+  // Capture exact untouched raw body bytes for Resend (Svix) webhook signature verification
+  app.use('/api/email/inbound', express.raw({ limit: '5mb', type: '*/*' }));
+
   app.use(
     express.json({
       limit: '5mb',
@@ -2385,11 +2266,6 @@ export function createApiApp() {
     })
   );
   app.use(express.urlencoded({ extended: true, limit: '5mb' }));
-  app.use(
-    ['/api/email/inbound', '/api/email/inbound/:secret'],
-    express.text({ limit: '5mb', type: ['message/rfc822', 'text/*'] }),
-    express.raw({ limit: '5mb', type: 'application/octet-stream' })
-  );
   app.use(
     (
       err: unknown,
@@ -2405,12 +2281,6 @@ export function createApiApp() {
         };
         const code = errObj.status || errObj.statusCode || 400;
         if (req.path.startsWith('/api/email/inbound')) {
-          const rawBuf = (req as express.Request & { rawBody?: Buffer }).rawBody;
-          if (rawBuf && rawBuf.length > 0 && err instanceof SyntaxError) {
-            req.body = rawBuf.toString('utf8');
-            next();
-            return;
-          }
           const attemptId = `att_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`;
           const msg = `HTTP ${code}: ${errObj.message || 'Invalid webhook payload'}`;
           void recordInboundAttempt({
@@ -2426,7 +2296,7 @@ export function createApiApp() {
             supabaseStored: false,
             error: msg,
           }).finally(() => {
-            res.status(code).json({ error: msg });
+            res.status(code).json({ ok: false, error: msg });
           });
           return;
         }
@@ -2794,7 +2664,7 @@ export function createApiApp() {
     return (
       (
         process.env.MAILBOX_TOKEN_SECRET ||
-        process.env.INBOUND_EMAIL_SECRET ||
+        process.env.RESEND_WEBHOOK_SECRET ||
         process.env.SUPABASE_SERVICE_ROLE_KEY ||
         process.env.SUPABASE_SECRET_KEY ||
         ''
@@ -3929,187 +3799,53 @@ export function createApiApp() {
     const firstHeader = (val: string | string[] | undefined): string =>
       Array.isArray(val) ? String(val[0] || '') : String(val || '');
 
-    // 1. Validate x-inbound-secret immediately before any body normalization or DB work
-    const configuredSecret = getInboundEmailSecret();
-    if (configuredSecret) {
-      const provided = String(
-        req.params.secret ||
-          firstHeader(req.headers['x-inbound-secret']) ||
-          firstHeader(req.headers['x-webhook-secret']) ||
-          firstHeader(req.headers['x-veribox-secret']) ||
-          firstHeader(req.headers.authorization).replace(/^Bearer\s+/i, '') ||
-          req.query.secret ||
-          ''
-      ).trim();
+    const isReadinessProbe = firstHeader(req.headers['x-veribox-readiness-probe']) === '1';
 
-      if (!provided || !safeSecretsEqual(provided, configuredSecret)) {
-        const totalMs = Math.max(0, Math.round(performance.now() - reqPerfStart));
-        const adminDiagnosticDetail = !provided
-          ? `HTTP 401: Missing x-inbound-secret header (server has INBOUND_EMAIL_SECRET configured, length ${configuredSecret.length})`
-          : `HTTP 401: x-inbound-secret did not match INBOUND_EMAIL_SECRET (sent length ${provided.length}, expected length ${configuredSecret.length})`;
-        console.warn(`[VeriBox Inbound] Unauthorized webhook totalMs=${totalMs}`);
-        const logRes = await Promise.race([
-          recordInboundAttempt({
-            id: attemptId,
-            timestamp: receivedAtIso,
-            status: 'rejected_secret',
-            httpStatus: 401,
-            recipients: [],
-            rawToPreview: '',
-            fromAddress: '',
-            subject: '(Blocked before body parse)',
-            otpDetected: null,
-            supabaseStored: false,
-            error: adminDiagnosticDetail,
-            totalMs,
-            dbInsertMs: 0,
-            parseMs: totalMs,
-            matchedMailbox: false,
-            matchedMailboxId: null,
-            receivedAt: receivedAtIso,
-            storedAt: null,
-            deliveryGapMs: null,
-          }),
-          new Promise<RecordInboundLogResult>((r) =>
-            setTimeout(
-              () =>
-                r({
-                  logged: false,
-                  logId: null,
-                  logError: 'Webhook log insert timed out after 1500ms',
-                }),
-              1500
-            )
-          ),
-        ]);
-        res.status(401).json({
-          ok: false,
-          error: adminDiagnosticDetail,
-          receivedLength: provided.length,
-          expectedLength: configuredSecret.length,
-          webhookLogged: logRes.logged,
-          webhookLogId: logRes.logId,
-          webhookLogError: logRes.logError,
-        });
-        return;
-      }
-    }
-
-    // 2. Fast payload parsing, recipient normalization, and MIME/OTP extraction
-    let parsedBody: unknown = req.body;
-    if (Buffer.isBuffer(parsedBody)) {
-      parsedBody = parsedBody.toString('utf8');
-    }
-    if (typeof parsedBody === 'string') {
-      const trimmedStr = parsedBody.trim();
-      if (trimmedStr.startsWith('{') || trimmedStr.startsWith('[')) {
-        try {
-          parsedBody = JSON.parse(trimmedStr);
-        } catch {
-          parsedBody = { raw: parsedBody };
-        }
-      } else {
-        parsedBody = { raw: parsedBody };
-      }
-    }
-    const body = (parsedBody && typeof parsedBody === 'object' ? parsedBody : {}) as Record<
-      string,
-      unknown
-    >;
-    const payload =
-      body.data && typeof body.data === 'object' && !Array.isArray(body.data)
-        ? (body.data as Record<string, unknown>)
-        : body;
-
-    const envelopeObj =
-      payload.envelope && typeof payload.envelope === 'object'
-        ? (payload.envelope as Record<string, unknown>)
-        : undefined;
-    const headersObj =
-      payload.headers && typeof payload.headers === 'object'
-        ? (payload.headers as Record<string, unknown>)
-        : undefined;
-
-    const isReadinessProbe =
-      firstHeader(req.headers['x-veribox-readiness']) === '1' ||
-      payload.readinessCheck === true ||
-      body.readinessCheck === true ||
-      payload.dryRun === true ||
-      body.dryRun === true;
-
-    const rawMime =
-      typeof payload.raw === 'string' && payload.raw.trim()
-        ? payload.raw
-        : typeof payload.rawEmail === 'string' && payload.rawEmail.trim()
-          ? payload.rawEmail
+    // 1. Read untouched raw body and Svix headers for Resend webhook verification
+    const rawBuf = Buffer.isBuffer(req.body)
+      ? req.body
+      : Buffer.isBuffer((req as express.Request & { rawBody?: Buffer }).rawBody)
+        ? (req as express.Request & { rawBody?: Buffer }).rawBody!
+        : null;
+    const rawPayload = rawBuf
+      ? rawBuf.toString('utf8')
+      : typeof req.body === 'string'
+        ? req.body
+        : req.body && typeof req.body === 'object'
+          ? JSON.stringify(req.body)
           : '';
-    const { headersRaw: rawHeaderSection } = rawMime
-      ? splitMimeHeadersAndBody(rawMime.slice(0, 65536))
-      : { headersRaw: '' };
-    const rawHeaderBlock = rawHeaderSection.replace(/\r?\n[ \t]+/g, ' ');
-    const rawHeaderValue = (name: string): string => {
-      if (!rawHeaderBlock) return '';
-      const m = new RegExp(`^${name}:\\s*(.+)$`, 'im').exec(rawHeaderBlock);
-      return m ? m[1].trim() : '';
-    };
 
-    const candidateRecipients = [
-      payload.to,
-      payload.rcptTo,
-      payload.recipient,
-      payload.rcpt,
-      payload.envelopeTo,
-      payload.deliveredTo,
-      payload.originalRecipient,
-      envelopeObj?.to,
-      headersObj?.to,
-      payload.ToFull,
-      payload.To,
-      body.to,
-      body.rcptTo,
-      body.recipient,
-      rawHeaderValue('Delivered-To'),
-      rawHeaderValue('X-Original-To'),
-      rawHeaderValue('To'),
-    ];
+    const svixId = firstHeader(req.headers['svix-id']).trim();
+    const svixTimestamp = firstHeader(req.headers['svix-timestamp']).trim();
+    const svixSignature = firstHeader(req.headers['svix-signature']).trim();
+    const resendWebhookSecret = getResendWebhookSecret();
 
-    const allExtractedTos = extractTargetRecipients(candidateRecipients).map((addr) =>
-      addr.trim().toLowerCase()
-    );
-    const rawToPreview =
-      allExtractedTos.slice(0, 3).join(', ') ||
-      String(payload.to || '').trim().toLowerCase().slice(0, 120);
-    const rawRecipients = allExtractedTos.filter((addr) =>
-      addr.endsWith(`@${CUSTOM_EMAIL_DOMAIN}`)
-    );
-
-    if (rawRecipients.length === 0) {
+    if (!resendWebhookSecret || !svixId || !svixTimestamp || !svixSignature || !rawPayload) {
       const totalMs = Math.max(0, Math.round(performance.now() - reqPerfStart));
-      const msg = `No recipient matching @${CUSTOM_EMAIL_DOMAIN} found in payload (received to: ${rawToPreview || 'empty'})`;
-      console.warn(`[VeriBox Inbound] Dropped webhook totalMs=${totalMs}:`, msg);
+      const detail = !resendWebhookSecret
+        ? 'HTTP 400: RESEND_WEBHOOK_SECRET is not configured on backend server'
+        : !svixId || !svixTimestamp || !svixSignature
+          ? 'HTTP 400: Missing required Resend Svix headers (svix-id, svix-timestamp, svix-signature)'
+          : 'HTTP 400: Empty webhook payload body';
+
       if (isReadinessProbe) {
-        res.status(400).json({
-          ok: false,
-          mode: 'readiness',
-          ready: false,
-          error: msg,
-          totalMs,
-        });
+        res.status(400).json({ ok: false, error: detail, readinessProbeRejectedUnsigned: true });
         return;
       }
+
       const logRes = await Promise.race([
         recordInboundAttempt({
           id: attemptId,
           timestamp: receivedAtIso,
-          status: 'unmatched_recipient',
+          status: 'rejected_secret',
           httpStatus: 400,
           recipients: [],
-          rawToPreview,
-          fromAddress: String(payload.from || envelopeObj?.from || '').slice(0, 120),
-          subject: String(payload.subject || '(No subject)').slice(0, 150),
+          rawToPreview: '',
+          fromAddress: '',
+          subject: '(Missing Resend signature headers)',
           otpDetected: null,
           supabaseStored: false,
-          error: `HTTP 400: ${msg}`,
+          error: detail,
           totalMs,
           dbInsertMs: 0,
           parseMs: totalMs,
@@ -4131,6 +3867,223 @@ export function createApiApp() {
           )
         ),
       ]);
+      res.status(400).json({
+        ok: false,
+        error: detail,
+        webhookLogged: logRes.logged,
+        webhookLogId: logRes.logId,
+        webhookLogError: logRes.logError,
+      });
+      return;
+    }
+
+    const resendApiKey = getResendApiKey();
+    const resend = new Resend(resendApiKey || undefined);
+
+    let verifiedEvent: ReturnType<Resend['webhooks']['verify']>;
+    try {
+      verifiedEvent = resend.webhooks.verify({
+        payload: rawPayload,
+        headers: {
+          id: svixId,
+          timestamp: svixTimestamp,
+          signature: svixSignature,
+        },
+        webhookSecret: resendWebhookSecret,
+      });
+    } catch (err) {
+      const totalMs = Math.max(0, Math.round(performance.now() - reqPerfStart));
+      const errMsg = `HTTP 400: Invalid Resend webhook signature (${err instanceof Error ? err.message : 'verification failed'})`;
+      console.warn(`[VeriBox Inbound] Invalid Resend signature totalMs=${totalMs}:`, errMsg);
+      const logRes = await Promise.race([
+        recordInboundAttempt({
+          id: attemptId,
+          timestamp: receivedAtIso,
+          status: 'rejected_secret',
+          httpStatus: 400,
+          recipients: [],
+          rawToPreview: '',
+          fromAddress: '',
+          subject: '(Invalid Resend webhook signature)',
+          otpDetected: null,
+          supabaseStored: false,
+          error: errMsg,
+          totalMs,
+          dbInsertMs: 0,
+          parseMs: totalMs,
+          matchedMailbox: false,
+          matchedMailboxId: null,
+          receivedAt: receivedAtIso,
+          storedAt: null,
+          deliveryGapMs: null,
+        }),
+        new Promise<RecordInboundLogResult>((r) =>
+          setTimeout(
+            () =>
+              r({
+                logged: false,
+                logId: null,
+                logError: 'Webhook log insert timed out after 1500ms',
+              }),
+            1500
+          )
+        ),
+      ]);
+      res.status(400).json({
+        ok: false,
+        error: errMsg,
+        webhookLogged: logRes.logged,
+        webhookLogId: logRes.logId,
+        webhookLogError: logRes.logError,
+      });
+      return;
+    }
+
+    // Acknowledge non-inbound Resend webhook events cleanly with HTTP 200
+    if (verifiedEvent.type !== 'email.received') {
+      res.status(200).json({
+        ok: true,
+        ignored: true,
+        eventType: verifiedEvent.type,
+      });
+      return;
+    }
+
+    const eventData = verifiedEvent.data;
+    const eventRecipientsPreview = extractTargetRecipients([
+      eventData.to,
+      eventData.received_for,
+      eventData.bcc,
+      eventData.cc,
+    ])
+      .slice(0, 3)
+      .join(', ');
+
+    if (!resendApiKey) {
+      const totalMs = Math.max(0, Math.round(performance.now() - reqPerfStart));
+      const errMsg = 'HTTP 500: RESEND_API_KEY is missing on backend server (required for resend.emails.receiving.get)';
+      const logRes = await recordInboundAttempt({
+        id: attemptId,
+        timestamp: receivedAtIso,
+        status: 'db_error',
+        httpStatus: 500,
+        recipients: eventRecipientsPreview ? [eventRecipientsPreview] : [],
+        rawToPreview: eventRecipientsPreview,
+        fromAddress: String(eventData.from || '').slice(0, 120),
+        subject: String(eventData.subject || '(No subject)').slice(0, 150),
+        otpDetected: null,
+        supabaseStored: false,
+        error: errMsg,
+        totalMs,
+        dbInsertMs: 0,
+        parseMs: totalMs,
+        matchedMailbox: false,
+        matchedMailboxId: null,
+        receivedAt: eventData.created_at || receivedAtIso,
+        storedAt: null,
+        deliveryGapMs: null,
+      });
+      res.status(500).json({
+        ok: false,
+        error: errMsg,
+        webhookLogged: logRes.logged,
+        webhookLogId: logRes.logId,
+        webhookLogError: logRes.logError,
+      });
+      return;
+    }
+
+    // 2. Fetch full email body (HTML + plain text) from Resend Receiving API using event.data.email_id
+    const { data: receivedEmail, error: resendFetchError } = await resend.emails.receiving.get(
+      eventData.email_id
+    );
+
+    if (resendFetchError || !receivedEmail) {
+      const totalMs = Math.max(0, Math.round(performance.now() - reqPerfStart));
+      const errMsg = `Resend emails.receiving.get(${eventData.email_id}) failed: ${resendFetchError?.message || 'Empty response'}`;
+      const logRes = await recordInboundAttempt({
+        id: attemptId,
+        timestamp: receivedAtIso,
+        status: 'invalid_payload',
+        httpStatus: 502,
+        recipients: eventRecipientsPreview ? [eventRecipientsPreview] : [],
+        rawToPreview: eventRecipientsPreview,
+        fromAddress: String(eventData.from || '').slice(0, 120),
+        subject: String(eventData.subject || '(No subject)').slice(0, 150),
+        otpDetected: null,
+        supabaseStored: false,
+        error: errMsg,
+        totalMs,
+        dbInsertMs: 0,
+        parseMs: totalMs,
+        matchedMailbox: false,
+        matchedMailboxId: null,
+        receivedAt: eventData.created_at || receivedAtIso,
+        storedAt: null,
+        deliveryGapMs: null,
+      });
+      res.status(502).json({
+        ok: false,
+        error: errMsg,
+        webhookLogged: logRes.logged,
+        webhookLogId: logRes.logId,
+        webhookLogError: logRes.logError,
+      });
+      return;
+    }
+
+    // 3. Extract recipient @veribox.name.ng address(es), sender, subject, HTML/text body, and OTP
+    const headersObj =
+      receivedEmail.headers && typeof receivedEmail.headers === 'object'
+        ? receivedEmail.headers
+        : undefined;
+    const candidateRecipients = [
+      receivedEmail.to,
+      receivedEmail.received_for,
+      eventData.to,
+      eventData.received_for,
+      receivedEmail.bcc,
+      receivedEmail.cc,
+      eventData.bcc,
+      eventData.cc,
+      headersObj?.['delivered-to'],
+      headersObj?.['x-original-to'],
+      headersObj?.to,
+    ];
+
+    const allExtractedTos = extractTargetRecipients(candidateRecipients).map((addr) =>
+      addr.trim().toLowerCase()
+    );
+    const rawToPreview = allExtractedTos.slice(0, 3).join(', ') || eventRecipientsPreview;
+    const rawRecipients = allExtractedTos.filter((addr) =>
+      addr.endsWith(`@${CUSTOM_EMAIL_DOMAIN}`)
+    );
+
+    if (rawRecipients.length === 0) {
+      const totalMs = Math.max(0, Math.round(performance.now() - reqPerfStart));
+      const msg = `No recipient matching @${CUSTOM_EMAIL_DOMAIN} found in Resend payload (received to: ${rawToPreview || 'empty'})`;
+      console.warn(`[VeriBox Inbound] Dropped Resend email totalMs=${totalMs}:`, msg);
+      const logRes = await recordInboundAttempt({
+        id: attemptId,
+        timestamp: receivedAtIso,
+        status: 'unmatched_recipient',
+        httpStatus: 400,
+        recipients: [],
+        rawToPreview,
+        fromAddress: String(receivedEmail.from || eventData.from || '').slice(0, 120),
+        subject: String(receivedEmail.subject || eventData.subject || '(No subject)').slice(0, 150),
+        otpDetected: null,
+        supabaseStored: false,
+        error: `HTTP 400: ${msg}`,
+        totalMs,
+        dbInsertMs: 0,
+        parseMs: totalMs,
+        matchedMailbox: false,
+        matchedMailboxId: null,
+        receivedAt: receivedEmail.created_at || eventData.created_at || receivedAtIso,
+        storedAt: null,
+        deliveryGapMs: null,
+      });
       res.status(400).json({
         ok: false,
         error: msg,
@@ -4167,146 +4120,47 @@ export function createApiApp() {
 
     const sb = getSupabaseServerClient();
     const primaryRecipient = recipients[0];
-    let mailboxLookupError: string | null = null;
-    const lookupMatchedMailbox = async (): Promise<{ id: string; address: string } | null> => {
+    let matchedMailboxId: string | null = null;
+    const lookupMatchedMailbox = async (): Promise<string | null> => {
       for (const rec of recipients) {
         const mem = mailboxRegistry.get(rec);
-        if (mem) return { id: mem.id, address: mem.address };
+        if (mem) return mem.id;
       }
       if (!sb) return null;
       try {
-        const { data, error } = await sb
+        const { data } = await sb
           .from('mailboxes')
-          .select('id, address')
+          .select('id')
           .ilike('address', escapeIlikePattern(primaryRecipient))
           .limit(1)
           .maybeSingle();
-        if (error) {
-          mailboxLookupError = `${error.code || 'MAILBOX_ERR'}: ${error.message}`;
-          return null;
-        }
-        if (data?.id) {
-          return {
-            id: String(data.id),
-            address: String(data.address || primaryRecipient).trim().toLowerCase(),
-          };
-        }
-        return null;
-      } catch (err) {
-        mailboxLookupError = err instanceof Error ? err.message : 'Mailbox lookup exception';
+        return data?.id ? String(data.id) : null;
+      } catch {
         return null;
       }
     };
 
-    const matchedMailboxRow = await lookupMatchedMailbox();
-    const matchedMailboxId = matchedMailboxRow?.id ?? null;
+    matchedMailboxId = await lookupMatchedMailbox();
     const matchedMailbox = Boolean(matchedMailboxId);
 
-    // Non-polluting readiness verification: verifies auth, payload parsing, recipient routing & DB lookup without saving any email
-    if (isReadinessProbe) {
-      const totalMs = Math.max(0, Math.round(performance.now() - reqPerfStart));
-      res.status(200).json({
-        ok: true,
-        mode: 'readiness',
-        ready: Boolean(sb) && !mailboxLookupError,
-        secretVerified: true,
-        inboundSecretConfigured: Boolean(configuredSecret),
-        domain: CUSTOM_EMAIL_DOMAIN,
-        recipient: primaryRecipient,
-        recipients,
-        matchedMailbox,
-        matchedMailboxId,
-        supabaseConfigured: Boolean(sb),
-        mailboxLookupError,
-        totalMs,
-      });
-      return;
-    }
-
-    const extractSenderString = (...candidates: unknown[]): string => {
-      for (const c of candidates) {
-        if (!c) continue;
-        if (typeof c === 'string' && c.trim()) return c.trim();
-        if (typeof c === 'object' && !Array.isArray(c)) {
-          const obj = c as { name?: unknown; address?: unknown; email?: unknown };
-          const addr =
-            typeof obj.address === 'string'
-              ? obj.address.trim()
-              : typeof obj.email === 'string'
-                ? obj.email.trim()
-                : '';
-          const nm = typeof obj.name === 'string' ? obj.name.trim() : '';
-          if (addr && nm) return `${nm} <${addr}>`;
-          if (addr) return addr;
-        }
-      }
-      return `sender@${CUSTOM_EMAIL_DOMAIN}`;
-    };
-
-    const rawFrom = decodeMimeWord(
-      extractSenderString(
-        payload.from,
-        payload.sender,
-        envelopeObj?.from,
-        headersObj?.from,
-        payload.From,
-        payload.FromFull,
-        rawHeaderValue('From')
-      )
-    );
+    const rawFrom = decodeMimeWord(String(receivedEmail.from || eventData.from || `sender@${CUSTOM_EMAIL_DOMAIN}`));
     const parsedFrom = extractAddressFromHeader(rawFrom);
-    const fromName = decodeMimeWord(
-      typeof payload.fromName === 'string' && payload.fromName.trim()
-        ? payload.fromName.trim()
-        : parsedFrom.name
-    );
+    const fromName = parsedFrom.name;
     const subject = decodeMimeWord(
-      String(
-        payload.subject ||
-          headersObj?.subject ||
-          payload.Subject ||
-          rawHeaderValue('Subject') ||
-          '(No subject)'
-      )
+      String(receivedEmail.subject || eventData.subject || '(No subject)')
     ).slice(0, 300);
 
-    const rawHtml = String(
-      payload.html ||
-        payload['body-html'] ||
-        payload['stripped-html'] ||
-        payload.HtmlBody ||
-        ''
-    );
-    let rawText = String(
-      payload.text ||
-        payload['body-plain'] ||
-        payload['stripped-text'] ||
-        payload.TextBody ||
-        ''
-    );
-    if (!rawText && !rawHtml && rawMime) {
-      rawText = rawMime;
-    }
+    const html = String(receivedEmail.html || '').trim().slice(0, 140000);
+    const plainTextRaw = String(receivedEmail.text || '').trim();
+    const plainText = (plainTextRaw || (html ? stripTags(html) : '')).trim().slice(0, 40000);
 
-    const { plainText, html } = parseInboundMimePayload(rawText, rawHtml);
-    // Extract OTP from subject + plain text first; only strip HTML if still missing
-    let otp =
-      typeof payload.otp === 'string' && /^\d{4,8}$/.test(payload.otp.trim())
-        ? payload.otp.trim()
-        : extractOtpCode(`${subject}\n${plainText.slice(0, 16000)}`);
+    // Extract OTP from subject + plain text first; fallback to stripped HTML
+    let otp = extractOtpCode(`${subject}\n${plainText.slice(0, 16000)}`);
     if (!otp && html) {
       otp = extractOtpCode(stripTags(html));
     }
 
-    // Track upstream receivedAt when provided by Cloudflare Worker, otherwise fallback to webhook entry time
-    const upstreamRawTime =
-      typeof payload.receivedAt === 'string'
-        ? payload.receivedAt
-        : typeof payload.workerStartedAt === 'string'
-          ? payload.workerStartedAt
-          : typeof payload.date === 'string'
-            ? payload.date
-            : '';
+    const upstreamRawTime = String(receivedEmail.created_at || eventData.created_at || '');
     const upstreamMs = upstreamRawTime ? Date.parse(upstreamRawTime) : NaN;
     const effectiveReceivedAt =
       Number.isFinite(upstreamMs) && upstreamMs <= Date.now() + 60000
@@ -4362,17 +4216,12 @@ export function createApiApp() {
       Date.parse(storedAtIso) - Date.parse(effectiveReceivedAt)
     );
 
-    console.log(
-      `[VeriBox Inbound] totalMs=${totalMs} dbInsertMs=${dbInsertMs} parseMs=${parseMs} matchedMailboxId=${matchedMailboxId || 'none'} otp=${otp || 'none'} deliveryGapMs=${deliveryGapMs} recipients=${recipients.join(',')}`
-    );
-
     const logNote = firstDbError
       ? firstDbError
       : !matchedMailboxId
         ? `No matching row in mailboxes for ${primaryRecipient} (saved to inbox & webhook logs)`
         : null;
 
-    // Commit inbound_webhook_logs before sending HTTP response so Vercel serverless never drops the log write
     const logRes = await Promise.race([
       recordInboundAttempt({
         id: attemptId,
@@ -4426,6 +4275,7 @@ export function createApiApp() {
     res.status(200).json({
       ok: true,
       received: true,
+      emailId: eventData.email_id,
       savedMessageId: storedIds[0] || null,
       matchedMailboxId,
       recipient: primaryRecipient,
@@ -4450,10 +4300,6 @@ export function createApiApp() {
   }
 
   app.post('/api/email/inbound', (req, res) => {
-    void handleInboundEmailWebhook(req, res);
-  });
-
-  app.post('/api/email/inbound/:secret', (req, res) => {
     void handleInboundEmailWebhook(req, res);
   });
 
@@ -4738,7 +4584,9 @@ export function createApiApp() {
 
       const spfRecord = txtRecords.find((t) => /v=spf1/i.test(t)) || null;
       const dmarcRecord = dmarcRecords.find((t) => /v=DMARC1/i.test(t)) || null;
-      const mxOk = mxRecords.some((m) => /mx\.cloudflare\.net/i.test(m)) || mxRecords.length > 0;
+      const mxOk =
+        mxRecords.some((m) => /inbound-smtp|amazonaws\.com|resend/i.test(m)) ||
+        mxRecords.length > 0;
       return {
         checkedAt,
         domain,
@@ -4849,7 +4697,9 @@ export function createApiApp() {
     const sb = verified.supabase;
     const forceProbe = req.query.force === '1' || req.query.force === 'true';
 
-    const inboundSecretConfigured = Boolean(getInboundEmailSecret());
+    const resendApiKeyConfigured = Boolean(getResendApiKey());
+    const resendWebhookSecretConfigured = Boolean(getResendWebhookSecret());
+    const inboundSecretConfigured = resendApiKeyConfigured && resendWebhookSecretConfigured;
     const sbConfig = getSupabaseServerConfig();
     const supabaseConfigured = Boolean(sbConfig.url);
     let supabaseProjectHost: string | null = null;
@@ -5141,7 +4991,7 @@ export function createApiApp() {
       pushLiveError({ source: 'routing', severity: 'error', code: 'DNS_ERR', message: msg, detail: null });
     } else {
       if (!dnsCheck.mxOk) {
-        const msg = `Missing Cloudflare MX records for ${CUSTOM_EMAIL_DOMAIN}`;
+        const msg = `Missing Resend Inbound MX records for ${CUSTOM_EMAIL_DOMAIN}`;
         connectionErrors.push(msg);
         pushLiveError({ source: 'routing', severity: 'warning', code: 'MX_MISSING', message: msg, detail: null });
       }
@@ -5151,8 +5001,13 @@ export function createApiApp() {
         pushLiveError({ source: 'routing', severity: 'warning', code: 'SPF_MISSING', message: msg, detail: null });
       }
     }
-    if (!inboundSecretConfigured) {
-      const msg = 'INBOUND_EMAIL_SECRET is not configured on backend server';
+    if (!resendApiKeyConfigured) {
+      const msg = 'RESEND_API_KEY is not configured on backend server';
+      connectionErrors.push(msg);
+      pushLiveError({ source: 'app', severity: 'warning', code: 'ENV_MISSING', message: msg, detail: null });
+    }
+    if (!resendWebhookSecretConfigured) {
+      const msg = 'RESEND_WEBHOOK_SECRET is not configured on backend server';
       connectionErrors.push(msg);
       pushLiveError({ source: 'app', severity: 'warning', code: 'ENV_MISSING', message: msg, detail: null });
     }
@@ -5301,6 +5156,8 @@ export function createApiApp() {
       environment: {
         emailDomain: CUSTOM_EMAIL_DOMAIN,
         inboundSecretConfigured,
+        resendApiKeyConfigured,
+        resendWebhookSecretConfigured,
         supabaseConfigured,
         supabaseServiceRoleConfigured: serviceRoleConfigured,
       },
@@ -5664,7 +5521,8 @@ export function createApiApp() {
     const endpointUrl = `${origin}/api/email/inbound`;
 
     const startedAt = Date.now();
-    const secret = getInboundEmailSecret();
+    const resendApiKey = getResendApiKey();
+    const resendWebhookSecret = getResendWebhookSecret();
     const sbConfig = getSupabaseServerConfig();
     const serviceRoleConfigured = Boolean(
       (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY || '').trim()
@@ -5696,48 +5554,11 @@ export function createApiApp() {
               : `HTTP ${healthRes.status} from ${prodDomainUrl}/api/email/domains`,
           };
         }
-        // Also probe the live custom-domain inbound endpoint in readiness mode when running off-domain
-        if (origin !== prodDomainUrl) {
-          const prodInboundRes = await fetch(`${prodDomainUrl}/api/email/inbound`, {
-            method: 'POST',
-            headers: {
-              'content-type': 'application/json',
-              'x-veribox-readiness': '1',
-              ...(secret ? { 'x-inbound-secret': secret } : {}),
-            },
-            body: JSON.stringify({
-              to: targetAddress,
-              readinessCheck: true,
-            }),
-            signal: AbortSignal.timeout(3500),
-          });
-          const prodInboundJson = (await prodInboundRes.json().catch(() => null)) as {
-            ok?: boolean;
-            error?: string;
-          } | null;
-          if (!prodInboundRes.ok || !prodInboundJson?.ok) {
-            return {
-              url: `${prodDomainUrl}/api/email/inbound`,
-              httpStatus: prodInboundRes.status,
-              reachable: false,
-              detail:
-                prodInboundJson?.error ||
-                `Live inbound webhook returned HTTP ${prodInboundRes.status}`,
-            };
-          }
-          return {
-            url: `${prodDomainUrl}/api/email/inbound`,
-            httpStatus: prodInboundRes.status,
-            reachable: true,
-            detail: 'Live domain & inbound webhook secret verified ready',
-          };
-        }
-
         return {
           url: `${prodDomainUrl}/api/email/domains`,
           httpStatus: healthRes.status,
           reachable: true,
-          detail: 'Live custom domain API reachable',
+          detail: 'Live custom domain API & Resend webhook host reachable',
         };
       } catch (err) {
         return {
@@ -5749,22 +5570,20 @@ export function createApiApp() {
       }
     })();
 
-    // Non-polluting readiness call to /api/email/inbound (does NOT insert into mailbox_messages or create any fake OTP)
+    // 1. Verify /api/email/inbound rejects unsigned requests with HTTP 400 (confirming Svix signature enforcement)
+    let signatureEnforcementOk = false;
     try {
       const webhookRes = await fetch(endpointUrl, {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
-          'x-veribox-readiness': '1',
-          ...(secret ? { 'x-inbound-secret': secret } : {}),
+          'x-veribox-readiness-probe': '1',
         },
-        body: JSON.stringify({
-          to: targetAddress,
-          readinessCheck: true,
-        }),
-        signal: AbortSignal.timeout(4500),
+        body: JSON.stringify({ type: 'email.received', readinessCheck: true }),
+        signal: AbortSignal.timeout(4000),
       });
       httpStatus = webhookRes.status;
+      signatureEnforcementOk = webhookRes.status === 400;
       const rawRespText = await webhookRes.text();
       try {
         responseBody = JSON.parse(rawRespText);
@@ -5772,26 +5591,36 @@ export function createApiApp() {
         responseBody = { raw: rawRespText.slice(0, 500) };
       }
     } catch (err) {
-      fetchError = err instanceof Error ? err.message : 'HTTP POST readiness check to /api/email/inbound failed';
+      fetchError =
+        err instanceof Error ? err.message : 'HTTP POST check to /api/email/inbound failed';
       responseBody = { error: fetchError };
     }
 
-    const parsedResp = (responseBody && typeof responseBody === 'object'
-      ? responseBody
-      : {}) as {
-      ok?: boolean;
-      ready?: boolean;
-      secretVerified?: boolean;
-      matchedMailbox?: boolean;
-      matchedMailboxId?: string | null;
-      mailboxLookupError?: string | null;
-      error?: string;
-    };
+    // 2. Verify live Resend API key via resend.emails.receiving.list({ limit: 1 })
+    let resendApiOk = false;
+    let resendApiError: string | null = null;
+    if (!resendApiKey) {
+      resendApiError = 'RESEND_API_KEY is not configured on server';
+    } else {
+      try {
+        const resendClient = new Resend(resendApiKey);
+        const listRes = await resendClient.emails.receiving.list({ limit: 1 });
+        if (listRes.error) {
+          resendApiError = `Resend API error: ${listRes.error.message}`;
+        } else {
+          resendApiOk = true;
+        }
+      } catch (err) {
+        resendApiError = err instanceof Error ? err.message : 'Resend API request failed';
+      }
+    }
 
-    const webhookReadyOk = Boolean(httpStatus >= 200 && httpStatus < 300 && parsedResp.ok);
-    const webhookError = !webhookReadyOk
-      ? parsedResp.error || fetchError || `HTTP ${httpStatus || 'ERR'} from ${endpointUrl}`
-      : parsedResp.mailboxLookupError || null;
+    const webhookReadyOk = Boolean(resendWebhookSecret) && signatureEnforcementOk;
+    const webhookError = !resendWebhookSecret
+      ? 'RESEND_WEBHOOK_SECRET is not configured on server'
+      : !signatureEnforcementOk
+        ? fetchError || `Expected HTTP 400 rejecting unsigned webhook at ${endpointUrl}, got HTTP ${httpStatus || 'ERR'}`
+        : null;
 
     // Verify Supabase tables & required columns directly (read-only schema verification — zero synthetic rows written)
     let mailboxesReady = false;
@@ -5873,25 +5702,38 @@ export function createApiApp() {
     const checks = [
       {
         key: 'env_secret',
-        label: 'Env & Inbound Secret',
-        ok: Boolean(secret) && Boolean(sbConfig.url) && serviceRoleConfigured,
-        detail: !secret
-          ? 'INBOUND_EMAIL_SECRET is not set on server'
-          : !serviceRoleConfigured
-            ? 'SUPABASE_SERVICE_ROLE_KEY is not set on server'
-            : `INBOUND_EMAIL_SECRET & Supabase Service Role configured (@${CUSTOM_EMAIL_DOMAIN})`,
-        error: !secret
-          ? 'INBOUND_EMAIL_SECRET missing'
-          : !serviceRoleConfigured
-            ? 'SUPABASE_SERVICE_ROLE_KEY missing'
-            : null,
+        label: 'Resend Keys & Supabase',
+        ok: Boolean(resendApiKey) && Boolean(resendWebhookSecret) && Boolean(sbConfig.url) && serviceRoleConfigured,
+        detail: !resendApiKey
+          ? 'RESEND_API_KEY is not set on server'
+          : !resendWebhookSecret
+            ? 'RESEND_WEBHOOK_SECRET is not set on server'
+            : !serviceRoleConfigured
+              ? 'SUPABASE_SERVICE_ROLE_KEY is not set on server'
+              : `RESEND_API_KEY, RESEND_WEBHOOK_SECRET & Supabase configured (@${CUSTOM_EMAIL_DOMAIN})`,
+        error: !resendApiKey
+          ? 'RESEND_API_KEY missing'
+          : !resendWebhookSecret
+            ? 'RESEND_WEBHOOK_SECRET missing'
+            : !serviceRoleConfigured
+              ? 'SUPABASE_SERVICE_ROLE_KEY missing'
+              : null,
+      },
+      {
+        key: 'resend_api',
+        label: 'Resend Receiving API',
+        ok: resendApiOk,
+        detail: resendApiOk
+          ? 'RESEND_API_KEY verified against resend.emails.receiving.list'
+          : resendApiError || 'Resend API verification failed',
+        error: resendApiError,
       },
       {
         key: 'webhook_readiness',
-        label: 'Webhook Auth & Parser',
+        label: 'Webhook Svix Verification',
         ok: webhookReadyOk,
         detail: webhookReadyOk
-          ? `HTTP ${httpStatus} · Auth, MIME parser & recipient router ready`
+          ? `HTTP ${httpStatus} · Svix signature check active on /api/email/inbound`
           : webhookError || `HTTP ${httpStatus || 'ERR'}`,
         error: webhookError,
       },
@@ -5943,8 +5785,10 @@ export function createApiApp() {
     ];
 
     const ready =
-      Boolean(secret) &&
+      Boolean(resendApiKey) &&
+      Boolean(resendWebhookSecret) &&
       serviceRoleConfigured &&
+      resendApiOk &&
       webhookReadyOk &&
       mailboxesReady &&
       messagesReady &&

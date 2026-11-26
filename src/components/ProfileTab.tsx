@@ -1591,7 +1591,7 @@ export function ProfileTab({
                 {showInboundTools && (
                   <div className="mt-2.5 space-y-2.5 rounded-xl border border-[#D4AF37]/20 bg-[#FAF7F0] p-3 dark:bg-[#0B0A07]">
                     <p className="text-[11px] text-[#6E6552] dark:text-[#A89F8C]">
-                      Verifies webhook secret auth, Supabase schema, custom domain routing, and DNS without creating fake codes or inserting emails.
+                      Verifies Resend API key, Svix webhook signature check, Supabase schema, custom domain routing, and DNS without creating fake codes or inserting emails.
                     </p>
                     <div className="flex flex-col sm:flex-row gap-2">
                       <input
@@ -1625,12 +1625,14 @@ export function ProfileTab({
                         <div className="flex flex-wrap items-center gap-2 font-mono text-[11px]">
                           <span
                             className={`rounded px-1.5 py-0.5 font-bold ${
-                              adminTestResult.ready === false || adminTestResult.httpStatus >= 400
+                              adminTestResult.ready === false ||
+                              (typeof adminTestResult.ready !== 'boolean' &&
+                                adminTestResult.httpStatus >= 400)
                                 ? 'bg-rose-500/15 text-rose-700 dark:text-rose-300'
                                 : 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
                             }`}
                           >
-                            {adminTestResult.ready === false ? 'NOT READY' : 'READY'} · HTTP {adminTestResult.httpStatus || 'ERR'} · {adminTestResult.latencyMs}ms
+                            {adminTestResult.ready === false ? 'NOT READY' : 'READY'} · Svix Probe HTTP {adminTestResult.httpStatus || 'ERR'} · {adminTestResult.latencyMs}ms
                           </span>
                         </div>
                         {Array.isArray(adminTestResult.checks) && adminTestResult.checks.length > 0 && (

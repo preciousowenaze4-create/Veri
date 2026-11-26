@@ -577,7 +577,11 @@ export default function App() {
         if (data.inboxError && data.inboxApiOk === false) {
           directErrors.push(data.inboxError);
         }
-        if (directErrors.length > 0 || data.ready === false || data.httpStatus >= 400) {
+        const readinessFailed =
+          directErrors.length > 0 ||
+          data.ready === false ||
+          (typeof data.ready !== 'boolean' && data.httpStatus >= 400);
+        if (readinessFailed) {
           setDomainErrorPopup({
             title: `System Readiness Check Failed (${emailDomain})`,
             errors:

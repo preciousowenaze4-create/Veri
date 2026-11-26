@@ -1,10 +1,7 @@
-import { ArrowRight, Menu, Plus, ShieldCheck, User as UserIcon } from 'lucide-react';
-import type { TabId } from '../types';
+import { ArrowRight, Menu, Plus, User as UserIcon } from 'lucide-react';
 
 interface TopBarProps {
   isAuthenticated: boolean;
-  isOwnerAdmin?: boolean;
-  activeTab?: TabId;
   userEmail?: string | null;
   userName?: string | null;
   avatarUrl?: string | null;
@@ -13,13 +10,10 @@ interface TopBarProps {
   onOpenDeposit: () => void;
   onOpenProfile: () => void;
   onOpenAuth: () => void;
-  onToggleAdmin?: () => void;
 }
 
 export function TopBar({
   isAuthenticated,
-  isOwnerAdmin = false,
-  activeTab,
   userEmail,
   userName,
   avatarUrl,
@@ -28,7 +22,6 @@ export function TopBar({
   onOpenDeposit,
   onOpenProfile,
   onOpenAuth,
-  onToggleAdmin,
 }: TopBarProps) {
   const displayBalance =
     walletBalance === 0 ? '00' : walletBalance.toLocaleString('en-US');
@@ -43,7 +36,7 @@ export function TopBar({
             type="button"
             onClick={onOpenDrawer}
             aria-label="Open left corner menu"
-            className="flex min-h-[42px] min-w-[42px] shrink-0 items-center justify-center rounded-xl text-[#3E3522] transition-colors hover:bg-[#D4AF37]/15 focus-visible:outline-2 focus-visible:outline-[#D4AF37] dark:text-[#F5D77A] dark:hover:bg-[#D4AF37]/15"
+            className="flex min-h-[42px] min-w-[42px] shrink-0 items-center justify-center rounded-xl text-[#3E3522] transition-colors hover:bg-[#D4AF37]/15 focus-visible:outline-2 focus-visible:outline-[#D4AF37] dark:text-[#F5D77A] dark:hover:bg-[#D4AF37]/15 cursor-pointer"
           >
             <Menu className="h-5 w-5" />
           </button>
@@ -57,7 +50,7 @@ export function TopBar({
                 className="h-full w-full object-cover scale-105"
               />
             </div>
-            <span className="font-display text-base sm:text-lg font-black tracking-tight text-[#1A160D] whitespace-nowrap truncate dark:text-[#F5D77A]">
+            <span className="font-display text-base sm:text-lg font-black tracking-tight text-[#1A160D] whitespace-nowrap dark:text-[#F5D77A]">
               VeriBox
             </span>
           </div>
@@ -74,27 +67,7 @@ export function TopBar({
             <ArrowRight className="h-3.5 w-3.5 stroke-[2.5] transition-transform group-hover:translate-x-0.5" />
           </button>
         ) : (
-          <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
-            {isOwnerAdmin && onToggleAdmin && (
-              <button
-                type="button"
-                onClick={onToggleAdmin}
-                title={
-                  activeTab === 'admin'
-                    ? 'Switch to User Dashboard'
-                    : 'Open Owner Admin Diagnostics'
-                }
-                className={`inline-flex min-h-[36px] sm:min-h-[38px] items-center gap-1 sm:gap-1.5 rounded-xl border px-2 sm:px-2.5 py-1.5 text-[11px] sm:text-xs font-extrabold transition-colors cursor-pointer ${
-                  activeTab === 'admin'
-                    ? 'border-[#D4AF37] bg-[#D4AF37] text-[#0A0906]'
-                    : 'border-[#D4AF37]/45 bg-[#D4AF37]/15 text-[#8A6208] hover:bg-[#D4AF37]/25 dark:text-[#F5D77A]'
-                }`}
-              >
-                <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
-                <span>{activeTab === 'admin' ? 'User' : 'Admin'}</span>
-              </button>
-            )}
-
+          <div className="flex items-center gap-2 shrink-0">
             <button
               type="button"
               onClick={onOpenDeposit}

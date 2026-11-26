@@ -5,7 +5,6 @@ import {
   MailPlus,
   Moon,
   Phone,
-  ShieldCheck,
   Sparkles,
   Sun,
   User,
@@ -18,7 +17,6 @@ import { PWAInstallButton } from './PWAInstallButton';
 interface CornerDrawerProps {
   open: boolean;
   isAuthenticated: boolean;
-  isOwnerAdmin?: boolean;
   userEmail?: string | null;
   userName?: string | null;
   activeTab: TabId;
@@ -37,7 +35,6 @@ interface CornerDrawerProps {
 export function CornerDrawer({
   open,
   isAuthenticated,
-  isOwnerAdmin = false,
   userEmail,
   userName,
   activeTab,
@@ -230,23 +227,8 @@ export function CornerDrawer({
                 }`}
               >
                 <User className="h-4 w-4 shrink-0" />
-                <span>Profile & Saved Vault</span>
+                <span>Profile &amp; Transfers</span>
               </button>
-
-              {isOwnerAdmin && (
-                <button
-                  type="button"
-                  onClick={() => go('admin')}
-                  className={`flex min-h-[44px] w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm font-bold transition-colors ${
-                    activeTab === 'admin'
-                      ? 'bg-[#D4AF37] text-[#0A0906]'
-                      : 'border border-[#D4AF37]/30 bg-[#D4AF37]/10 text-[#8A6208] hover:bg-[#D4AF37]/20 dark:text-[#F5D77A]'
-                  }`}
-                >
-                  <ShieldCheck className="h-4 w-4 shrink-0" />
-                  <span>Owner Admin Diagnostics</span>
-                </button>
-              )}
             </div>
           </div>
 

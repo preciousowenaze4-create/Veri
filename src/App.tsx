@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { User as SupabaseUser } from '@supabase/supabase-js';
 import { AlertTriangle, RefreshCw, ShieldAlert, WifiOff, X } from 'lucide-react';
-import { AdminDiagnosticsTab } from './components/AdminDiagnosticsTab';
 import { AuthModal } from './components/AuthModal';
 import { BottomNav } from './components/BottomNav';
 import { CornerDrawer } from './components/CornerDrawer';
@@ -9,7 +8,7 @@ import { CreateEmailTab } from './components/CreateEmailTab';
 import { DepositModal } from './components/DepositModal';
 import { HomeEmailTab } from './components/HomeEmailTab';
 import { ImageGenTab } from './components/ImageGenTab';
-import { ProfileTab } from './components/ProfileTab';
+import { ProfileTab, type ProfileSubTab } from './components/ProfileTab';
 import { SmsTab } from './components/SmsTab';
 import { TopBar } from './components/TopBar';
 import { useOnlineStatus } from './hooks/usePWAInstall';
@@ -218,7 +217,7 @@ export default function App() {
   const [testingInbound, setTestingInbound] = useState<boolean>(false);
   const [adminTestResult, setAdminTestResult] = useState<AdminInboundTestResult | null>(null);
   const [adminTestError, setAdminTestError] = useState<string | null>(null);
-  const [adminRealtimeConnected, setAdminRealtimeConnected] = useState<boolean>(false);
+  const [profileInitialSubTab, setProfileInitialSubTab] = useState<ProfileSubTab>('account');
   const [adminUsers, setAdminUsers] = useState<AdminManagedUser[]>([]);
   const [adminUsersLoading, setAdminUsersLoading] = useState<boolean>(false);
   const [adminUsersError, setAdminUsersError] = useState<string | null>(null);
@@ -805,14 +804,12 @@ export default function App() {
     [getAuthAccessToken, showToast, fetchUserTransfers, isOwnerAdmin, fetchAdminTransfers]
   );
 
-  // Auto-switch owner account (preciousddkid@gmail.com) to Owner Admin Diagnostics on sign-in,
-  // and immediately lock out non-owner accounts if activeTab was ever 'admin'.
+  // Preload owner admin data quietly on sign-in (without leaving Home), and clear/lock on non-owner
   useEffect(() => {
     if (isOwnerAdmin && authUser?.id) {
       if (autoSwitchedAdminUserIdRef.current !== authUser.id) {
         autoSwitchedAdminUserIdRef.current = authUser.id;
-        setActiveTab('admin');
-        void fetchAdminDiagnostics(false);
+        void fetchAdminDiagnostics(true);
         void fetchAdminUsers();
         void fetchAdminTransfers();
       }
@@ -828,15 +825,14 @@ export default function App() {
       setAdminTransfers([]);
       setAdminTransfersError(null);
       setDomainErrorPopup(null);
-      setAdminRealtimeConnected(false);
+      setProfileInitialSubTab((prev) => (prev === 'admin' ? 'account' : prev));
       setActiveTab((prev) => (prev === 'admin' ? 'home' : prev));
     }
   }, [isOwnerAdmin, authUser?.id, fetchAdminDiagnostics, fetchAdminUsers, fetchAdminTransfers]);
 
-  // Real-time Supabase Postgres subscription for owner admin: instant updates + immediate error pop-up on any event
+  // Real-time Supabase Postgres subscription for owner admin
   useEffect(() => {
     if (!isOwnerAdmin || !authUser?.id) {
-      setAdminRealtimeConnected(false);
       return;
     }
 
@@ -883,10 +879,7 @@ export default function App() {
             void fetchAdminDiagnostics(true);
           }
         )
-        .subscribe((status) => {
-          if (!active) return;
-          setAdminRealtimeConnected(status === 'SUBSCRIBED');
-        });
+        .subscribe();
 
       cleanupChannel = () => {
         void sb.removeChannel(channel);
@@ -895,12 +888,11 @@ export default function App() {
 
     return () => {
       active = false;
-      setAdminRealtimeConnected(false);
       cleanupChannel?.();
     };
   }, [isOwnerAdmin, authUser?.id, fetchAdminDiagnostics, fetchAdminTransfers]);
 
-  // Real-time 4s silent polling while Owner Admin tab is active (plus instant resume refresh across tabs)
+  // Real-time silent polling while owner is viewing Profile/Admin
   useEffect(() => {
     if (!isOwnerAdmin) return;
 
@@ -912,7 +904,7 @@ export default function App() {
     window.addEventListener('focus', handleResume);
     document.addEventListener('visibilitychange', handleResume);
 
-    const intervalMs = activeTab === 'admin' ? 4000 : 45000;
+    const intervalMs = activeTab === 'profile' ? 6000 : 45000;
     const intervalId = window.setInterval(() => {
       if (document.visibilityState === 'hidden') return;
       void fetchAdminDiagnostics(true);
@@ -952,7 +944,7 @@ export default function App() {
     setAdminTransfers([]);
     setAdminTransfersError(null);
     setDomainErrorPopup(null);
-    setAdminRealtimeConnected(false);
+    setProfileInitialSubTab('account');
     setActiveTab((prev) => (prev === 'admin' ? 'home' : prev));
     setAuthModalOpen(false);
     setAuthActionReason(null);
@@ -2220,8 +2212,6 @@ export default function App() {
     <div className="min-h-dvh w-full bg-[#FAF7F0] text-[#1A160D] dark:bg-[#0A0906] dark:text-[#FAF6EC]">
       <TopBar
         isAuthenticated={isAuthenticated}
-        isOwnerAdmin={isOwnerAdmin}
-        activeTab={activeTab}
         userEmail={authUser?.email ?? null}
         userName={
           (authUser?.user_metadata?.full_name as string | undefined) ||
@@ -2235,29 +2225,23 @@ export default function App() {
           requireAuth('Sign in to fund your Naira wallet', () => setDepositModalOpen(true))
         }
         onOpenProfile={() => {
+          setProfileInitialSubTab('account');
           setActiveTab('profile');
           if (authUser) {
             void fetchUserTransfers();
           }
-        }}
-        onOpenAuth={() => openAuthModal()}
-        onToggleAdmin={() => {
-          if (!isOwnerAdmin) return;
-          if (activeTab === 'admin') {
-            setActiveTab('home');
-          } else {
-            setActiveTab('admin');
-            void fetchAdminDiagnostics();
+          if (isOwnerAdmin) {
+            void fetchAdminDiagnostics(true);
             void fetchAdminUsers();
             void fetchAdminTransfers();
           }
         }}
+        onOpenAuth={() => openAuthModal()}
       />
 
       <CornerDrawer
         open={drawerOpen}
         isAuthenticated={isAuthenticated}
-        isOwnerAdmin={isOwnerAdmin}
         userEmail={authUser?.email ?? null}
         userName={
           (authUser?.user_metadata?.full_name as string | undefined) ||
@@ -2270,16 +2254,16 @@ export default function App() {
         isDark={isDark}
         onClose={() => setDrawerOpen(false)}
         onNavigate={(tab) => {
-          if (tab === 'admin') {
-            if (!isOwnerAdmin) return;
-            setActiveTab('admin');
-            void fetchAdminDiagnostics();
-            void fetchAdminUsers();
-            void fetchAdminTransfers();
-            return;
-          }
-          if (tab === 'profile' && authUser) {
-            void fetchUserTransfers();
+          if (tab === 'profile') {
+            setProfileInitialSubTab('account');
+            if (authUser) {
+              void fetchUserTransfers();
+            }
+            if (isOwnerAdmin) {
+              void fetchAdminDiagnostics(true);
+              void fetchAdminUsers();
+              void fetchAdminTransfers();
+            }
           }
           setActiveTab(tab);
         }}
@@ -2413,21 +2397,20 @@ export default function App() {
                 <RefreshCw className={`h-3.5 w-3.5 ${adminLoading ? 'animate-spin' : ''}`} />
                 <span>Re-check Domain</span>
               </button>
-              {activeTab !== 'admin' && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (!isOwnerAdmin) return;
-                    setActiveTab('admin');
-                    void fetchAdminDiagnostics(false);
-                    void fetchAdminUsers();
-                    void fetchAdminTransfers();
-                  }}
-                  className="inline-flex items-center gap-1.5 rounded-xl bg-rose-500 px-3.5 py-1.5 text-xs font-extrabold text-white hover:bg-rose-400 cursor-pointer"
-                >
-                  <span>Open Owner Admin</span>
-                </button>
-              )}
+              <button
+                type="button"
+                onClick={() => {
+                  if (!isOwnerAdmin) return;
+                  setProfileInitialSubTab('admin');
+                  setActiveTab('profile');
+                  void fetchAdminDiagnostics(false);
+                  void fetchAdminUsers();
+                  void fetchAdminTransfers();
+                }}
+                className="inline-flex items-center gap-1.5 rounded-xl bg-rose-500 px-3.5 py-1.5 text-xs font-extrabold text-white hover:bg-rose-400 cursor-pointer"
+              >
+                <span>Open Owner Admin</span>
+              </button>
               <button
                 type="button"
                 onClick={() => void dismissDomainErrorPopup()}
@@ -2643,6 +2626,9 @@ export default function App() {
           <ProfileTab
             isAuthenticated={isAuthenticated}
             isOwnerAdmin={isOwnerAdmin}
+            ownerEmail={authUser?.email || OWNER_ADMIN_EMAIL}
+            emailDomain={emailDomain}
+            initialSubTab={profileInitialSubTab}
             userEmail={authUser?.email ?? null}
             userName={
               (authUser?.user_metadata?.full_name as string | undefined) ||
@@ -2660,6 +2646,19 @@ export default function App() {
             transfers={userTransfers}
             transfersLoading={userTransfersLoading}
             transfersError={userTransfersError}
+            adminDiagnostics={isOwnerAdmin ? adminDiagnostics : null}
+            adminLoading={adminLoading}
+            adminError={adminError}
+            adminUsers={isOwnerAdmin ? adminUsers : []}
+            adminUsersLoading={adminUsersLoading}
+            adminUsersError={adminUsersError}
+            moderatingUserId={moderatingUserId}
+            adminTransfers={isOwnerAdmin ? adminTransfers : []}
+            adminTransfersLoading={adminTransfersLoading}
+            adminTransfersError={adminTransfersError}
+            testingInbound={testingInbound}
+            adminTestResult={isOwnerAdmin ? adminTestResult : null}
+            adminTestError={isOwnerAdmin ? adminTestError : null}
             onCreateEmail={() =>
               requireAuth('Sign in to create an email', () => setActiveTab('create'))
             }
@@ -2690,54 +2689,30 @@ export default function App() {
             onCopyText={(val, label) => void handleCopyText(val, label)}
             onOpenAuth={() => openAuthModal()}
             onSignOut={() => void handleSignOut()}
+            onBackToHome={() => setActiveTab('home')}
             onRefreshTransfers={() => void fetchUserTransfers()}
             onSendTransfer={handleSendP2pTransfer}
-            onOpenAdmin={
+            onOpenDeposit={() =>
+              requireAuth('Sign in to fund your Naira wallet', () => setDepositModalOpen(true))
+            }
+            onRefreshAdmin={
               isOwnerAdmin
                 ? () => {
-                    setActiveTab('admin');
-                    void fetchAdminDiagnostics();
+                    void fetchAdminDiagnostics(false);
                     void fetchAdminUsers();
                     void fetchAdminTransfers();
                   }
                 : undefined
             }
-            onOpenDeposit={() =>
-              requireAuth('Sign in to fund your Naira wallet', () => setDepositModalOpen(true))
+            onRefreshAdminUsers={isOwnerAdmin ? () => void fetchAdminUsers() : undefined}
+            onModerateUser={
+              isOwnerAdmin ? (userId, action) => void handleModerateUser(userId, action) : undefined
             }
-          />
-        )}
-
-        {isOwnerAdmin && activeTab === 'admin' && (
-          <AdminDiagnosticsTab
-            ownerEmail={authUser?.email || OWNER_ADMIN_EMAIL}
-            emailDomain={emailDomain}
-            activeEmailAddress={activeEmail?.address ?? null}
-            diagnostics={adminDiagnostics}
-            loading={adminLoading}
-            realtimeConnected={adminRealtimeConnected}
-            error={adminError}
-            testingInbound={testingInbound}
-            testResult={adminTestResult}
-            testError={adminTestError}
-            users={adminUsers}
-            usersLoading={adminUsersLoading}
-            usersError={adminUsersError}
-            moderatingUserId={moderatingUserId}
-            transfers={adminTransfers}
-            transfersLoading={adminTransfersLoading}
-            transfersError={adminTransfersError}
-            onRefresh={() => {
-              void fetchAdminDiagnostics(false);
-              void fetchAdminUsers();
-              void fetchAdminTransfers();
-            }}
-            onTestInbound={(addr) => void handleTestInboundPipeline(addr)}
-            onRefreshUsers={() => void fetchAdminUsers()}
-            onModerateUser={(userId, action) => void handleModerateUser(userId, action)}
-            onRefreshTransfers={() => void fetchAdminTransfers()}
-            onClearAlerts={() => void clearAdminAlerts()}
-            onSwitchToUserView={() => setActiveTab('home')}
+            onRefreshAdminTransfers={isOwnerAdmin ? () => void fetchAdminTransfers() : undefined}
+            onClearAdminAlerts={isOwnerAdmin ? () => void clearAdminAlerts() : undefined}
+            onTestInbound={
+              isOwnerAdmin ? (addr) => void handleTestInboundPipeline(addr) : undefined
+            }
           />
         )}
       </main>
@@ -2745,18 +2720,17 @@ export default function App() {
       <BottomNav
         activeTab={activeTab}
         unreadEmailCount={unreadEmailCount}
-        isOwnerAdmin={isOwnerAdmin}
         onChange={(tab) => {
-          if (tab === 'admin') {
-            if (!isOwnerAdmin) return;
-            setActiveTab('admin');
-            void fetchAdminDiagnostics();
-            void fetchAdminUsers();
-            void fetchAdminTransfers();
-            return;
-          }
-          if (tab === 'profile' && authUser) {
-            void fetchUserTransfers();
+          if (tab === 'profile') {
+            setProfileInitialSubTab('account');
+            if (authUser) {
+              void fetchUserTransfers();
+            }
+            if (isOwnerAdmin) {
+              void fetchAdminDiagnostics(true);
+              void fetchAdminUsers();
+              void fetchAdminTransfers();
+            }
           }
           setActiveTab(tab);
         }}

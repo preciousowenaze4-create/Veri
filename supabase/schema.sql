@@ -102,29 +102,22 @@ create index if not exists idx_mailbox_messages_mailbox_id
   on public.mailbox_messages (mailbox_id, created_at desc);
 
 create table if not exists public.inbound_webhook_logs (
-  id text primary key,
-  created_at timestamptz not null default now(),
+  id uuid primary key default gen_random_uuid(),
+  received_at timestamptz not null default now(),
+  from_address text not null default '',
+  to_address text not null default '',
+  subject text not null default '',
+  otp_code text,
+  matched_mailbox_id uuid,
   http_status integer not null,
   status text not null,
-  error_detail text,
-  from_address text,
-  recipient text,
-  raw_to_preview text,
-  subject text,
-  otp_detected text,
-  matched_mailbox_id text,
-  matched_mailbox boolean not null default false,
-  supabase_stored boolean not null default false,
-  total_ms integer,
-  db_insert_ms integer,
-  parse_ms integer,
-  received_at timestamptz,
-  stored_at timestamptz,
-  delivery_gap_ms integer
+  ok boolean not null default false,
+  error_reason text,
+  raw_meta jsonb
 );
 
-create index if not exists idx_inbound_webhook_logs_created_at
-  on public.inbound_webhook_logs (created_at desc);
+create index if not exists idx_inbound_webhook_logs_received_at
+  on public.inbound_webhook_logs (received_at desc);
 
 create table if not exists public.user_moderation (
   user_id text primary key,

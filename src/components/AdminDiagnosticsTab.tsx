@@ -528,17 +528,24 @@ export function AdminDiagnosticsTab({
                 >
                   DB Read: {testResult.supabaseReadbackOk ? 'OK' : 'FAILED'}
                 </span>
-                {typeof testResult.webhookLogReadbackOk === 'boolean' && (
-                  <span
-                    className={
-                      testResult.webhookLogReadbackOk
-                        ? 'text-emerald-600 dark:text-emerald-400'
-                        : 'text-rose-600 dark:text-rose-400'
-                    }
-                  >
-                    Webhook Log: {testResult.webhookLogReadbackOk ? 'OK' : 'FAILED'}
-                  </span>
-                )}
+                {(() => {
+                  const isWebhookLogged =
+                    typeof testResult.webhookLogged === 'boolean'
+                      ? testResult.webhookLogged
+                      : testResult.webhookLogReadbackOk;
+                  if (typeof isWebhookLogged !== 'boolean') return null;
+                  return (
+                    <span
+                      className={
+                        isWebhookLogged
+                          ? 'text-emerald-600 dark:text-emerald-400'
+                          : 'text-rose-600 dark:text-rose-400'
+                      }
+                    >
+                      Webhook Log: {isWebhookLogged ? 'OK' : 'FAILED'}
+                    </span>
+                  );
+                })()}
                 <span
                   className={
                     testResult.inboxApiOk === true
@@ -580,6 +587,12 @@ export function AdminDiagnosticsTab({
             {testResult.inboxError && (
               <p className="rounded-lg bg-amber-500/10 p-2 font-mono text-[11px] text-amber-800 dark:text-amber-200 break-words">
                 Inbox Check: {testResult.inboxError}
+              </p>
+            )}
+
+            {testResult.webhookLogError && (
+              <p className="rounded-lg bg-rose-500/10 p-2 font-mono text-[11px] text-rose-700 dark:text-rose-200 break-all">
+                Webhook Log Error: {testResult.webhookLogError}
               </p>
             )}
 

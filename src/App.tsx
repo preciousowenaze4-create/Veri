@@ -553,7 +553,8 @@ export default function App() {
             timestamp: data.testedAt || new Date().toISOString(),
           });
         }
-        void fetchAdminDiagnostics(true);
+        adminDiagnosticsInFlightRef.current = false;
+        await fetchAdminDiagnostics(true);
       } catch (err) {
         const message =
           err instanceof Error

@@ -2163,72 +2163,93 @@ export function createApiApp() {
   }
 
   const inboundAttemptLogs: InboundAttemptLog[] = [];
-  let inboundLogsTableAvailable = true;
   let mailboxIdColumnAvailable = true;
 
-  async function recordInboundAttempt(entry: InboundAttemptLog): Promise<void> {
+  const UUID_V4_OR_ANY_REGEX =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  interface RecordInboundLogResult {
+    logged: boolean;
+    logId: string | null;
+    logError: string | null;
+  }
+
+  async function recordInboundAttempt(entry: InboundAttemptLog): Promise<RecordInboundLogResult> {
     inboundAttemptLogs.unshift(entry);
     if (inboundAttemptLogs.length > 50) {
       inboundAttemptLogs.length = 50;
     }
 
     const sb = getSupabaseServerClient();
-    if (!sb) return;
-
-    const targetPreview = entry.recipients.join(', ') || entry.rawToPreview || 'unmatched';
-    if (inboundLogsTableAvailable) {
-      try {
-        const { error } = await sb.from('inbound_webhook_logs').upsert(
-          {
-            id: entry.id,
-            created_at: entry.timestamp,
-            http_status: entry.httpStatus,
-            status: entry.status,
-            error_detail: entry.error,
-            from_address: (entry.fromAddress || '').slice(0, 160),
-            recipient: (entry.recipients[0] || entry.rawToPreview || '').slice(0, 160),
-            raw_to_preview: entry.rawToPreview.slice(0, 240),
-            subject: entry.subject.slice(0, 280),
-            otp_detected: entry.otpDetected,
-            matched_mailbox_id: entry.matchedMailboxId ?? null,
-            matched_mailbox: Boolean(entry.matchedMailbox),
-            supabase_stored: entry.supabaseStored,
-            total_ms: typeof entry.totalMs === 'number' ? entry.totalMs : null,
-            db_insert_ms: typeof entry.dbInsertMs === 'number' ? entry.dbInsertMs : null,
-            parse_ms: typeof entry.parseMs === 'number' ? entry.parseMs : null,
-            received_at: entry.receivedAt || entry.timestamp,
-            stored_at: entry.storedAt || null,
-            delivery_gap_ms: typeof entry.deliveryGapMs === 'number' ? entry.deliveryGapMs : null,
-          },
-          { onConflict: 'id' }
-        );
-        if (!error) return;
-        if (error.code === 'PGRST205' || error.code === '42P01') {
-          inboundLogsTableAvailable = false;
-        }
-      } catch {
-        // Fallback below
-      }
+    if (!sb) {
+      return {
+        logged: false,
+        logId: null,
+        logError: 'Supabase client not configured on backend',
+      };
     }
 
+    const safeMailboxUuid =
+      entry.matchedMailboxId && UUID_V4_OR_ANY_REGEX.test(entry.matchedMailboxId)
+        ? entry.matchedMailboxId
+        : null;
+    const isOk =
+      entry.httpStatus >= 200 && entry.httpStatus < 300 && Boolean(entry.supabaseStored);
+
     try {
-      await sb.from('mailbox_messages').upsert(
-        {
-          id: entry.id,
-          recipient_address: INBOUND_AUDIT_ADDRESS,
-          from_name: `${entry.status} · HTTP ${entry.httpStatus}`,
-          from_address: (entry.fromAddress || 'webhook').slice(0, 120),
-          subject: `[${targetPreview}] ${entry.subject}`.slice(0, 280),
-          body_text: JSON.stringify(entry),
-          body_html: '',
-          otp: entry.otpDetected,
-          seen: true,
-          created_at: entry.timestamp,
-        },
-        { onConflict: 'id' }
-      );
-    } catch {
-      // Non-blocking audit persistence
+      const { data, error: logError } = await sb
+        .from('inbound_webhook_logs')
+        .insert({
+          received_at: entry.receivedAt || entry.timestamp || new Date().toISOString(),
+          from_address: (entry.fromAddress || '').slice(0, 240),
+          to_address: (entry.recipients[0] || entry.rawToPreview || '').slice(0, 240),
+          subject: (entry.subject || '').slice(0, 300),
+          otp_code: entry.otpDetected || null,
+          matched_mailbox_id: safeMailboxUuid,
+          http_status: entry.httpStatus,
+          status: entry.status,
+          ok: isOk,
+          error_reason: entry.error || null,
+          raw_meta: {
+            attemptId: entry.id,
+            recipients: entry.recipients,
+            rawToPreview: entry.rawToPreview,
+            matchedMailbox: Boolean(entry.matchedMailbox),
+            matchedMailboxIdRaw: entry.matchedMailboxId ?? null,
+            supabaseStored: entry.supabaseStored,
+            totalMs: typeof entry.totalMs === 'number' ? entry.totalMs : null,
+            dbInsertMs: typeof entry.dbInsertMs === 'number' ? entry.dbInsertMs : null,
+            parseMs: typeof entry.parseMs === 'number' ? entry.parseMs : null,
+            storedAt: entry.storedAt || null,
+            deliveryGapMs: typeof entry.deliveryGapMs === 'number' ? entry.deliveryGapMs : null,
+          },
+        })
+        .select('id')
+        .single();
+
+      if (logError) {
+        console.warn('[VeriBox Inbound] inbound_webhook_logs insert error:', logError.message);
+        return {
+          logged: false,
+          logId: null,
+          logError: logError.message || 'Failed to insert into public.inbound_webhook_logs',
+        };
+      }
+
+      return {
+        logged: true,
+        logId: data?.id ? String(data.id) : null,
+        logError: null,
+      };
+    } catch (err) {
+      const msg =
+        err instanceof Error ? err.message : 'Exception inserting into public.inbound_webhook_logs';
+      console.warn('[VeriBox Inbound] inbound_webhook_logs insert exception:', msg);
+      return {
+        logged: false,
+        logId: null,
+        logError: msg,
+      };
     }
   }
 
@@ -3778,7 +3799,7 @@ export function createApiApp() {
           ? `401: Missing x-inbound-secret header (expected ${configuredSecret.length} chars starting with '${configuredSecret.slice(0, 4)}')`
           : `401: Secret mismatch (received ${provided.length} chars starting with '${provided.slice(0, 4)}', expected ${configuredSecret.length} chars starting with '${configuredSecret.slice(0, 4)}')`;
         console.warn(`[VeriBox Inbound] Unauthorized webhook totalMs=${totalMs}`);
-        await Promise.race([
+        const logRes = await Promise.race([
           recordInboundAttempt({
             id: attemptId,
             timestamp: receivedAtIso,
@@ -3800,12 +3821,25 @@ export function createApiApp() {
             storedAt: null,
             deliveryGapMs: null,
           }),
-          new Promise<void>((r) => setTimeout(r, 450)),
+          new Promise<RecordInboundLogResult>((r) =>
+            setTimeout(
+              () =>
+                r({
+                  logged: false,
+                  logId: null,
+                  logError: 'Webhook log insert timed out after 1500ms',
+                }),
+              1500
+            )
+          ),
         ]);
         res.status(401).json({
           ok: false,
           error: 'Unauthorized: invalid or missing x-inbound-secret header',
           receivedLength: provided.length,
+          webhookLogged: logRes.logged,
+          webhookLogId: logRes.logId,
+          webhookLogError: logRes.logError,
         });
         return;
       }
@@ -3895,7 +3929,7 @@ export function createApiApp() {
       const totalMs = Math.max(0, Math.round(performance.now() - reqPerfStart));
       const msg = `No recipient matching @${CUSTOM_EMAIL_DOMAIN} found in payload (received to: ${rawToPreview || 'empty'})`;
       console.warn(`[VeriBox Inbound] Dropped webhook totalMs=${totalMs}:`, msg);
-      await Promise.race([
+      const logRes = await Promise.race([
         recordInboundAttempt({
           id: attemptId,
           timestamp: receivedAtIso,
@@ -3917,9 +3951,26 @@ export function createApiApp() {
           storedAt: null,
           deliveryGapMs: null,
         }),
-        new Promise<void>((r) => setTimeout(r, 450)),
+        new Promise<RecordInboundLogResult>((r) =>
+          setTimeout(
+            () =>
+              r({
+                logged: false,
+                logId: null,
+                logError: 'Webhook log insert timed out after 1500ms',
+              }),
+            1500
+          )
+        ),
       ]);
-      res.status(400).json({ ok: false, error: msg, totalMs });
+      res.status(400).json({
+        ok: false,
+        error: msg,
+        totalMs,
+        webhookLogged: logRes.logged,
+        webhookLogId: logRes.logId,
+        webhookLogError: logRes.logError,
+      });
       return;
     }
 
@@ -4128,7 +4179,7 @@ export function createApiApp() {
         : null;
 
     // Commit inbound_webhook_logs before sending HTTP response so Vercel serverless never drops the log write
-    await Promise.race([
+    const logRes = await Promise.race([
       recordInboundAttempt({
         id: attemptId,
         timestamp: storedAtIso,
@@ -4150,7 +4201,17 @@ export function createApiApp() {
         storedAt: storedAtIso,
         deliveryGapMs,
       }),
-      new Promise<void>((r) => setTimeout(r, 450)),
+      new Promise<RecordInboundLogResult>((r) =>
+        setTimeout(
+          () =>
+            r({
+              logged: false,
+              logId: null,
+              logError: 'Webhook log insert timed out after 2500ms',
+            }),
+          2500
+        )
+      ),
     ]);
 
     if (firstDbError) {
@@ -4161,6 +4222,9 @@ export function createApiApp() {
         matchedMailboxId,
         recipient: primaryRecipient,
         otp,
+        webhookLogged: logRes.logged,
+        webhookLogId: logRes.logId,
+        webhookLogError: logRes.logError,
       });
       return;
     }
@@ -4172,6 +4236,9 @@ export function createApiApp() {
       matchedMailboxId,
       recipient: primaryRecipient,
       otp,
+      webhookLogged: logRes.logged,
+      webhookLogId: logRes.logId,
+      webhookLogError: logRes.logError,
       domain: CUSTOM_EMAIL_DOMAIN,
       recipients,
       messageIds: storedIds,
@@ -4580,13 +4647,14 @@ export function createApiApp() {
 
     const probeTable = async (
       table: 'mailboxes' | 'mailbox_messages' | 'inbound_webhook_logs',
-      columns: string
+      columns: string,
+      orderColumn: 'created_at' | 'received_at' = 'created_at'
     ) => {
       try {
         let query = sb
           .from(table)
           .select(columns, { count: 'exact' })
-          .order('created_at', { ascending: false })
+          .order(orderColumn, { ascending: false })
           .limit(30);
         if (table === 'mailbox_messages') {
           query = query.neq('recipient_address', INBOUND_AUDIT_ADDRESS);
@@ -4620,30 +4688,79 @@ export function createApiApp() {
         const { data, error } = await sb
           .from('inbound_webhook_logs')
           .select('*')
-          .order('created_at', { ascending: false })
+          .order('received_at', { ascending: false })
           .limit(30);
         if (!error && Array.isArray(data)) {
           for (const row of data) {
+            const meta = (
+              row.raw_meta && typeof row.raw_meta === 'object' ? row.raw_meta : {}
+            ) as Record<string, unknown>;
+            const toAddr = String(row.to_address || row.recipient || '');
             parsed.push({
               id: String(row.id),
-              timestamp: String(row.created_at || new Date().toISOString()),
+              timestamp: String(row.received_at || row.created_at || new Date().toISOString()),
               status: String(row.status || 'stored') as InboundAttemptLog['status'],
               httpStatus: Number(row.http_status || 200),
-              recipients: row.recipient ? [String(row.recipient)] : [],
-              rawToPreview: String(row.raw_to_preview || row.recipient || ''),
+              recipients: Array.isArray(meta.recipients)
+                ? (meta.recipients as unknown[]).map((r) => String(r))
+                : toAddr
+                  ? [toAddr]
+                  : [],
+              rawToPreview: String(meta.rawToPreview || row.raw_to_preview || toAddr),
               fromAddress: String(row.from_address || ''),
               subject: String(row.subject || '(No subject)'),
-              otpDetected: row.otp_detected ? String(row.otp_detected) : null,
-              supabaseStored: Boolean(row.supabase_stored),
-              error: row.error_detail ? String(row.error_detail) : null,
-              totalMs: typeof row.total_ms === 'number' ? row.total_ms : null,
-              dbInsertMs: typeof row.db_insert_ms === 'number' ? row.db_insert_ms : null,
-              parseMs: typeof row.parse_ms === 'number' ? row.parse_ms : null,
-              matchedMailbox: Boolean(row.matched_mailbox),
-              matchedMailboxId: row.matched_mailbox_id ? String(row.matched_mailbox_id) : null,
+              otpDetected: row.otp_code
+                ? String(row.otp_code)
+                : row.otp_detected
+                  ? String(row.otp_detected)
+                  : null,
+              supabaseStored:
+                typeof row.ok === 'boolean' ? row.ok : Boolean(row.supabase_stored),
+              error: row.error_reason
+                ? String(row.error_reason)
+                : row.error_detail
+                  ? String(row.error_detail)
+                  : null,
+              totalMs:
+                typeof meta.totalMs === 'number'
+                  ? meta.totalMs
+                  : typeof row.total_ms === 'number'
+                    ? row.total_ms
+                    : null,
+              dbInsertMs:
+                typeof meta.dbInsertMs === 'number'
+                  ? meta.dbInsertMs
+                  : typeof row.db_insert_ms === 'number'
+                    ? row.db_insert_ms
+                    : null,
+              parseMs:
+                typeof meta.parseMs === 'number'
+                  ? meta.parseMs
+                  : typeof row.parse_ms === 'number'
+                    ? row.parse_ms
+                    : null,
+              matchedMailbox:
+                typeof meta.matchedMailbox === 'boolean'
+                  ? meta.matchedMailbox
+                  : Boolean(row.matched_mailbox_id || row.matched_mailbox),
+              matchedMailboxId: row.matched_mailbox_id
+                ? String(row.matched_mailbox_id)
+                : typeof meta.matchedMailboxIdRaw === 'string'
+                  ? meta.matchedMailboxIdRaw
+                  : null,
               receivedAt: row.received_at ? String(row.received_at) : null,
-              storedAt: row.stored_at ? String(row.stored_at) : null,
-              deliveryGapMs: typeof row.delivery_gap_ms === 'number' ? row.delivery_gap_ms : null,
+              storedAt:
+                typeof meta.storedAt === 'string'
+                  ? meta.storedAt
+                  : row.stored_at
+                    ? String(row.stored_at)
+                    : null,
+              deliveryGapMs:
+                typeof meta.deliveryGapMs === 'number'
+                  ? meta.deliveryGapMs
+                  : typeof row.delivery_gap_ms === 'number'
+                    ? row.delivery_gap_ms
+                    : null,
             });
           }
         }
@@ -4710,7 +4827,11 @@ export function createApiApp() {
         'mailbox_messages',
         'id, recipient_address, from_name, from_address, subject, otp, seen, created_at'
       ),
-      probeTable('inbound_webhook_logs', 'id, created_at, http_status, status'),
+      probeTable(
+        'inbound_webhook_logs',
+        'id, received_at, http_status, status, ok',
+        'received_at'
+      ),
       fetchPersistedWebhookLogs(),
       fetchLegacyAuditLogs(),
       getDnsCheckCached(),
@@ -4918,7 +5039,7 @@ export function createApiApp() {
         verified.supabase
           .from('inbound_webhook_logs')
           .delete()
-          .neq('status', 'stored'),
+          .eq('ok', false),
       ]);
     } catch {
       // Non-blocking
@@ -5239,6 +5360,9 @@ export function createApiApp() {
       otpDetected?: string | null;
       supabaseStored?: boolean;
       supabaseError?: string | null;
+      webhookLogged?: boolean;
+      webhookLogId?: string | null;
+      webhookLogError?: string | null;
       error?: string;
     };
 
@@ -5247,42 +5371,67 @@ export function createApiApp() {
       (Array.isArray(parsedResp.messageIds) ? parsedResp.messageIds[0] : null);
     let supabaseReadbackOk = false;
     let webhookLogReadbackOk = false;
-    let webhookLogId: string | null = null;
+    let webhookLogId: string | null = parsedResp.webhookLogId ?? null;
+    let webhookLogError: string | null = parsedResp.webhookLogError ?? null;
     let readbackError: string | null = parsedResp.supabaseError || parsedResp.error || fetchError || null;
 
-    if (insertedId) {
+    if (insertedId || webhookLogId) {
       try {
-        const [msgReadback, logReadback] = await Promise.all([
-          verified.supabase
-            .from('mailbox_messages')
-            .select('id, otp, recipient_address')
-            .eq('id', insertedId)
-            .maybeSingle(),
-          verified.supabase
-            .from('inbound_webhook_logs')
-            .select('id, http_status, status, recipient, otp_detected')
-            .ilike('recipient', targetAddress)
-            .order('created_at', { ascending: false })
-            .limit(1)
-            .maybeSingle(),
-        ]);
+        const msgPromise = insertedId
+          ? verified.supabase
+              .from('mailbox_messages')
+              .select('id, otp, recipient_address')
+              .eq('id', insertedId)
+              .maybeSingle()
+          : Promise.resolve({ data: null, error: null });
 
-        if (msgReadback.error) {
-          readbackError = `${msgReadback.error.code || 'READBACK_ERR'}: ${msgReadback.error.message}`;
-        } else if (msgReadback.data?.id === insertedId) {
-          supabaseReadbackOk = true;
-        } else if (!readbackError) {
-          readbackError = 'Inserted row not returned during Supabase readback (check RLS policies or SUPABASE_SERVICE_ROLE_KEY)';
+        const logPromise = webhookLogId
+          ? verified.supabase
+              .from('inbound_webhook_logs')
+              .select('id, received_at, to_address, http_status, status, ok, otp_code, error_reason')
+              .eq('id', webhookLogId)
+              .maybeSingle()
+          : verified.supabase
+              .from('inbound_webhook_logs')
+              .select('id, received_at, to_address, http_status, status, ok, otp_code, error_reason')
+              .ilike('to_address', targetAddress)
+              .order('received_at', { ascending: false })
+              .limit(1)
+              .maybeSingle();
+
+        const [msgReadback, logReadback] = await Promise.all([msgPromise, logPromise]);
+
+        if (insertedId) {
+          if (msgReadback.error) {
+            readbackError = `${msgReadback.error.code || 'READBACK_ERR'}: ${msgReadback.error.message}`;
+          } else if (msgReadback.data?.id === insertedId) {
+            supabaseReadbackOk = true;
+          } else if (!readbackError) {
+            readbackError = 'Inserted row not returned during Supabase readback (check RLS policies or SUPABASE_SERVICE_ROLE_KEY)';
+          }
         }
 
-        if (!logReadback.error && logReadback.data?.id) {
+        if (logReadback.error) {
+          if (!webhookLogError) {
+            webhookLogError = `${logReadback.error.code || 'LOG_READ_ERR'}: ${logReadback.error.message}`;
+          }
+        } else if (logReadback.data?.id) {
           webhookLogReadbackOk = true;
           webhookLogId = String(logReadback.data.id);
+        } else if (!webhookLogError) {
+          webhookLogError = 'Webhook log row was not found in public.inbound_webhook_logs';
         }
       } catch (err) {
-        readbackError = err instanceof Error ? err.message : 'Readback failed';
+        const msg = err instanceof Error ? err.message : 'Readback failed';
+        readbackError = readbackError || msg;
+        webhookLogError = webhookLogError || msg;
       }
     }
+
+    const webhookLogged =
+      typeof parsedResp.webhookLogged === 'boolean'
+        ? parsedResp.webhookLogged
+        : webhookLogReadbackOk;
 
     let inboxApiOk: boolean | null = null;
     let inboxMessageCount: number | null = null;
@@ -5339,6 +5488,8 @@ export function createApiApp() {
       responseBody,
       supabaseWriteOk: Boolean(parsedResp.supabaseStored),
       supabaseReadbackOk,
+      webhookLogged,
+      webhookLogError,
       webhookLogReadbackOk,
       webhookLogId,
       inboxApiOk,

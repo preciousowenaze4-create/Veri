@@ -7,12 +7,15 @@ import {
   ArrowRight,
   ArrowUpRight,
   Ban,
+  Brain,
   Check,
   CheckCircle2,
   ChevronDown,
   ChevronUp,
+  Clock,
   Copy,
   Database,
+  Eye,
   KeyRound,
   Loader2,
   LogOut,
@@ -29,6 +32,7 @@ import {
   Send,
   ShieldAlert,
   ShieldCheck,
+  Sparkles,
   Sun,
   Trash2,
   User,
@@ -37,6 +41,7 @@ import {
   XCircle,
 } from 'lucide-react';
 import type {
+  AdminAiBrainReport,
   AdminDiagnosticsResponse,
   AdminInboundTestResult,
   AdminManagedUser,
@@ -89,6 +94,9 @@ interface ProfileTabProps {
   testingInbound?: boolean;
   adminTestResult?: AdminInboundTestResult | null;
   adminTestError?: string | null;
+  aiBrainReport?: AdminAiBrainReport | null;
+  aiBrainLoading?: boolean;
+  aiReviewWaitHours?: number;
   onCreateEmail: () => void;
   onSelectEmail: (account: TempEmailAccount) => void;
   onOpenSmsNumber: (entry: PhoneNumberEntry) => void;
@@ -129,6 +137,14 @@ interface ProfileTabProps {
     subject: string;
     text: string;
   }) => Promise<{ ok: boolean; id?: string | null; error?: string }>;
+  onRunAiBrainScan?: () => Promise<void>;
+  onRegenerateUserBanScript?: (userId: string) => Promise<void>;
+  onSaveAiWaitHours?: (hours: number) => Promise<void>;
+  onDecideAppeal?: (
+    appealId: string,
+    decision: 'approve' | 'reject',
+    note?: string
+  ) => Promise<void>;
 }
 
 type UserTransferFilter = 'all' | 'sent' | 'received' | 'deposit' | 'debit';
@@ -168,6 +184,9 @@ export function ProfileTab({
   testingInbound = false,
   adminTestResult = null,
   adminTestError = null,
+  aiBrainReport = null,
+  aiBrainLoading = false,
+  aiReviewWaitHours = 6,
   onCreateEmail,
   onSelectEmail,
   onOpenSmsNumber,
@@ -191,6 +210,10 @@ export function ProfileTab({
   onClearAdminAlerts,
   onTestInbound,
   onSendEmail,
+  onRunAiBrainScan,
+  onRegenerateUserBanScript,
+  onSaveAiWaitHours,
+  onDecideAppeal,
 }: ProfileTabProps) {
   const [subTab, setSubTab] = useState<ProfileSubTab>(
     initialSubTab === 'admin' && isOwnerAdmin ? 'admin' : initialSubTab
@@ -229,6 +252,10 @@ export function ProfileTab({
   const [userSearch, setUserSearch] = useState('');
   const [userStatusFilter, setUserStatusFilter] = useState<'all' | UserModerationStatus>('all');
   const [moderationReasonInput, setModerationReasonInput] = useState('');
+  const [expandedScriptUserId, setExpandedScriptUserId] = useState<string | null>(null);
+  const [regeneratingScriptUserId, setRegeneratingScriptUserId] = useState<string | null>(null);
+  const [decidingAppealId, setDecidingAppealId] = useState<string | null>(null);
+  const [savingWaitHours, setSavingWaitHours] = useState<boolean>(false);
   const [visitorBanType, setVisitorBanType] = useState<'email' | 'ip'>('ip');
   const [visitorBanValue, setVisitorBanValue] = useState('');
   const [visitorBanReason, setVisitorBanReason] = useState('');
@@ -346,6 +373,11 @@ export function ProfileTab({
       suspended: adminUsers.filter((u) => u.status === 'suspended').length,
       banned: adminUsers.filter((u) => u.status === 'banned').length,
     }),
+    [adminUsers]
+  );
+
+  const activeAppeals = useMemo(
+    () => adminUsers.filter((u) => u.appeal && u.appeal.status !== 'none'),
     [adminUsers]
   );
 
@@ -1208,6 +1240,259 @@ export function ProfileTab({
       {/* ======================================================== */}
       {isOwnerAdmin && subTab === 'admin' && (
         <div className="space-y-4">
+          {/* 0. Owner AI Security Brain & Appeal Verification Center */}
+          <section className="rounded-2xl border border-[#D4AF37]/35 bg-white p-4 space-y-3.5 dark:bg-[#14120D]">
+            <div className="flex flex-wrap items-center justify-between gap-2.5">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[#1A160D] text-[#F5D77A] border border-[#D4AF37]/40">
+                  <Brain className="h-4 w-4" />
+                </div>
+                <div className="min-w-0">
+                  <h2 className="font-display text-sm font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
+                    AI Security Brain &amp; Appeals
+                  </h2>
+                  <p className="text-[11px] text-[#6E6552] dark:text-[#A89F8C]">
+                    Monitors login days, failed deposit attempts &amp; 30-day free usage · Generates unique ban explanations
+                  </p>
+                </div>
+              </div>
+
+              {onRunAiBrainScan && (
+                <button
+                  type="button"
+                  disabled={aiBrainLoading}
+                  onClick={() => void onRunAiBrainScan()}
+                  className="inline-flex min-h-[36px] items-center gap-1.5 rounded-xl bg-[#D4AF37] px-3 py-1.5 text-xs font-extrabold text-[#0A0906] hover:bg-[#E5C150] disabled:opacity-60 whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  {aiBrainLoading ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Sparkles className="h-3.5 w-3.5" />
+                  )}
+                  <span>{aiBrainLoading ? 'Scanning Accounts...' : 'Scan All Accounts'}</span>
+                </button>
+              )}
+            </div>
+
+            {/* AI Appeal Review Countdown Window Selector */}
+            {onSaveAiWaitHours && (
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[#D4AF37]/20 bg-[#FAF7F0] px-3 py-2 dark:bg-[#0B0A07]">
+                <div className="flex items-center gap-1.5 text-[11px] font-semibold text-[#6E6552] dark:text-[#D5CCB8]">
+                  <Clock className="h-3.5 w-3.5 text-[#D4AF37]" />
+                  <span>Appeal wait countdown after email confirmation:</span>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  {[5, 6, 12, 24].map((hrs) => (
+                    <button
+                      key={hrs}
+                      type="button"
+                      disabled={savingWaitHours}
+                      onClick={async () => {
+                        setSavingWaitHours(true);
+                        try {
+                          await onSaveAiWaitHours(hrs);
+                        } finally {
+                          setSavingWaitHours(false);
+                        }
+                      }}
+                      className={`rounded-lg px-2.5 py-1 font-mono text-[11px] font-bold tabular-nums transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                        aiReviewWaitHours === hrs
+                          ? 'bg-[#D4AF37] text-[#0A0906]'
+                          : 'border border-[#D4AF37]/25 bg-white text-[#6E6552] hover:bg-[#D4AF37]/10 dark:bg-[#14120D] dark:text-[#D5CCB8]'
+                      }`}
+                    >
+                      {hrs}h
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* AI Security Scan Results */}
+            {aiBrainReport && (
+              <div className="space-y-2.5 rounded-xl border border-[#D4AF37]/25 bg-[#FAF7F0] p-3 dark:bg-[#0B0A07]">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-xs font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
+                    Live AI Risk Assessment
+                  </span>
+                  <span className="font-mono text-[10px] text-[#6E6552] dark:text-[#A89F8C]">
+                    {aiBrainReport.provider} · {formatRelativeTime(aiBrainReport.analyzedAt)}
+                  </span>
+                </div>
+                <p className="text-xs leading-relaxed text-[#4A4231] dark:text-[#D5CCB8]">
+                  {aiBrainReport.summary}
+                </p>
+
+                {aiBrainReport.flaggedUsers.length === 0 ? (
+                  <p className="text-[11px] font-semibold text-emerald-700 dark:text-emerald-300">
+                    No suspicious deposit attempts or high-risk accounts flagged in this scan.
+                  </p>
+                ) : (
+                  <div className="divide-y divide-[#D4AF37]/15 max-h-72 overflow-y-auto">
+                    {aiBrainReport.flaggedUsers.map((flag) => (
+                      <div key={`${flag.userId}-${flag.flagType}`} className="py-2.5 space-y-1.5">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="min-w-0">
+                            <p className="font-mono text-xs font-extrabold text-[#1A160D] truncate dark:text-[#FAF6EC]">
+                              {flag.email}
+                            </p>
+                            <p className="text-[11px] text-[#6E6552] tabular-nums dark:text-[#A89F8C]">
+                              <span
+                                className={
+                                  flag.riskLevel === 'high'
+                                    ? 'font-bold text-rose-600 dark:text-rose-400'
+                                    : flag.riskLevel === 'medium'
+                                      ? 'font-bold text-amber-600 dark:text-amber-300'
+                                      : 'font-bold text-emerald-600 dark:text-emerald-300'
+                                }
+                              >
+                                {flag.riskLevel.toUpperCase()} RISK
+                              </span>
+                              {' · '}
+                              {flag.flagType}
+                              {' · '}
+                              Age: {flag.accountAgeDays}d
+                              {flag.lastLoginDay ? ` · Login: ${flag.lastLoginDay}` : ''}
+                            </p>
+                          </div>
+
+                          {onModerateUser && (
+                            <button
+                              type="button"
+                              disabled={moderatingUserId === flag.userId}
+                              onClick={() => {
+                                const action =
+                                  flag.recommendedAction === 'verify'
+                                    ? 'verify'
+                                    : flag.recommendedAction === 'restrict'
+                                      ? 'restrict'
+                                      : 'ban';
+                                onModerateUser(flag.userId, action, {
+                                  reason: flag.insight,
+                                  strict: action === 'ban',
+                                });
+                              }}
+                              className="inline-flex items-center gap-1 rounded-lg border border-rose-500/35 bg-rose-500/10 px-2.5 py-1 text-[11px] font-bold text-rose-700 hover:bg-rose-500/20 whitespace-nowrap shrink-0 cursor-pointer dark:text-rose-300"
+                            >
+                              <Ban className="h-3 w-3" />
+                              <span>
+                                {flag.recommendedAction === 'verify'
+                                  ? 'Verify'
+                                  : flag.recommendedAction === 'restrict'
+                                    ? 'Restrict'
+                                    : 'Ban with AI'}
+                              </span>
+                            </button>
+                          )}
+                        </div>
+                        <p className="text-[11.5px] leading-relaxed text-[#4A4231] dark:text-[#D5CCB8]">
+                          {flag.insight}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Submitted Appeals Queue */}
+            <div className="space-y-2 rounded-xl border border-[#D4AF37]/20 bg-[#FAF7F0] p-3 dark:bg-[#0B0A07]">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
+                  Submitted Appeals ({activeAppeals.length})
+                </span>
+                <span className="text-[11px] text-[#6E6552] dark:text-[#A89F8C]">
+                  Real-time email &amp; browser confirmation status
+                </span>
+              </div>
+
+              {activeAppeals.length === 0 ? (
+                <p className="py-2 text-[11px] text-[#6E6552] dark:text-[#A89F8C]">
+                  No pending or completed user appeals right now.
+                </p>
+              ) : (
+                <div className="divide-y divide-[#D4AF37]/15 max-h-72 overflow-y-auto">
+                  {activeAppeals.map((u) => {
+                    const appeal = u.appeal!;
+                    const busyAppeal = decidingAppealId === appeal.appealId;
+                    const statusLabel =
+                      appeal.status === 'pending_email_link'
+                        ? 'Awaiting Email Link Tap'
+                        : appeal.status === 'email_confirmed_waiting'
+                          ? `Browser Confirmed · ${appeal.reviewWaitHours}h Timer`
+                          : appeal.status === 'ai_verified_restored'
+                            ? 'AI Verified & Restored'
+                            : 'Declined';
+
+                    return (
+                      <div key={appeal.appealId} className="py-2.5 space-y-1.5">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="min-w-0">
+                            <p className="font-mono text-xs font-extrabold text-[#1A160D] truncate dark:text-[#FAF6EC]">
+                              {appeal.submittedEmail}
+                            </p>
+                            <p className="text-[11px] text-[#6E6552] tabular-nums dark:text-[#A89F8C]">
+                              {appeal.registeredAuthProvider === 'google' ? 'Google Login' : 'Email Login'}
+                              {' · '}
+                              <span className="font-semibold text-[#1A160D] dark:text-[#F5D77A]">
+                                {statusLabel}
+                              </span>
+                              {appeal.emailConfirmedAt
+                                ? ` · Confirmed ${formatRelativeTime(appeal.emailConfirmedAt)}`
+                                : ` · Submitted ${formatRelativeTime(appeal.submittedAt)}`}
+                            </p>
+                          </div>
+
+                          {onDecideAppeal &&
+                            (appeal.status === 'pending_email_link' ||
+                              appeal.status === 'email_confirmed_waiting') && (
+                              <div className="flex items-center gap-1.5 shrink-0">
+                                <button
+                                  type="button"
+                                  disabled={busyAppeal}
+                                  onClick={async () => {
+                                    setDecidingAppealId(appeal.appealId);
+                                    try {
+                                      await onDecideAppeal(appeal.appealId, 'approve');
+                                    } finally {
+                                      setDecidingAppealId(null);
+                                    }
+                                  }}
+                                  className="inline-flex items-center gap-1 rounded-lg bg-emerald-600 px-2.5 py-1 text-[11px] font-bold text-white hover:bg-emerald-500 disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer"
+                                >
+                                  <CheckCircle2 className="h-3 w-3" />
+                                  <span>Approve &amp; Verify</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={busyAppeal}
+                                  onClick={async () => {
+                                    setDecidingAppealId(appeal.appealId);
+                                    try {
+                                      await onDecideAppeal(appeal.appealId, 'reject');
+                                    } finally {
+                                      setDecidingAppealId(null);
+                                    }
+                                  }}
+                                  className="inline-flex items-center gap-1 rounded-lg border border-rose-500/35 px-2.5 py-1 text-[11px] font-bold text-rose-600 hover:bg-rose-500/10 disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer dark:text-rose-300"
+                                >
+                                  <XCircle className="h-3 w-3" />
+                                  <span>Reject</span>
+                                </button>
+                              </div>
+                            )}
+                        </div>
+                        <p className="text-[11.5px] leading-relaxed text-[#4A4231] dark:text-[#D5CCB8]">
+                          “{appeal.appealDetails}”
+                        </p>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </section>
+
           {/* 1. Compact Owner Admin Console (Users Ban / Verify / Restrict) */}
           <section className="rounded-2xl border border-[#D4AF37]/30 bg-white p-4 space-y-3 dark:bg-[#14120D]">
             <div className="flex items-center justify-between gap-2">
@@ -1423,15 +1708,88 @@ export function ProfileTab({
                               </span>
                             )}
                           </div>
-                          <p className="text-[11px] text-[#6E6552] truncate dark:text-[#A89F8C]">
-                            {u.fullName || 'VeriBox User'} · {u.mailboxCount} emails
+                          <p className="text-[11px] text-[#6E6552] truncate tabular-nums dark:text-[#A89F8C]">
+                            {u.fullName || 'VeriBox User'}
+                            {u.authProvider ? ` · ${u.authProvider}` : ''}
+                            {typeof u.accountAgeDays === 'number' ? ` · ${u.accountAgeDays}d old` : ''}
+                            {` · ${u.mailboxCount} emails`}
+                            {typeof u.totalDepositedNgn === 'number'
+                              ? ` · ₦${u.totalDepositedNgn.toLocaleString()} dep`
+                              : ''}
+                            {typeof u.failedDepositAttempts === 'number' && u.failedDepositAttempts > 0
+                              ? ` · ${u.failedDepositAttempts} failed dep`
+                              : ''}
                             {u.moderationReason ? ` · ${u.moderationReason}` : ''}
                           </p>
                         </div>
-                        <span className="font-mono text-xs font-black text-[#8A6208] shrink-0 dark:text-[#F5D77A]">
+                        <span className="font-mono text-xs font-black text-[#8A6208] shrink-0 tabular-nums dark:text-[#F5D77A]">
                           ₦{u.walletBalance.toLocaleString()}
                         </span>
                       </div>
+
+                      {/* Unique AI Ban Script Inspector & Regenerator for Moderated Accounts */}
+                      {!isSelf && (u.banScript || u.status === 'banned' || u.status === 'suspended') && (
+                        <div className="pt-1 space-y-2">
+                          <div className="flex flex-wrap items-center gap-2">
+                            {u.banScript && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setExpandedScriptUserId((prev) => (prev === u.id ? null : u.id))
+                                }
+                                className="inline-flex items-center gap-1 rounded-lg border border-[#D4AF37]/30 px-2.5 py-1 text-[11px] font-bold text-[#8A6208] hover:bg-[#D4AF37]/10 whitespace-nowrap shrink-0 cursor-pointer dark:text-[#F5D77A]"
+                              >
+                                <Eye className="h-3 w-3" />
+                                <span>
+                                  {expandedScriptUserId === u.id
+                                    ? 'Hide AI Script'
+                                    : `View AI Script (${u.banScript.caseId})`}
+                                </span>
+                              </button>
+                            )}
+                            {onRegenerateUserBanScript && (
+                              <button
+                                type="button"
+                                disabled={regeneratingScriptUserId === u.id}
+                                onClick={async () => {
+                                  setRegeneratingScriptUserId(u.id);
+                                  try {
+                                    await onRegenerateUserBanScript(u.id);
+                                    setExpandedScriptUserId(u.id);
+                                  } finally {
+                                    setRegeneratingScriptUserId(null);
+                                  }
+                                }}
+                                className="inline-flex items-center gap-1 rounded-lg border border-[#D4AF37]/25 px-2.5 py-1 text-[11px] font-bold text-[#6E6552] hover:bg-[#D4AF37]/10 disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer dark:text-[#D5CCB8]"
+                              >
+                                {regeneratingScriptUserId === u.id ? (
+                                  <Loader2 className="h-3 w-3 animate-spin" />
+                                ) : (
+                                  <Sparkles className="h-3 w-3 text-[#D4AF37]" />
+                                )}
+                                <span>Regenerate Unique AI Script</span>
+                              </button>
+                            )}
+                          </div>
+
+                          {expandedScriptUserId === u.id && u.banScript && (
+                            <div className="max-h-56 overflow-y-auto rounded-xl border border-rose-500/25 bg-[#FAF7F0] p-3 space-y-2 text-[11.5px] leading-relaxed text-[#4A4231] dark:bg-[#0B0A07] dark:text-[#D5CCB8]">
+                              <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-bold text-[#1A160D] dark:text-[#FAF6EC]">
+                                <span>{u.banScript.headline}</span>
+                                <span className="font-mono text-[10px] text-[#6E6552] dark:text-[#A89F8C]">
+                                  {u.banScript.category} · {u.banScript.generatedBy}
+                                </span>
+                              </div>
+                              <p className="font-semibold text-[#1A160D] dark:text-[#FAF6EC]">
+                                {u.banScript.summaryParagraph}
+                              </p>
+                              {u.banScript.paragraphs.map((p, idx) => (
+                                <p key={idx}>{p}</p>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </div>
                   );
                 })}

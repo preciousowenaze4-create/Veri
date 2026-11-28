@@ -1,7 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { User as SupabaseUser } from '@supabase/supabase-js';
-import { AlertTriangle, RefreshCw, ShieldAlert, WifiOff, X } from 'lucide-react';
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Clock,
+  Loader2,
+  RefreshCw,
+  ShieldAlert,
+  WifiOff,
+  X,
+} from 'lucide-react';
 import { AuthModal } from './components/AuthModal';
+import { BanLockoutModal } from './components/BanLockoutModal';
 import { BottomNav } from './components/BottomNav';
 import { CornerDrawer } from './components/CornerDrawer';
 import { CreateEmailTab } from './components/CreateEmailTab';
@@ -13,10 +23,12 @@ import { SmsTab } from './components/SmsTab';
 import { TopBar } from './components/TopBar';
 import { useOnlineStatus } from './hooks/usePWAInstall';
 import type {
+  AdminAiBrainReport,
   AdminDiagnosticsResponse,
   AdminInboundTestResult,
   AdminManagedUser,
   AdminTransferRecord,
+  BanAppealRecord,
   CopiedOtpRecord,
   EmailMessageDetail,
   EmailMessageSummary,
@@ -217,6 +229,20 @@ export default function App() {
   const [reservedBalance, setReservedBalance] = useState<number>(0);
   const [depositModalOpen, setDepositModalOpen] = useState<boolean>(false);
   const [moderationLockout, setModerationLockout] = useState<UserModerationLockoutState | null>(null);
+  const [pendingAppealVerifyToken, setPendingAppealVerifyToken] = useState<string | null>(() => {
+    try {
+      return new URLSearchParams(window.location.search).get('appeal_verify');
+    } catch {
+      return null;
+    }
+  });
+  const [appealVerifyBusy, setAppealVerifyBusy] = useState<boolean>(false);
+  const [appealVerifyError, setAppealVerifyError] = useState<string | null>(null);
+  const [appealVerifyResult, setAppealVerifyResult] = useState<{
+    appeal: BanAppealRecord;
+    unlocked: boolean;
+    message: string;
+  } | null>(null);
 
   // Owner Admin Diagnostics state (only active when signed in as preciousddkid@gmail.com)
   const [adminDiagnostics, setAdminDiagnostics] = useState<AdminDiagnosticsResponse | null>(null);
@@ -232,6 +258,9 @@ export default function App() {
   const [adminUsersLoading, setAdminUsersLoading] = useState<boolean>(false);
   const [adminUsersError, setAdminUsersError] = useState<string | null>(null);
   const [moderatingUserId, setModeratingUserId] = useState<string | null>(null);
+  const [aiBrainReport, setAiBrainReport] = useState<AdminAiBrainReport | null>(null);
+  const [aiBrainLoading, setAiBrainLoading] = useState<boolean>(false);
+  const [aiReviewWaitHours, setAiReviewWaitHours] = useState<number>(6);
   const [adminTransfers, setAdminTransfers] = useState<AdminTransferRecord[]>([]);
   const [adminTransfersLoading, setAdminTransfersLoading] = useState<boolean>(false);
   const [adminTransfersError, setAdminTransfersError] = useState<string | null>(null);
@@ -690,6 +719,7 @@ export default function App() {
       const data = await parseJsonResponse<{
         users?: AdminManagedUser[];
         strictBans?: StrictBanEntry[];
+        reviewWaitHours?: number;
         error?: string;
       }>(res);
       if (!res.ok) {
@@ -697,6 +727,9 @@ export default function App() {
       }
       setAdminUsers(Array.isArray(data.users) ? data.users : []);
       setStrictBans(Array.isArray(data.strictBans) ? data.strictBans : []);
+      if (typeof data.reviewWaitHours === 'number') {
+        setAiReviewWaitHours(data.reviewWaitHours);
+      }
     } catch (err) {
       setAdminUsersError(
         err instanceof Error ? err.message : 'Failed to load registered users'
@@ -856,6 +889,186 @@ export default function App() {
         void fetchAdminUsers();
       } catch (err) {
         showToast(err instanceof Error ? err.message : 'Could not remove ban');
+      }
+    },
+    [isOwnerAdmin, getAuthAccessToken, showToast, fetchAdminUsers]
+  );
+
+  const handleConfirmAppealLink = useCallback(async () => {
+    if (!pendingAppealVerifyToken) return;
+    setAppealVerifyBusy(true);
+    setAppealVerifyError(null);
+    try {
+      const res = await fetch('/api/auth/ban-appeal/confirm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: pendingAppealVerifyToken }),
+        signal: AbortSignal.timeout(12000),
+      });
+      const data = await parseJsonResponse<{
+        ok?: boolean;
+        appeal?: BanAppealRecord;
+        unlocked?: boolean;
+        message?: string;
+        error?: string;
+      }>(res);
+      if (!res.ok || !data.ok || !data.appeal) {
+        throw new Error(data.error || 'Could not confirm this email appeal link.');
+      }
+      setAppealVerifyResult({
+        appeal: data.appeal,
+        unlocked: Boolean(data.unlocked),
+        message:
+          data.message ||
+          'Email confirmed in your browser. Return to VeriBox to track your live verification timer.',
+      });
+      void checkModerationStatus();
+    } catch (err) {
+      setAppealVerifyError(
+        err instanceof Error ? err.message : 'Could not verify appeal confirmation link.'
+      );
+    } finally {
+      setAppealVerifyBusy(false);
+    }
+  }, [pendingAppealVerifyToken, checkModerationStatus]);
+
+  const handleDismissAppealVerifyScreen = useCallback(() => {
+    setPendingAppealVerifyToken(null);
+    setAppealVerifyResult(null);
+    setAppealVerifyError(null);
+    try {
+      const clean = new URL(window.location.href);
+      clean.searchParams.delete('appeal_verify');
+      window.history.replaceState({}, document.title, `${clean.pathname}${clean.search}`);
+    } catch {
+      // non-blocking
+    }
+    void checkModerationStatus();
+  }, [checkModerationStatus]);
+
+  const handleRunAiBrainScan = useCallback(async () => {
+    if (!isOwnerAdmin) return;
+    setAiBrainLoading(true);
+    setAdminUsersError(null);
+    try {
+      const token = await getAuthAccessToken();
+      if (!token) throw new Error('HTTP 401: Missing active Supabase session token.');
+      const res = await fetch('/api/admin/ai-brain/scan', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(25000),
+      });
+      const data = await parseJsonResponse<AdminAiBrainReport & { error?: string }>(res);
+      if (!res.ok) {
+        throw new Error(data.error || `HTTP ${res.status}: AI Brain scan failed`);
+      }
+      setAiBrainReport(data);
+      if (typeof data.reviewWaitHours === 'number') {
+        setAiReviewWaitHours(data.reviewWaitHours);
+      }
+      showToast(`AI Brain scanned accounts (${data.flaggedUsers?.length || 0} flagged)`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'AI Security Brain scan failed';
+      setAdminUsersError(msg);
+      showToast(msg);
+    } finally {
+      setAiBrainLoading(false);
+    }
+  }, [isOwnerAdmin, getAuthAccessToken, showToast]);
+
+  const handleRegenerateUserBanScript = useCallback(
+    async (userId: string) => {
+      if (!isOwnerAdmin) return;
+      try {
+        const token = await getAuthAccessToken();
+        if (!token) throw new Error('HTTP 401: Missing active Supabase session token.');
+        const res = await fetch('/api/admin/ai-brain/ban-script', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ userId }),
+          signal: AbortSignal.timeout(20000),
+        });
+        const data = await parseJsonResponse<{
+          ok?: boolean;
+          banScript?: AdminManagedUser['banScript'];
+          error?: string;
+        }>(res);
+        if (!res.ok || !data.ok || !data.banScript) {
+          throw new Error(data.error || 'Could not regenerate unique AI ban script');
+        }
+        setAdminUsers((prev) =>
+          prev.map((u) => (u.id === userId ? { ...u, banScript: data.banScript } : u))
+        );
+        showToast(`Generated fresh AI ban script (${data.banScript.caseId})`);
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : 'Failed to generate AI ban script');
+      }
+    },
+    [isOwnerAdmin, getAuthAccessToken, showToast]
+  );
+
+  const handleSaveAiWaitHours = useCallback(
+    async (hours: number) => {
+      if (!isOwnerAdmin) return;
+      try {
+        const token = await getAuthAccessToken();
+        if (!token) throw new Error('HTTP 401: Missing active Supabase session token.');
+        const res = await fetch('/api/admin/ai-brain/settings', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ reviewWaitHours: hours }),
+          signal: AbortSignal.timeout(10000),
+        });
+        const data = await parseJsonResponse<{
+          ok?: boolean;
+          reviewWaitHours?: number;
+          error?: string;
+        }>(res);
+        if (!res.ok || !data.ok) {
+          throw new Error(data.error || 'Could not save wait hours');
+        }
+        setAiReviewWaitHours(data.reviewWaitHours || hours);
+        showToast(`Appeal wait timer set to ${data.reviewWaitHours || hours} hours`);
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : 'Could not update wait duration');
+      }
+    },
+    [isOwnerAdmin, getAuthAccessToken, showToast]
+  );
+
+  const handleDecideAppeal = useCallback(
+    async (appealId: string, decision: 'approve' | 'reject', note?: string) => {
+      if (!isOwnerAdmin) return;
+      try {
+        const token = await getAuthAccessToken();
+        if (!token) throw new Error('HTTP 401: Missing active Supabase session token.');
+        const res = await fetch(`/api/admin/appeals/${encodeURIComponent(appealId)}/decide`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ decision, note }),
+          signal: AbortSignal.timeout(12000),
+        });
+        const data = await parseJsonResponse<{ ok?: boolean; error?: string }>(res);
+        if (!res.ok || !data.ok) {
+          throw new Error(data.error || 'Could not update appeal');
+        }
+        showToast(
+          decision === 'approve'
+            ? 'Appeal approved & account verified in Supabase'
+            : 'Appeal declined'
+        );
+        void fetchAdminUsers();
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : 'Failed to decide appeal');
       }
     },
     [isOwnerAdmin, getAuthAccessToken, showToast, fetchAdminUsers]
@@ -1022,12 +1235,15 @@ export default function App() {
       setAdminUsersError(null);
       setAdminTransfers([]);
       setAdminTransfersError(null);
+      setAiBrainReport(null);
       setDomainErrorPopup(null);
       setProfileInitialSubTab((prev) => (prev === 'admin' ? 'account' : prev));
       setActiveTab((prev) => (prev === 'admin' ? 'home' : prev));
     }
   }, [isOwnerAdmin, authUser?.id, fetchAdminDiagnostics, fetchAdminUsers, fetchAdminTransfers]);
 
+  // Real-time moderation & appeal status polling + window focus check
+  const activeAppealStatus = moderationLockout?.appeal?.status;
   useEffect(() => {
     void checkModerationStatus();
     const handleFocus = () => {
@@ -1036,16 +1252,59 @@ export default function App() {
       }
     };
     window.addEventListener('focus', handleFocus);
+    document.addEventListener('visibilitychange', handleFocus);
+    const pollMs =
+      activeAppealStatus === 'pending_email_link' ||
+      activeAppealStatus === 'email_confirmed_waiting'
+        ? 5000
+        : 25000;
     const id = window.setInterval(() => {
       if (document.visibilityState !== 'hidden') {
         void checkModerationStatus();
       }
-    }, 25000);
+    }, pollMs);
     return () => {
       window.clearInterval(id);
       window.removeEventListener('focus', handleFocus);
+      document.removeEventListener('visibilitychange', handleFocus);
     };
-  }, [checkModerationStatus]);
+  }, [checkModerationStatus, activeAppealStatus]);
+
+  // Real-time Supabase Postgres subscription for user_moderation (unlocks/appeal updates instantly)
+  useEffect(() => {
+    if (!authUser?.id || isOwnerAdmin) return;
+    let active = true;
+    let cleanupChannel: (() => void) | null = null;
+
+    void ensureSupabaseClient().then(async (sb) => {
+      if (!active || !sb) return;
+      const token = await syncSupabaseRealtimeAuth(sb);
+      if (!active || !token) return;
+      const channel = sb
+        .channel(`user-moderation-realtime-${authUser.id}`)
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'user_moderation' },
+          () => {
+            void checkModerationStatus();
+          }
+        )
+        .subscribe((status) => {
+          if (!active) return;
+          if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+            void sb.removeChannel(channel);
+          }
+        });
+      cleanupChannel = () => {
+        void sb.removeChannel(channel);
+      };
+    });
+
+    return () => {
+      active = false;
+      cleanupChannel?.();
+    };
+  }, [authUser?.id, isOwnerAdmin, checkModerationStatus]);
 
   // Real-time Supabase Postgres subscription for owner admin
   useEffect(() => {
@@ -1093,6 +1352,13 @@ export default function App() {
         )
         .on(
           'postgres_changes',
+          { event: '*', schema: 'public', table: 'user_moderation' },
+          () => {
+            void fetchAdminUsers();
+          }
+        )
+        .on(
+          'postgres_changes',
           { event: '*', schema: 'public', table: 'app_error_logs' },
           () => {
             void fetchAdminDiagnostics(true);
@@ -1114,7 +1380,7 @@ export default function App() {
       active = false;
       cleanupChannel?.();
     };
-  }, [isOwnerAdmin, authUser?.id, fetchAdminDiagnostics, fetchAdminTransfers]);
+  }, [isOwnerAdmin, authUser?.id, fetchAdminDiagnostics, fetchAdminTransfers, fetchAdminUsers]);
 
   // Real-time silent polling while owner is viewing Profile/Admin
   useEffect(() => {
@@ -3001,44 +3267,106 @@ export default function App() {
         </div>
       )}
 
-      {moderationLockout?.blocked && moderationLockout.status !== 'restricted' && !isOwnerAdmin ? (
-        <main className="mx-auto flex min-h-[75vh] w-full max-w-lg items-center justify-center px-4 py-10">
-          <div className="w-full rounded-3xl border-2 border-rose-500/60 bg-white p-6 text-center shadow-2xl dark:bg-[#14120D]">
-            <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-rose-500/15 text-rose-500">
-              <ShieldAlert className="h-7 w-7" />
+      {pendingAppealVerifyToken ? (
+        <main className="mx-auto flex min-h-[78vh] w-full max-w-lg items-center justify-center px-4 py-10">
+          <div className="w-full rounded-3xl border border-[#D4AF37]/40 bg-white p-6 shadow-2xl space-y-4 dark:bg-[#14120D]">
+            <div className="flex items-start gap-3">
+              <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-[#D4AF37]/15 text-[#8A6208] dark:text-[#F5D77A]">
+                {appealVerifyResult ? (
+                  <CheckCircle2 className="h-6 w-6 text-emerald-500" />
+                ) : (
+                  <ShieldAlert className="h-6 w-6" />
+                )}
+              </div>
+              <div className="min-w-0">
+                <p className="text-xs font-bold text-[#8A6208] dark:text-[#F5D77A]">
+                  VeriBox Appeal Email Verification
+                </p>
+                <h1 className="mt-0.5 font-display text-lg font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
+                  {appealVerifyResult
+                    ? 'Email Confirmed in Browser'
+                    : 'Confirm Your Account Appeal'}
+                </h1>
+              </div>
             </div>
-            <p className="mt-3 text-[11px] font-extrabold uppercase tracking-wider text-rose-600 dark:text-rose-400">
-              Account {moderationLockout.status}
-              {moderationLockout.matchType ? ` · ${moderationLockout.matchType.toUpperCase()} Block` : ''}
-            </p>
-            <h1 className="mt-1 font-display text-xl font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
-              Access Suspended by Administrator
-            </h1>
-            <p className="mt-2 rounded-xl border border-rose-500/25 bg-rose-500/10 p-3 text-xs font-medium text-rose-700 dark:text-rose-200">
-              {moderationLockout.reason ||
-                'Your access to VeriBox has been disabled by the platform owner.'}
-            </p>
-            <div className="mt-5 flex flex-wrap items-center justify-center gap-2.5">
-              {isAuthenticated && (
+
+            {appealVerifyError && (
+              <div className="rounded-xl border border-rose-500/35 bg-rose-500/10 p-3 text-xs font-medium text-rose-700 dark:text-rose-200">
+                {appealVerifyError}
+              </div>
+            )}
+
+            {appealVerifyResult ? (
+              <div className="space-y-3 rounded-2xl border border-emerald-500/35 bg-emerald-500/10 p-4 text-xs text-emerald-800 dark:text-emerald-200">
+                <p className="font-bold">
+                  {appealVerifyResult.message}
+                </p>
+                <div className="flex flex-wrap items-center gap-2 text-[11px] tabular-nums">
+                  <Clock className="h-3.5 w-3.5" />
+                  <span>
+                    Email: <strong className="font-mono">{appealVerifyResult.appeal.submittedEmail}</strong>
+                    {' · '}
+                    Review Window: <strong>{appealVerifyResult.appeal.reviewWaitHours}h</strong>
+                  </span>
+                </div>
                 <button
                   type="button"
-                  onClick={() => void handleSignOut()}
-                  className="rounded-xl border border-rose-500/35 px-4 py-2 text-xs font-bold text-rose-600 hover:bg-rose-500/10 dark:text-rose-300"
+                  onClick={handleDismissAppealVerifyScreen}
+                  className="inline-flex min-h-[40px] w-full items-center justify-center gap-2 rounded-xl bg-[#D4AF37] px-4 py-2 text-xs font-black text-[#0A0906] hover:bg-[#E5C150] cursor-pointer"
                 >
-                  Sign Out
+                  <span>Return to VeriBox App</span>
                 </button>
-              )}
-              <button
-                type="button"
-                onClick={() => void checkModerationStatus()}
-                className="inline-flex items-center gap-1.5 rounded-xl bg-[#D4AF37] px-4 py-2 text-xs font-extrabold text-[#0A0906] hover:bg-[#E5C150]"
-              >
-                <RefreshCw className="h-3.5 w-3.5" />
-                <span>Re-check Access</span>
-              </button>
-            </div>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                <p className="text-xs leading-relaxed text-[#4A4231] dark:text-[#D5CCB8]">
+                  Tap the confirmation button below to verify your email ownership in this browser. Once confirmed, return to your VeriBox app where your live AI verification timer will begin counting down.
+                </p>
+                <div className="flex flex-wrap items-center gap-2.5">
+                  <button
+                    type="button"
+                    disabled={appealVerifyBusy}
+                    onClick={() => void handleConfirmAppealLink()}
+                    className="inline-flex min-h-[42px] flex-1 items-center justify-center gap-2 rounded-xl bg-emerald-600 px-4 py-2 text-xs font-extrabold text-white hover:bg-emerald-500 disabled:opacity-60 cursor-pointer"
+                  >
+                    {appealVerifyBusy ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <CheckCircle2 className="h-4 w-4" />
+                    )}
+                    <span>{appealVerifyBusy ? 'Confirming Email...' : 'Confirm Email in Browser'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleDismissAppealVerifyScreen}
+                    className="inline-flex min-h-[42px] items-center justify-center rounded-xl border border-[#D4AF37]/30 px-3.5 py-2 text-xs font-bold text-[#6E6552] hover:bg-[#D4AF37]/10 cursor-pointer dark:text-[#D5CCB8]"
+                  >
+                    Back to App
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </main>
+      ) : moderationLockout?.blocked && moderationLockout.status !== 'restricted' && !isOwnerAdmin ? (
+        <BanLockoutModal
+          lockout={moderationLockout}
+          isAuthenticated={isAuthenticated}
+          defaultEmail={authUser?.email ?? null}
+          onAppealUpdated={(updatedAppeal, unlocked) => {
+            if (unlocked) {
+              setModerationLockout(null);
+              showToast('Your account has been verified and restored!');
+              void checkModerationStatus();
+              return;
+            }
+            setModerationLockout((prev) =>
+              prev ? { ...prev, appeal: updatedAppeal } : prev
+            );
+          }}
+          onRefreshStatus={checkModerationStatus}
+          onSignOut={handleSignOut}
+        />
       ) : (
         <>
           {moderationLockout?.blocked && moderationLockout.status === 'restricted' && !isOwnerAdmin && (
@@ -3309,6 +3637,9 @@ export default function App() {
             testingInbound={testingInbound}
             adminTestResult={isOwnerAdmin ? adminTestResult : null}
             adminTestError={isOwnerAdmin ? adminTestError : null}
+            aiBrainReport={isOwnerAdmin ? aiBrainReport : null}
+            aiBrainLoading={aiBrainLoading}
+            aiReviewWaitHours={aiReviewWaitHours}
             onCreateEmail={() =>
               requireAuth('Sign in to create an email', () => setActiveTab('create'))
             }
@@ -3368,6 +3699,10 @@ export default function App() {
               isOwnerAdmin ? (addr) => void handleTestInboundPipeline(addr) : undefined
             }
             onSendEmail={isOwnerAdmin ? handleSendEmail : undefined}
+            onRunAiBrainScan={isOwnerAdmin ? handleRunAiBrainScan : undefined}
+            onRegenerateUserBanScript={isOwnerAdmin ? handleRegenerateUserBanScript : undefined}
+            onSaveAiWaitHours={isOwnerAdmin ? handleSaveAiWaitHours : undefined}
+            onDecideAppeal={isOwnerAdmin ? handleDecideAppeal : undefined}
           />
         )}
       </main>

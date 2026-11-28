@@ -371,6 +371,74 @@ export interface AdminDiagnosticsResponse {
 export type UserModerationStatus = 'active' | 'verified' | 'restricted' | 'suspended' | 'banned';
 export type UserModerationAction = 'verify' | 'restrict' | 'suspend' | 'ban' | 'restore';
 
+export type BanScriptCategory =
+  | 'fake_deposit'
+  | 'inactive_no_deposit_30d'
+  | 'free_tier_abuse'
+  | 'owner_trust_review'
+  | 'multi_account_ip'
+  | 'policy_violation';
+
+export interface AiBanScript {
+  caseId: string;
+  headline: string;
+  category: BanScriptCategory;
+  summaryParagraph: string;
+  paragraphs: string[];
+  whatHappenedBullets: string[];
+  whatYouCanDo: string;
+  riskLevel: 'high' | 'medium' | 'low';
+  generatedBy: string;
+  generatedAt: string;
+  lastLoginDayChecked: string | null;
+  accountAgeDays: number | null;
+}
+
+export type BanAppealStatus =
+  | 'none'
+  | 'pending_email_link'
+  | 'email_confirmed_waiting'
+  | 'ai_verified_restored'
+  | 'rejected';
+
+export interface BanAppealRecord {
+  appealId: string;
+  userId: string | null;
+  submittedEmail: string;
+  registeredEmailMatched: boolean;
+  registeredAuthProvider: string | null;
+  appealDetails: string;
+  fullName: string | null;
+  status: BanAppealStatus;
+  verificationLinkSentVia: 'resend' | 'supabase' | 'both' | null;
+  submittedAt: string;
+  emailConfirmedAt: string | null;
+  reviewWaitHours: number;
+  reviewEligibleAt: string | null;
+  aiVerdictAt: string | null;
+  aiVerdictNote: string | null;
+  reviewedByOwner: string | null;
+}
+
+export interface AdminAiBrainFlag {
+  userId: string;
+  email: string;
+  riskLevel: 'high' | 'medium' | 'low';
+  flagType: string;
+  lastLoginDay: string | null;
+  accountAgeDays: number;
+  insight: string;
+  recommendedAction: 'ban' | 'restrict' | 'verify' | 'monitor';
+}
+
+export interface AdminAiBrainReport {
+  analyzedAt: string;
+  provider: string;
+  summary: string;
+  reviewWaitHours: number;
+  flaggedUsers: AdminAiBrainFlag[];
+}
+
 export interface StrictBanEntry {
   id: string;
   targetType: 'user' | 'email' | 'ip';
@@ -387,6 +455,12 @@ export interface UserModerationLockoutState {
   reason: string | null;
   strict: boolean;
   matchType?: 'user' | 'email' | 'ip' | null;
+  userId?: string | null;
+  email?: string | null;
+  bannedAt?: string | null;
+  lastSignInAt?: string | null;
+  banScript?: AiBanScript | null;
+  appeal?: BanAppealRecord | null;
 }
 
 export interface AdminManagedUser {
@@ -397,13 +471,19 @@ export interface AdminManagedUser {
   createdAt: string;
   lastSignInAt: string | null;
   emailConfirmed: boolean;
+  authProvider?: string | null;
   status: UserModerationStatus;
   bannedUntil: string | null;
   walletBalance: number;
   mailboxCount: number;
+  totalDepositedNgn?: number;
+  failedDepositAttempts?: number;
+  accountAgeDays?: number;
   moderationReason: string | null;
   strictBanned?: boolean;
   lastIp?: string | null;
+  banScript?: AiBanScript | null;
+  appeal?: BanAppealRecord | null;
 }
 
 export interface AdminReadinessCheckItem {

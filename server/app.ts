@@ -2820,6 +2820,54 @@ export function createApiApp() {
 
   // Strict Moderation & Visitor Ban Registry (supports User ID, Email & IP blocking)
   type ModerationStatusValue = 'active' | 'verified' | 'restricted' | 'suspended' | 'banned';
+  type BanScriptCategoryValue =
+    | 'fake_deposit'
+    | 'inactive_no_deposit_30d'
+    | 'free_tier_abuse'
+    | 'owner_trust_review'
+    | 'multi_account_ip'
+    | 'policy_violation';
+  type BanAppealStatusValue =
+    | 'none'
+    | 'pending_email_link'
+    | 'email_confirmed_waiting'
+    | 'ai_verified_restored'
+    | 'rejected';
+
+  interface AiBanScriptRecord {
+    caseId: string;
+    headline: string;
+    category: BanScriptCategoryValue;
+    summaryParagraph: string;
+    paragraphs: string[];
+    whatHappenedBullets: string[];
+    whatYouCanDo: string;
+    riskLevel: 'high' | 'medium' | 'low';
+    generatedBy: string;
+    generatedAt: string;
+    lastLoginDayChecked: string | null;
+    accountAgeDays: number | null;
+  }
+
+  interface BanAppealServerRecord {
+    appealId: string;
+    userId: string | null;
+    submittedEmail: string;
+    registeredEmailMatched: boolean;
+    registeredAuthProvider: string | null;
+    appealDetails: string;
+    fullName: string | null;
+    status: BanAppealStatusValue;
+    verificationLinkSentVia: 'resend' | 'supabase' | 'both' | null;
+    submittedAt: string;
+    emailConfirmedAt: string | null;
+    reviewWaitHours: number;
+    reviewEligibleAt: string | null;
+    aiVerdictAt: string | null;
+    aiVerdictNote: string | null;
+    reviewedByOwner: string | null;
+  }
+
   interface StrictBanEntryRecord {
     id: string;
     targetType: 'user' | 'email' | 'ip';
@@ -2838,12 +2886,20 @@ export function createApiApp() {
       strict: boolean;
       email?: string | null;
       ip?: string | null;
+      bannedAt?: string | null;
       updatedAt: number;
     }
   >();
   const bannedEmailsSet = new Map<string, StrictBanEntryRecord>();
   const bannedIpsSet = new Map<string, StrictBanEntryRecord>();
   const lastKnownUserIpMap = new Map<string, string>();
+  const banScriptByUserIdMap = new Map<string, AiBanScriptRecord>();
+  const banScriptByEmailMap = new Map<string, AiBanScriptRecord>();
+  const banAppealsByIdMap = new Map<string, BanAppealServerRecord>();
+  const banAppealsByUserIdMap = new Map<string, BanAppealServerRecord>();
+  const banAppealsByEmailMap = new Map<string, BanAppealServerRecord>();
+  const banScriptInFlightMap = new Map<string, Promise<AiBanScriptRecord>>();
+  let aiReviewWaitHours = 6; // Default 6 hours (owner-configurable between 5 and 24 hours)
   let moderationDbHydratedAt = 0;
 
   function getRequestClientIp(req: express.Request): string {
@@ -2859,8 +2915,102 @@ export function createApiApp() {
     lastKnownUserIpMap.set(userId, ip);
   }
 
+  function storeBanScriptInMemory(userId: string | null | undefined, email: string | null | undefined, script: AiBanScriptRecord): void {
+    if (userId && !userId.startsWith('email:') && !userId.startsWith('ip:')) {
+      banScriptByUserIdMap.set(userId, script);
+    }
+    const cleanEmail = (email || '').trim().toLowerCase();
+    if (cleanEmail) {
+      banScriptByEmailMap.set(cleanEmail, script);
+    }
+  }
+
+  function storeBanAppealInMemory(appeal: BanAppealServerRecord): void {
+    banAppealsByIdMap.set(appeal.appealId, appeal);
+    if (appeal.userId) {
+      banAppealsByUserIdMap.set(appeal.userId, appeal);
+    }
+    const cleanEmail = appeal.submittedEmail.trim().toLowerCase();
+    if (cleanEmail) {
+      banAppealsByEmailMap.set(cleanEmail, appeal);
+    }
+  }
+
+  async function persistBanScriptToDb(
+    userId: string | null | undefined,
+    email: string | null | undefined,
+    script: AiBanScriptRecord,
+    updatedBy: string
+  ): Promise<void> {
+    storeBanScriptInMemory(userId, email, script);
+    const sb = getSupabaseServerClient();
+    if (!sb) return;
+    const cleanEmail = (email || '').trim().toLowerCase() || null;
+    const key =
+      userId && !userId.startsWith('email:') && !userId.startsWith('ip:')
+        ? `script:${userId}`
+        : cleanEmail
+          ? `script-email:${cleanEmail}`
+          : '';
+    if (!key) return;
+    try {
+      await sb.from('user_moderation').upsert(
+        {
+          user_id: key,
+          email: cleanEmail,
+          status: 'meta',
+          reason: JSON.stringify(script),
+          updated_by: updatedBy,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: 'user_id' }
+      );
+    } catch {
+      // Non-blocking
+    }
+  }
+
+  async function persistBanAppealToDb(appeal: BanAppealServerRecord): Promise<void> {
+    storeBanAppealInMemory(appeal);
+    const sb = getSupabaseServerClient();
+    if (!sb) return;
+    const cleanEmail = appeal.submittedEmail.trim().toLowerCase();
+    const nowIso = new Date().toISOString();
+    try {
+      const payload = JSON.stringify(appeal);
+      if (appeal.userId) {
+        await sb.from('user_moderation').upsert(
+          {
+            user_id: `appeal:${appeal.userId}`,
+            email: cleanEmail,
+            status: 'meta',
+            reason: payload,
+            updated_by: appeal.reviewedByOwner || 'appeal-system',
+            updated_at: nowIso,
+          },
+          { onConflict: 'user_id' }
+        );
+      }
+      if (cleanEmail) {
+        await sb.from('user_moderation').upsert(
+          {
+            user_id: `appeal-email:${cleanEmail}`,
+            email: cleanEmail,
+            status: 'meta',
+            reason: payload,
+            updated_by: appeal.reviewedByOwner || 'appeal-system',
+            updated_at: nowIso,
+          },
+          { onConflict: 'user_id' }
+        );
+      }
+    } catch {
+      // Non-blocking
+    }
+  }
+
   async function hydrateModerationFromDb(force = false): Promise<void> {
-    if (!force && Date.now() - moderationDbHydratedAt < 15_000) return;
+    if (!force && Date.now() - moderationDbHydratedAt < 10_000) return;
     moderationDbHydratedAt = Date.now();
     const sb = getSupabaseServerClient();
     if (!sb) return;
@@ -2882,6 +3032,68 @@ export function createApiApp() {
         const email = String(r.email || '').trim().toLowerCase();
         const status = String(r.status || 'active').toLowerCase() as ModerationStatusValue;
         const reason = r.reason ? String(r.reason) : null;
+
+        if (uid === 'ai_settings:config' && reason) {
+          try {
+            const cfg = JSON.parse(reason) as { reviewWaitHours?: number };
+            if (typeof cfg.reviewWaitHours === 'number' && cfg.reviewWaitHours >= 1 && cfg.reviewWaitHours <= 72) {
+              aiReviewWaitHours = Math.round(cfg.reviewWaitHours);
+            }
+          } catch {
+            // ignore
+          }
+          continue;
+        }
+
+        if (uid.startsWith('script:')) {
+          const targetUid = uid.slice(7).trim();
+          if (reason && targetUid) {
+            try {
+              const parsed = JSON.parse(reason) as AiBanScriptRecord;
+              if (parsed && typeof parsed.headline === 'string') {
+                storeBanScriptInMemory(targetUid, email, parsed);
+              }
+            } catch {
+              // ignore malformed json
+            }
+          }
+          continue;
+        }
+
+        if (uid.startsWith('script-email:')) {
+          const targetEmail = (uid.slice(13) || email).trim().toLowerCase();
+          if (reason && targetEmail) {
+            try {
+              const parsed = JSON.parse(reason) as AiBanScriptRecord;
+              if (parsed && typeof parsed.headline === 'string') {
+                storeBanScriptInMemory(null, targetEmail, parsed);
+              }
+            } catch {
+              // ignore malformed json
+            }
+          }
+          continue;
+        }
+
+        if (uid.startsWith('appeal:') || uid.startsWith('appeal-email:')) {
+          if (reason) {
+            try {
+              const parsed = JSON.parse(reason) as BanAppealServerRecord;
+              if (parsed && parsed.appealId) {
+                const existing = banAppealsByIdMap.get(parsed.appealId);
+                const existingRank = existing?.status === 'ai_verified_restored' ? 4 : existing?.status === 'rejected' ? 4 : existing?.status === 'email_confirmed_waiting' ? 3 : 1;
+                const parsedRank = parsed.status === 'ai_verified_restored' ? 4 : parsed.status === 'rejected' ? 4 : parsed.status === 'email_confirmed_waiting' ? 3 : 1;
+                if (!existing || parsedRank >= existingRank) {
+                  storeBanAppealInMemory(parsed);
+                }
+              }
+            } catch {
+              // ignore malformed json
+            }
+          }
+          continue;
+        }
+
         if (email === OWNER_ADMIN_EMAIL) continue;
 
         if (uid.startsWith('ip:')) {
@@ -2921,23 +3133,29 @@ export function createApiApp() {
         }
 
         if (uid) {
-          strictModerationUserMap.set(uid, {
-            status,
-            reason,
-            strict: status === 'banned',
-            email: email || null,
-            updatedAt: Date.now(),
-          });
-          if (status === 'banned' && email) {
-            bannedEmailsSet.set(email, {
-              id: `email:${email}`,
-              targetType: 'email',
-              targetValue: email,
+          if (['banned', 'suspended', 'restricted'].includes(status)) {
+            strictModerationUserMap.set(uid, {
+              status,
               reason,
-              strict: true,
-              bannedBy: r.updated_by || null,
-              createdAt: r.updated_at || new Date().toISOString(),
+              strict: status === 'banned',
+              email: email || null,
+              bannedAt: r.updated_at || new Date().toISOString(),
+              updatedAt: Date.now(),
             });
+            if (status === 'banned' && email) {
+              bannedEmailsSet.set(email, {
+                id: `email:${email}`,
+                targetType: 'email',
+                targetValue: email,
+                reason,
+                strict: true,
+                bannedBy: r.updated_by || null,
+                createdAt: r.updated_at || new Date().toISOString(),
+              });
+            }
+          } else {
+            strictModerationUserMap.delete(uid);
+            if (email) bannedEmailsSet.delete(email);
           }
         }
       }
@@ -3128,6 +3346,749 @@ export function createApiApp() {
     return Boolean(user && user.email === OWNER_ADMIN_EMAIL);
   }
 
+  interface AccountSecurityTelemetry {
+    userId: string | null;
+    email: string | null;
+    fullName: string | null;
+    authProvider: string;
+    emailConfirmed: boolean;
+    createdAt: string | null;
+    accountAgeDays: number;
+    lastSignInAt: string | null;
+    lastLoginDayFormatted: string | null;
+    walletBalance: number;
+    successfulDepositsCount: number;
+    totalDepositedNgn: number;
+    failedOrPendingDepositsCount: number;
+    failedDepositDetails: string[];
+    debitOrdersCount: number;
+    p2pTransfersCount: number;
+    mailboxCount: number;
+    lastIp: string | null;
+    sharedIpAccountsCount: number;
+  }
+
+  function formatReadableDay(isoDate: string | null | undefined): string | null {
+    if (!isoDate) return null;
+    const ms = Date.parse(isoDate);
+    if (!Number.isFinite(ms)) return null;
+    try {
+      return new Date(ms).toLocaleString('en-US', {
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+        timeZone: 'UTC',
+      }) + ' UTC';
+    } catch {
+      return new Date(ms).toISOString();
+    }
+  }
+
+  function extractSupabaseAuthProvider(u: {
+    app_metadata?: Record<string, unknown> | null;
+    identities?: Array<{ provider?: string }> | null;
+  }): string {
+    const providers = Array.isArray(u.app_metadata?.providers)
+      ? (u.app_metadata?.providers as unknown[]).map((p) => String(p).toLowerCase())
+      : [];
+    const primary = String(u.app_metadata?.provider || '').toLowerCase();
+    const idProviders = Array.isArray(u.identities)
+      ? u.identities.map((i) => String(i.provider || '').toLowerCase())
+      : [];
+    const all = [...providers, primary, ...idProviders];
+    if (all.includes('google')) return 'google';
+    return primary || idProviders[0] || 'email';
+  }
+
+  function createSignedAppealToken(payload: {
+    appealId: string;
+    userId: string | null;
+    email: string;
+    exp: number;
+  }): string {
+    const encoded = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+    const sig = crypto
+      .createHmac('sha256', getMailboxSigningSecret())
+      .update(`appeal:${encoded}`)
+      .digest('hex')
+      .slice(0, 36);
+    return `${encoded}.${sig}`;
+  }
+
+  function verifySignedAppealToken(
+    rawToken: string
+  ): { appealId: string; userId: string | null; email: string; exp: number } | null {
+    if (!rawToken || !rawToken.includes('.')) return null;
+    const [encoded, sig] = rawToken.trim().split('.');
+    if (!encoded || !sig) return null;
+    const expectedSig = crypto
+      .createHmac('sha256', getMailboxSigningSecret())
+      .update(`appeal:${encoded}`)
+      .digest('hex')
+      .slice(0, 36);
+    if (!safeSecretsEqual(sig, expectedSig)) return null;
+    try {
+      const parsed = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')) as {
+        appealId?: string;
+        userId?: string | null;
+        email?: string;
+        exp?: number;
+      };
+      if (!parsed.appealId || !parsed.email || !parsed.exp || Date.now() > parsed.exp) {
+        return null;
+      }
+      return {
+        appealId: String(parsed.appealId),
+        userId: parsed.userId ? String(parsed.userId) : null,
+        email: String(parsed.email).trim().toLowerCase(),
+        exp: Number(parsed.exp),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  function getSafeAppOrigin(req: express.Request): string {
+    const envUrl = String(process.env.APP_URL || '').trim();
+    if (envUrl && /^https?:\/\//i.test(envUrl) && !envUrl.includes('MY_APP_URL')) {
+      try {
+        return new URL(envUrl).origin;
+      } catch {
+        // ignore invalid APP_URL
+      }
+    }
+    const originHeader = typeof req.headers.origin === 'string' ? req.headers.origin.trim() : '';
+    if (originHeader && /^https?:\/\//i.test(originHeader)) {
+      try {
+        return new URL(originHeader).origin;
+      } catch {
+        // ignore
+      }
+    }
+    const xfProto =
+      typeof req.headers['x-forwarded-proto'] === 'string'
+        ? req.headers['x-forwarded-proto'].split(',')[0].trim()
+        : req.protocol || 'https';
+    const host =
+      (typeof req.headers['x-forwarded-host'] === 'string'
+        ? req.headers['x-forwarded-host'].split(',')[0].trim()
+        : '') ||
+      req.get('host') ||
+      `www.${CUSTOM_EMAIL_DOMAIN}`;
+    const safeProto = xfProto === 'http' ? 'http' : 'https';
+    return `${safeProto}://${host}`;
+  }
+
+  async function findSupabaseUserByEmail(email: string): Promise<{
+    id: string;
+    email: string;
+    fullName: string | null;
+    authProvider: string;
+    emailConfirmed: boolean;
+    createdAt: string;
+    lastSignInAt: string | null;
+    appMetadata: Record<string, unknown>;
+    bannedUntil: string | null;
+  } | null> {
+    const target = email.trim().toLowerCase();
+    if (!target) return null;
+    const sb = getSupabaseServerClient();
+    if (!sb) return null;
+    try {
+      for (let page = 1; page <= 5; page++) {
+        const { data, error } = await sb.auth.admin.listUsers({ page, perPage: 200 });
+        if (error || !Array.isArray(data?.users) || data.users.length === 0) break;
+        const found = data.users.find((u) => (u.email || '').trim().toLowerCase() === target);
+        if (found) {
+          const userMeta = (found.user_metadata || {}) as Record<string, unknown>;
+          return {
+            id: found.id,
+            email: (found.email || '').trim().toLowerCase(),
+            fullName:
+              typeof userMeta.full_name === 'string'
+                ? userMeta.full_name
+                : typeof userMeta.name === 'string'
+                  ? userMeta.name
+                  : null,
+            authProvider: extractSupabaseAuthProvider(found),
+            emailConfirmed: Boolean(found.email_confirmed_at),
+            createdAt: found.created_at,
+            lastSignInAt: found.last_sign_in_at || null,
+            appMetadata: (found.app_metadata || {}) as Record<string, unknown>,
+            bannedUntil:
+              typeof (found as { banned_until?: string | null }).banned_until === 'string'
+                ? (found as { banned_until?: string | null }).banned_until || null
+                : null,
+          };
+        }
+        if (data.users.length < 200) break;
+      }
+    } catch {
+      // Non-blocking
+    }
+    return null;
+  }
+
+  async function gatherAccountTelemetry(
+    userId: string | null | undefined,
+    emailHint?: string | null
+  ): Promise<AccountSecurityTelemetry> {
+    const cleanUid = userId && !userId.startsWith('email:') && !userId.startsWith('ip:') ? userId : null;
+    let cleanEmail = emailHint ? emailHint.trim().toLowerCase() : null;
+    let fullName: string | null = null;
+    let authProvider = 'email';
+    let emailConfirmed = false;
+    let createdAt: string | null = null;
+    let lastSignInAt: string | null = null;
+    let walletBalance = 0;
+    let successfulDepositsCount = 0;
+    let totalDepositedNgn = 0;
+    let failedOrPendingDepositsCount = 0;
+    const failedDepositDetails: string[] = [];
+    let debitOrdersCount = 0;
+    let p2pTransfersCount = 0;
+    let mailboxCount = 0;
+
+    const sb = getSupabaseServerClient();
+    if (sb) {
+      try {
+        let authUserObj: {
+          id: string;
+          email?: string;
+          user_metadata?: Record<string, unknown>;
+          app_metadata?: Record<string, unknown>;
+          identities?: Array<{ provider?: string }>;
+          email_confirmed_at?: string | null;
+          created_at: string;
+          last_sign_in_at?: string | null;
+        } | null = null;
+
+        if (cleanUid) {
+          const { data } = await sb.auth.admin.getUserById(cleanUid);
+          if (data?.user) authUserObj = data.user;
+        }
+        if (!authUserObj && cleanEmail) {
+          const matched = await findSupabaseUserByEmail(cleanEmail);
+          if (matched) {
+            const { data } = await sb.auth.admin.getUserById(matched.id);
+            if (data?.user) authUserObj = data.user;
+          }
+        }
+
+        const resolvedUid = authUserObj?.id || cleanUid;
+        if (authUserObj) {
+          cleanEmail = (authUserObj.email || cleanEmail || '').trim().toLowerCase() || null;
+          const uMeta = (authUserObj.user_metadata || {}) as Record<string, unknown>;
+          fullName =
+            typeof uMeta.full_name === 'string'
+              ? uMeta.full_name
+              : typeof uMeta.name === 'string'
+                ? uMeta.name
+                : null;
+          authProvider = extractSupabaseAuthProvider(authUserObj);
+          emailConfirmed = Boolean(authUserObj.email_confirmed_at);
+          createdAt = authUserObj.created_at || null;
+          lastSignInAt = authUserObj.last_sign_in_at || null;
+        }
+
+        if (resolvedUid) {
+          const [wRes, txRes, mbRes] = await Promise.all([
+            sb.from('wallets').select('balance').eq('user_id', resolvedUid).maybeSingle(),
+            sb
+              .from('wallet_transactions')
+              .select('tx_type, amount, status, details, created_at')
+              .eq('user_id', resolvedUid)
+              .order('created_at', { ascending: false })
+              .limit(60),
+            sb
+              .from('mailboxes')
+              .select('id, is_deleted')
+              .eq('owner_user_id', resolvedUid),
+          ]);
+
+          if (!wRes.error && wRes.data) {
+            walletBalance = Number((wRes.data as { balance?: number }).balance) || 0;
+          }
+          if (!mbRes.error && Array.isArray(mbRes.data)) {
+            mailboxCount = mbRes.data.filter((m) => !(m as { is_deleted?: boolean }).is_deleted).length;
+          }
+          if (!txRes.error && Array.isArray(txRes.data)) {
+            for (const row of txRes.data) {
+              const t = row as {
+                tx_type?: string;
+                amount?: number;
+                status?: string;
+                details?: string;
+                created_at?: string;
+              };
+              const txType = String(t.tx_type || '').toLowerCase();
+              const txStatus = String(t.status || '').toLowerCase();
+              const amt = Number(t.amount) || 0;
+              if (txType === 'deposit') {
+                if (txStatus === 'success' || txStatus === 'completed') {
+                  successfulDepositsCount++;
+                  totalDepositedNgn += amt;
+                } else {
+                  failedOrPendingDepositsCount++;
+                  if (failedDepositDetails.length < 3) {
+                    failedDepositDetails.push(
+                      `₦${amt.toLocaleString()} (${txStatus || 'unverified'}) on ${formatReadableDay(t.created_at) || 'recent date'}`
+                    );
+                  }
+                }
+              } else if (txType === 'debit') {
+                debitOrdersCount++;
+              } else if (txType === 'p2p_transfer') {
+                p2pTransfersCount++;
+              }
+            }
+          }
+        }
+      } catch {
+        // Non-blocking partial telemetry
+      }
+    }
+
+    const effectiveUid = cleanUid || null;
+    const lastIp = effectiveUid
+      ? lastKnownUserIpMap.get(effectiveUid) || strictModerationUserMap.get(effectiveUid)?.ip || null
+      : null;
+    let sharedIpAccountsCount = 0;
+    if (lastIp) {
+      for (const ipVal of lastKnownUserIpMap.values()) {
+        if (ipVal === lastIp) sharedIpAccountsCount++;
+      }
+    }
+
+    const accountAgeDays = createdAt
+      ? Math.max(0, Math.floor((Date.now() - Date.parse(createdAt)) / 86_400_000))
+      : 0;
+
+    return {
+      userId: effectiveUid,
+      email: cleanEmail,
+      fullName,
+      authProvider,
+      emailConfirmed,
+      createdAt,
+      accountAgeDays,
+      lastSignInAt,
+      lastLoginDayFormatted: formatReadableDay(lastSignInAt),
+      walletBalance,
+      successfulDepositsCount,
+      totalDepositedNgn,
+      failedOrPendingDepositsCount,
+      failedDepositDetails,
+      debitOrdersCount,
+      p2pTransfersCount,
+      mailboxCount,
+      lastIp,
+      sharedIpAccountsCount,
+    };
+  }
+
+  async function callSecurityBrainLlm<T>(params: {
+    systemInstruction: string;
+    prompt: string;
+    responseSchema: Record<string, unknown>;
+  }): Promise<{ data: T; provider: string }> {
+    const geminiKey = String(process.env.GEMINI_API_KEY || '').trim();
+    if (geminiKey) {
+      try {
+        const ai = new GoogleGenAI({
+          apiKey: geminiKey,
+          httpOptions: {
+            headers: {
+              'User-Agent': 'aistudio-build',
+            },
+          },
+        });
+        const response: GenerateContentResponse = await ai.models.generateContent({
+          model: 'gemini-4-hydrogen',
+          contents: params.prompt,
+          config: {
+            systemInstruction: params.systemInstruction,
+            responseMimeType: 'application/json',
+            responseSchema: params.responseSchema as never,
+          },
+        });
+        const rawText = (response.text || '').trim();
+        if (rawText) {
+          const parsed = JSON.parse(rawText) as T;
+          return { data: parsed, provider: 'Gemini AI' };
+        }
+      } catch (err) {
+        console.warn('Security Brain Gemini call failed, trying secondary LLM:', err instanceof Error ? err.message : err);
+      }
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 11_000);
+    try {
+      const r = await fetch('https://text.pollinations.ai/openai', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': USER_AGENT,
+        },
+        body: JSON.stringify({
+          model: 'openai-fast',
+          messages: [
+            {
+              role: 'system',
+              content: `${params.systemInstruction}\nReturn ONLY valid JSON matching the requested schema.`,
+            },
+            {
+              role: 'user',
+              content: params.prompt,
+            },
+          ],
+          jsonMode: true,
+        }),
+        signal: controller.signal,
+      });
+      if (!r.ok) {
+        throw new Error(`AI Security Brain upstream returned HTTP ${r.status}`);
+      }
+      const json = (await r.json()) as {
+        choices?: Array<{ message?: { content?: string } }>;
+      };
+      const rawContent = (json.choices?.[0]?.message?.content || '').trim();
+      const cleaned = rawContent
+        .replace(/^```json\s*/i, '')
+        .replace(/^```\s*/i, '')
+        .replace(/```$/i, '')
+        .trim();
+      const parsed = JSON.parse(cleaned) as T;
+      return { data: parsed, provider: 'VeriBox AI Brain' };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function generateUniqueAiBanScript(params: {
+    telemetry: AccountSecurityTelemetry;
+    moderationStatus: ModerationStatusValue;
+    ownerReason?: string | null;
+    matchType?: 'user' | 'email' | 'ip' | null;
+    existingScript?: AiBanScriptRecord | null;
+    forceRegenerate?: boolean;
+  }): Promise<AiBanScriptRecord> {
+    if (!params.forceRegenerate && params.existingScript) {
+      return params.existingScript;
+    }
+
+    const dedupeKey =
+      params.telemetry.userId || params.telemetry.email || params.telemetry.lastIp || 'visitor';
+    if (!params.forceRegenerate && banScriptInFlightMap.has(dedupeKey)) {
+      return banScriptInFlightMap.get(dedupeKey)!;
+    }
+
+    const taskPromise = (async (): Promise<AiBanScriptRecord> => {
+      const recentIssuedScripts: string[] = [];
+      for (const [uidKey, s] of banScriptByUserIdMap.entries()) {
+        if (uidKey !== params.telemetry.userId && recentIssuedScripts.length < 5) {
+          recentIssuedScripts.push(
+            `- Headline: "${s.headline}" | Category: ${s.category} | Opening: "${s.summaryParagraph.slice(0, 140)}"`
+          );
+        }
+      }
+      for (const [emKey, s] of banScriptByEmailMap.entries()) {
+        if (emKey !== params.telemetry.email && recentIssuedScripts.length < 6) {
+          recentIssuedScripts.push(
+            `- Headline: "${s.headline}" | Category: ${s.category} | Opening: "${s.summaryParagraph.slice(0, 140)}"`
+          );
+        }
+      }
+
+      const systemInstruction = `You are the VeriBox Trust & Security AI Brain. When an account or visitor is banned, suspended, or restricted on VeriBox (a domain email & private OTP verification platform), you write a comprehensive, deeply personalized, Facebook-style "Your Account Has Been Disabled / Security Review" notice.
+
+CRITICAL RULES:
+1. NEVER write generic copy-paste wording. Every single user must receive a genuinely unique, original multi-paragraph explanation referencing their specific telemetry (the exact day/time they logged in, how many days old their account is, their real deposit or failed deposit attempts, free mailbox usage, IP overlap, and any owner note).
+2. Avoid repeating headlines, opening phrasing, or paragraph templates listed in ALREADY_ISSUED_SCRIPTS_TO_AVOID.
+3. Choose the category that best reflects the real evidence:
+   - "fake_deposit": if failedOrPendingDepositsCount > 0 or owner note mentions fake/unverified deposit
+   - "inactive_no_deposit_30d": if accountAgeDays >= 20 and successfulDepositsCount === 0
+   - "free_tier_abuse": if mailboxCount > 0 and totalDepositedNgn === 0
+   - "multi_account_ip": if sharedIpAccountsCount > 1 or matchType === "ip"
+   - "owner_trust_review": if the owner manually restricted/banned the account on trust grounds
+   - "policy_violation": general platform integrity review
+4. Write 3 to 4 thorough, readable paragraphs (like Facebook's long scrollable account disabled screen) clearly explaining WHY this specific account was disabled, citing their exact last login day (if known) and real activity numbers.`;
+
+      const promptPayload = {
+        currentUtcTime: new Date().toISOString(),
+        moderationStatus: params.moderationStatus,
+        matchType: params.matchType || 'user',
+        ownerManualNote: params.ownerReason || 'No manual note typed — analyze telemetry directly.',
+        accountTelemetry: params.telemetry,
+        ALREADY_ISSUED_SCRIPTS_TO_AVOID: recentIssuedScripts,
+        uniqueAngleNonce: crypto.randomBytes(4).toString('hex'),
+      };
+
+      interface LlmBanSchemaOutput {
+        headline: string;
+        category: BanScriptCategoryValue;
+        summaryParagraph: string;
+        paragraphs: string[];
+        whatHappenedBullets: string[];
+        whatYouCanDo: string;
+        riskLevel: 'high' | 'medium' | 'low';
+      }
+
+      const schema = {
+        type: Type.OBJECT,
+        properties: {
+          headline: { type: Type.STRING, description: 'Facebook-style security headline.' },
+          category: {
+            type: Type.STRING,
+            description:
+              'One of: fake_deposit, inactive_no_deposit_30d, free_tier_abuse, owner_trust_review, multi_account_ip, policy_violation.',
+          },
+          summaryParagraph: {
+            type: Type.STRING,
+            description: 'Clear 2-sentence lead paragraph stating why the account was locked.',
+          },
+          paragraphs: {
+            type: Type.ARRAY,
+            items: { type: Type.STRING },
+            description: '3 to 4 distinct, detailed paragraphs unique to this account.',
+          },
+          whatHappenedBullets: {
+            type: Type.ARRAY,
+            items: { type: Type.STRING },
+            description: '3 to 4 concrete telemetry findings checked on this account.',
+          },
+          whatYouCanDo: {
+            type: Type.STRING,
+            description: 'How the user can appeal by submitting their registered email and confirming the verification link.',
+          },
+          riskLevel: { type: Type.STRING, description: 'high, medium, or low.' },
+        },
+        required: [
+          'headline',
+          'category',
+          'summaryParagraph',
+          'paragraphs',
+          'whatHappenedBullets',
+          'whatYouCanDo',
+          'riskLevel',
+        ],
+      };
+
+      const { data: aiOut, provider } = await callSecurityBrainLlm<LlmBanSchemaOutput>({
+        systemInstruction,
+        prompt: JSON.stringify(promptPayload),
+        responseSchema: schema,
+      });
+
+      const validCategories: BanScriptCategoryValue[] = [
+        'fake_deposit',
+        'inactive_no_deposit_30d',
+        'free_tier_abuse',
+        'owner_trust_review',
+        'multi_account_ip',
+        'policy_violation',
+      ];
+      const safeCat = validCategories.includes(aiOut.category)
+        ? aiOut.category
+        : 'owner_trust_review';
+      const safeRisk = ['high', 'medium', 'low'].includes(aiOut.riskLevel)
+        ? aiOut.riskLevel
+        : 'high';
+
+      const script: AiBanScriptRecord = {
+        caseId: `VBX-CASE-${crypto.randomBytes(3).toString('hex').toUpperCase()}`,
+        headline: String(aiOut.headline || 'Your VeriBox Account Has Been Disabled').trim(),
+        category: safeCat,
+        summaryParagraph: String(aiOut.summaryParagraph || '').trim(),
+        paragraphs: Array.isArray(aiOut.paragraphs)
+          ? aiOut.paragraphs.map((p) => String(p).trim()).filter(Boolean).slice(0, 6)
+          : [],
+        whatHappenedBullets: Array.isArray(aiOut.whatHappenedBullets)
+          ? aiOut.whatHappenedBullets.map((b) => String(b).trim()).filter(Boolean).slice(0, 6)
+          : [],
+        whatYouCanDo: String(
+          aiOut.whatYouCanDo ||
+            'You may submit an ownership appeal using the exact Google or Email address used to register your account and confirm the verification link sent to your inbox.'
+        ).trim(),
+        riskLevel: safeRisk,
+        generatedBy: provider,
+        generatedAt: new Date().toISOString(),
+        lastLoginDayChecked: params.telemetry.lastLoginDayFormatted,
+        accountAgeDays: params.telemetry.accountAgeDays,
+      };
+
+      await persistBanScriptToDb(
+        params.telemetry.userId,
+        params.telemetry.email,
+        script,
+        provider
+      );
+      return script;
+    })().finally(() => {
+      banScriptInFlightMap.delete(dedupeKey);
+    });
+
+    banScriptInFlightMap.set(dedupeKey, taskPromise);
+    return taskPromise;
+  }
+
+  async function evaluateBanAppealWithAi(params: {
+    appeal: BanAppealServerRecord;
+    banScript: AiBanScriptRecord | null;
+    telemetry: AccountSecurityTelemetry;
+  }): Promise<{ approved: boolean; verdictNote: string }> {
+    const systemInstruction = `You are the VeriBox Appeal Verification AI Judge.
+A previously banned user has submitted an appeal, matched their registered Supabase account email (${params.appeal.registeredAuthProvider || 'email'}), clicked and confirmed the real-time verification link in their browser, and waited out the mandatory security hold window.
+Evaluate if the appeal is coherent, non-abusive, and safe to unlock as a verified account. Approve legitimate user appeals where ownership is confirmed unless the appeal text admits fraud/attacks or the owner marked a serious fake-deposit fraud pattern that the user did not address.`;
+
+    const prompt = JSON.stringify({
+      appealEmail: params.appeal.submittedEmail,
+      registeredAuthProvider: params.appeal.registeredAuthProvider,
+      registeredEmailMatched: params.appeal.registeredEmailMatched,
+      emailConfirmedInBrowserAt: params.appeal.emailConfirmedAt,
+      appealDetails: params.appeal.appealDetails,
+      originalBanCategory: params.banScript?.category || 'owner_trust_review',
+      originalBanSummary: params.banScript?.summaryParagraph || '',
+      accountTelemetry: {
+        accountAgeDays: params.telemetry.accountAgeDays,
+        lastSignInAt: params.telemetry.lastSignInAt,
+        totalDepositedNgn: params.telemetry.totalDepositedNgn,
+        failedOrPendingDepositsCount: params.telemetry.failedOrPendingDepositsCount,
+      },
+    });
+
+    const schema = {
+      type: Type.OBJECT,
+      properties: {
+        approved: { type: Type.BOOLEAN },
+        verdictNote: { type: Type.STRING },
+      },
+      required: ['approved', 'verdictNote'],
+    };
+
+    const { data } = await callSecurityBrainLlm<{ approved: boolean; verdictNote: string }>({
+      systemInstruction,
+      prompt,
+      responseSchema: schema,
+    });
+
+    return {
+      approved: Boolean(data.approved),
+      verdictNote:
+        String(data.verdictNote || '').trim() ||
+        (data.approved
+          ? 'Ownership email verified in Supabase and appeal cleared by VeriBox AI.'
+          : 'Appeal could not be cleared automatically; awaiting manual owner review.'),
+    };
+  }
+
+  async function restoreVerifiedAccountFromAppeal(
+    userId: string | null,
+    email: string | null,
+    verdictActor: string
+  ): Promise<void> {
+    const cleanEmail = (email || '').trim().toLowerCase();
+    const sb = getSupabaseServerClient();
+    let resolvedUid = userId;
+    if (!resolvedUid && cleanEmail && sb) {
+      const matched = await findSupabaseUserByEmail(cleanEmail);
+      if (matched) resolvedUid = matched.id;
+    }
+
+    if (resolvedUid) {
+      const knownIp =
+        lastKnownUserIpMap.get(resolvedUid) || strictModerationUserMap.get(resolvedUid)?.ip || null;
+      strictModerationUserMap.delete(resolvedUid);
+      if (knownIp) bannedIpsSet.delete(knownIp);
+      if (sb) {
+        try {
+          const { data: uData } = await sb.auth.admin.getUserById(resolvedUid);
+          await sb.auth.admin.updateUserById(resolvedUid, {
+            ban_duration: 'none',
+            email_confirm: true,
+            app_metadata: {
+              ...((uData?.user?.app_metadata || {}) as Record<string, unknown>),
+              account_status: 'verified',
+            },
+          });
+        } catch {
+          // non-blocking
+        }
+        try {
+          await sb.from('user_moderation').upsert(
+            {
+              user_id: resolvedUid,
+              email: cleanEmail || null,
+              status: 'verified',
+              reason: null,
+              updated_by: verdictActor,
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: 'user_id' }
+          );
+          if (knownIp) {
+            await sb.from('user_moderation').delete().eq('user_id', `ip:${knownIp}`);
+          }
+        } catch {
+          // non-blocking
+        }
+      }
+    }
+
+    if (cleanEmail) {
+      bannedEmailsSet.delete(cleanEmail);
+      if (sb) {
+        try {
+          await sb.from('user_moderation').delete().eq('user_id', `email:${cleanEmail}`);
+        } catch {
+          // non-blocking
+        }
+      }
+    }
+  }
+
+  async function maybeAutoEvaluateAppealIfReady(
+    appeal: BanAppealServerRecord | null,
+    banScript: AiBanScriptRecord | null
+  ): Promise<BanAppealServerRecord | null> {
+    if (!appeal) return null;
+    if (
+      appeal.status === 'email_confirmed_waiting' &&
+      appeal.registeredEmailMatched &&
+      appeal.emailConfirmedAt &&
+      appeal.reviewEligibleAt &&
+      Date.now() >= Date.parse(appeal.reviewEligibleAt)
+    ) {
+      try {
+        const telemetry = await gatherAccountTelemetry(appeal.userId, appeal.submittedEmail);
+        const verdict = await evaluateBanAppealWithAi({ appeal, banScript, telemetry });
+        const nowIso = new Date().toISOString();
+        const updated: BanAppealServerRecord = {
+          ...appeal,
+          status: verdict.approved ? 'ai_verified_restored' : 'rejected',
+          aiVerdictAt: nowIso,
+          aiVerdictNote: verdict.verdictNote,
+        };
+        await persistBanAppealToDb(updated);
+        if (verdict.approved) {
+          await restoreVerifiedAccountFromAppeal(
+            appeal.userId,
+            appeal.submittedEmail,
+            'ai-appeal-verifier'
+          );
+        }
+        return updated;
+      } catch {
+        // Retry on next poll if LLM momentarily timed out
+        return appeal;
+      }
+    }
+    return appeal;
+  }
+
   async function evaluateCallerModeration(req: express.Request): Promise<{
     ownerUnlimited: boolean;
     blocked: boolean;
@@ -3135,6 +4096,12 @@ export function createApiApp() {
     reason: string | null;
     strict: boolean;
     matchType: 'user' | 'email' | 'ip' | null;
+    userId: string | null;
+    email: string | null;
+    bannedAt: string | null;
+    lastSignInAt: string | null;
+    banScript: AiBanScriptRecord | null;
+    appeal: BanAppealServerRecord | null;
     user: { id: string; email: string; accountStatus: string; bannedUntil: string | null } | null;
   }> {
     await hydrateModerationFromDb(false);
@@ -3147,40 +4114,22 @@ export function createApiApp() {
         reason: null,
         strict: false,
         matchType: null,
+        userId: user.id,
+        email: user.email,
+        bannedAt: null,
+        lastSignInAt: null,
+        banScript: null,
+        appeal: null,
         user,
       };
     }
 
     const clientIp = getRequestClientIp(req);
-    if (clientIp && bannedIpsSet.has(clientIp)) {
-      const ipBan = bannedIpsSet.get(clientIp)!;
-      return {
-        ownerUnlimited: false,
-        blocked: true,
-        status: 'banned',
-        reason: ipBan.reason || 'Your network / device has been permanently banned by the administrator.',
-        strict: true,
-        matchType: 'ip',
-        user,
-      };
-    }
-
     const bodyEmail =
       typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
-    const checkEmail = user?.email || bodyEmail;
-    if (checkEmail && checkEmail !== OWNER_ADMIN_EMAIL && bannedEmailsSet.has(checkEmail)) {
-      const emBan = bannedEmailsSet.get(checkEmail)!;
-      return {
-        ownerUnlimited: false,
-        blocked: true,
-        status: 'banned',
-        reason: emBan.reason || 'This email address has been banned by the administrator.',
-        strict: true,
-        matchType: 'email',
-        user,
-      };
-    }
-
+    const queryEmail =
+      typeof req.query?.email === 'string' ? req.query.email.trim().toLowerCase() : '';
+    const checkEmail = user?.email || bodyEmail || queryEmail || null;
     const checkUserId =
       user?.id ||
       (typeof req.body?.userId === 'string' && req.body.userId.trim()
@@ -3189,50 +4138,114 @@ export function createApiApp() {
           ? req.query.userId.trim()
           : '');
 
-    if (checkUserId) {
+    let blocked = false;
+    let effStatus: ModerationStatusValue = user?.accountStatus === 'verified' ? 'verified' : 'active';
+    let reason: string | null = null;
+    let strict = false;
+    let matchType: 'user' | 'email' | 'ip' | null = null;
+    let bannedAt: string | null = null;
+    let resolvedUserId: string | null = checkUserId || null;
+    let resolvedEmail: string | null = checkEmail;
+
+    if (clientIp && bannedIpsSet.has(clientIp)) {
+      const ipBan = bannedIpsSet.get(clientIp)!;
+      blocked = true;
+      effStatus = 'banned';
+      reason = ipBan.reason || 'Your network / device has been permanently banned by the administrator.';
+      strict = true;
+      matchType = 'ip';
+      bannedAt = ipBan.createdAt;
+    } else if (checkEmail && checkEmail !== OWNER_ADMIN_EMAIL && bannedEmailsSet.has(checkEmail)) {
+      const emBan = bannedEmailsSet.get(checkEmail)!;
+      blocked = true;
+      effStatus = 'banned';
+      reason = emBan.reason || 'This email address has been banned by the administrator.';
+      strict = true;
+      matchType = 'email';
+      bannedAt = emBan.createdAt;
+    } else if (checkUserId) {
       const cachedMod = strictModerationUserMap.get(checkUserId);
       if (cachedMod && ['banned', 'suspended', 'restricted'].includes(cachedMod.status)) {
-        return {
-          ownerUnlimited: false,
-          blocked: true,
-          status: cachedMod.status,
-          reason:
-            cachedMod.reason ||
-            `Account is ${cachedMod.status}. Access to VeriBox services has been disabled.`,
-          strict: cachedMod.strict,
-          matchType: 'user',
-          user,
-        };
+        blocked = true;
+        effStatus = cachedMod.status;
+        reason =
+          cachedMod.reason ||
+          `Account is ${cachedMod.status}. Access to VeriBox services has been disabled.`;
+        strict = cachedMod.strict;
+        matchType = 'user';
+        bannedAt = cachedMod.bannedAt || null;
+        if (!resolvedEmail && cachedMod.email) resolvedEmail = cachedMod.email;
       }
     }
 
-    if (user) {
+    if (!blocked && user) {
       const isTimeBanned = user.bannedUntil ? Date.parse(user.bannedUntil) > Date.now() : false;
       const metaStatus = user.accountStatus as ModerationStatusValue;
       if (isTimeBanned || ['banned', 'suspended', 'restricted'].includes(metaStatus)) {
-        const effStatus: ModerationStatusValue =
+        effStatus =
           metaStatus === 'banned' || metaStatus === 'suspended' || metaStatus === 'restricted'
             ? metaStatus
             : 'banned';
-        return {
-          ownerUnlimited: false,
-          blocked: true,
-          status: effStatus,
-          reason: `Account is currently ${effStatus}. Contact the administrator for support.`,
-          strict: effStatus === 'banned',
-          matchType: 'user',
-          user,
-        };
+        blocked = true;
+        reason = `Account is currently ${effStatus}. Contact the administrator for support.`;
+        strict = effStatus === 'banned';
+        matchType = 'user';
+      }
+    }
+
+    let existingScript =
+      (resolvedUserId ? banScriptByUserIdMap.get(resolvedUserId) : undefined) ||
+      (resolvedEmail ? banScriptByEmailMap.get(resolvedEmail) : undefined) ||
+      null;
+    let existingAppeal =
+      (resolvedUserId ? banAppealsByUserIdMap.get(resolvedUserId) : undefined) ||
+      (resolvedEmail ? banAppealsByEmailMap.get(resolvedEmail) : undefined) ||
+      null;
+
+    if (blocked && existingAppeal) {
+      existingAppeal = await maybeAutoEvaluateAppealIfReady(existingAppeal, existingScript);
+      if (existingAppeal?.status === 'ai_verified_restored') {
+        blocked = false;
+        effStatus = 'verified';
+        reason = null;
+        strict = false;
+      }
+    }
+
+    let lastSignInAt: string | null = null;
+    if (blocked && effStatus !== 'restricted') {
+      const telemetry = await gatherAccountTelemetry(resolvedUserId, resolvedEmail);
+      lastSignInAt = telemetry.lastSignInAt;
+      if (!resolvedUserId && telemetry.userId) resolvedUserId = telemetry.userId;
+      if (!resolvedEmail && telemetry.email) resolvedEmail = telemetry.email;
+      if (!existingScript) {
+        try {
+          existingScript = await generateUniqueAiBanScript({
+            telemetry,
+            moderationStatus: effStatus,
+            ownerReason: reason,
+            matchType,
+            existingScript: null,
+          });
+        } catch {
+          // Leave null if external AI unavailable; UI handles clean fallback
+        }
       }
     }
 
     return {
       ownerUnlimited: false,
-      blocked: false,
-      status: user?.accountStatus === 'verified' ? 'verified' : 'active',
-      reason: null,
-      strict: false,
-      matchType: null,
+      blocked,
+      status: effStatus,
+      reason,
+      strict,
+      matchType,
+      userId: resolvedUserId,
+      email: resolvedEmail,
+      bannedAt,
+      lastSignInAt,
+      banScript: existingScript,
+      appeal: existingAppeal,
       user,
     };
   }
@@ -3254,6 +4267,12 @@ export function createApiApp() {
           reason: evalResult.reason,
           strict: evalResult.strict,
           matchType: evalResult.matchType,
+          userId: evalResult.userId,
+          email: evalResult.email,
+          bannedAt: evalResult.bannedAt,
+          lastSignInAt: evalResult.lastSignInAt,
+          banScript: evalResult.banScript,
+          appeal: evalResult.appeal,
         },
       });
       return null;
@@ -6106,7 +7125,316 @@ export function createApiApp() {
       reason: evalResult.reason,
       strict: evalResult.strict,
       matchType: evalResult.matchType,
+      userId: evalResult.userId,
+      email: evalResult.email,
+      bannedAt: evalResult.bannedAt,
+      lastSignInAt: evalResult.lastSignInAt,
+      banScript: evalResult.banScript,
+      appeal: evalResult.appeal,
       ownerUnlimited: evalResult.ownerUnlimited,
+    });
+  });
+
+  // Real-time Ban Appeal: Submit registered email + appeal details -> verify account match -> send verification link
+  app.post('/api/auth/ban-appeal/submit', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    await hydrateModerationFromDb(false);
+
+    const submittedEmail = String(req.body?.email || '').trim().toLowerCase();
+    const appealDetails = String(req.body?.appealDetails || '').trim().slice(0, 1200);
+    const fullName =
+      typeof req.body?.fullName === 'string' && req.body.fullName.trim()
+        ? req.body.fullName.trim().slice(0, 120)
+        : null;
+    const claimedBlockedUserId =
+      typeof req.body?.blockedUserId === 'string' && req.body.blockedUserId.trim()
+        ? req.body.blockedUserId.trim()
+        : null;
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(submittedEmail)) {
+      res.status(400).json({
+        error: 'Enter the exact valid email address you used to register your VeriBox account.',
+      });
+      return;
+    }
+    if (appealDetails.length < 15) {
+      res.status(400).json({
+        error: 'Please write a clear explanation (at least 15 characters) describing why your account should be reviewed.',
+      });
+      return;
+    }
+
+    const sb = getSupabaseServerClient();
+    if (!sb) {
+      res.status(503).json({
+        error: 'Supabase account verification is not configured on the server yet.',
+      });
+      return;
+    }
+
+    // 1. Check Supabase Auth to confirm this email actually belongs to a registered Google or Email account
+    const matchedUser = await findSupabaseUserByEmail(submittedEmail);
+    if (!matchedUser) {
+      res.status(404).json({
+        matched: false,
+        error:
+          'Account mismatch: No registered VeriBox account (Google or Email) was found for this email address. Enter the exact email you used to sign in.',
+      });
+      return;
+    }
+
+    // If a specific banned userId is attached to the session/device, confirm the entered email matches it
+    const sessionUser = await getVerifiedSupabaseBearerUser(req);
+    const activeBlockedUid = sessionUser?.id || claimedBlockedUserId;
+    if (
+      activeBlockedUid &&
+      !activeBlockedUid.startsWith('vbw-') &&
+      activeBlockedUid !== matchedUser.id
+    ) {
+      res.status(403).json({
+        matched: false,
+        error:
+          'Account mismatch: That email belongs to a different account and does not match the banned account on this session.',
+      });
+      return;
+    }
+
+    const appealId = `APL-${Date.now().toString(36).toUpperCase()}-${crypto
+      .randomBytes(3)
+      .toString('hex')
+      .toUpperCase()}`;
+    const exp = Date.now() + 48 * 3600_000;
+    const token = createSignedAppealToken({
+      appealId,
+      userId: matchedUser.id,
+      email: submittedEmail,
+      exp,
+    });
+    const appOrigin = getSafeAppOrigin(req);
+    const confirmUrl = `${appOrigin}/?appeal_verify=${encodeURIComponent(token)}`;
+
+    // 2. Dispatch real verification link email via Resend or Supabase Auth
+    let verificationLinkSentVia: 'resend' | 'supabase' | 'both' | null = null;
+    let deliveryError: string | null = null;
+
+    const resendApiKey = getResendApiKey();
+    if (resendApiKey) {
+      try {
+        const resend = new Resend(resendApiKey);
+        const fromSender = `VeriBox Security <security@${CUSTOM_EMAIL_DOMAIN}>`;
+        const htmlBody = `
+          <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 560px; margin: 0 auto; background: #14120D; color: #FAF6EC; border: 1px solid #D4AF37; border-radius: 16px; padding: 28px;">
+            <h2 style="margin: 0 0 12px; color: #F5D77A; font-size: 20px;">VeriBox Account Appeal Verification</h2>
+            <p style="margin: 0 0 14px; font-size: 14px; line-height: 1.6; color: #EAE2CF;">
+              Hello${fullName ? ` ${fullName.replace(/[<>]/g, '')}` : ''}, our AI security system matched your email <strong>${submittedEmail}</strong> (${matchedUser.authProvider === 'google' ? 'Google Login' : 'Email Login'}) with your VeriBox account.
+            </p>
+            <p style="margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: #EAE2CF;">
+              Tap the button below to open your browser and confirm your appeal ownership. Once confirmed, return to the VeriBox app for your real-time AI verification countdown (${aiReviewWaitHours} hours).
+            </p>
+            <a href="${confirmUrl}" style="display: inline-block; background: #D4AF37; color: #0A0906; font-weight: 800; text-decoration: none; padding: 12px 24px; border-radius: 12px; font-size: 14px;">
+              Confirm Email &amp; Verify Appeal
+            </a>
+            <p style="margin: 20px 0 0; font-size: 12px; color: #A89F8C; word-break: break-all;">
+              Or copy this link into your browser:<br />${confirmUrl}
+            </p>
+          </div>
+        `;
+        const sendRes = await resend.emails.send({
+          from: fromSender,
+          to: [submittedEmail],
+          subject: `Confirm your VeriBox Account Appeal (${appealId})`,
+          text: `VeriBox Account Appeal Verification\n\nOur system matched ${submittedEmail} with your VeriBox account.\nOpen this link in your browser to confirm ownership and start your ${aiReviewWaitHours}-hour AI verification timer:\n\n${confirmUrl}\n`,
+          html: htmlBody,
+        });
+        if (!sendRes.error && sendRes.data?.id) {
+          verificationLinkSentVia = 'resend';
+        } else {
+          deliveryError = sendRes.error?.message || 'Resend failed to send appeal verification link.';
+        }
+      } catch (err) {
+        deliveryError = err instanceof Error ? err.message : 'Resend appeal dispatch error.';
+      }
+    }
+
+    // Fallback via Supabase Auth OTP magic link if Resend didn't send
+    if (!verificationLinkSentVia) {
+      const hadActiveBanDuration = Boolean(
+        matchedUser.bannedUntil && Date.parse(matchedUser.bannedUntil) > Date.now()
+      );
+      try {
+        if (hadActiveBanDuration) {
+          await sb.auth.admin.updateUserById(matchedUser.id, { ban_duration: 'none' });
+        }
+        const publicUrl = String(process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || '').trim();
+        const publicAnon = String(process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || '').trim();
+        if (publicUrl && publicAnon) {
+          const tempAnon = createClient(publicUrl, publicAnon);
+          const { error: otpErr } = await tempAnon.auth.signInWithOtp({
+            email: submittedEmail,
+            options: {
+              shouldCreateUser: false,
+              emailRedirectTo: confirmUrl,
+            },
+          });
+          if (!otpErr) {
+            verificationLinkSentVia = 'supabase';
+          } else {
+            deliveryError = otpErr.message;
+          }
+        }
+      } catch (err) {
+        deliveryError = err instanceof Error ? err.message : 'Supabase email link dispatch failed.';
+      } finally {
+        if (hadActiveBanDuration) {
+          await sb.auth.admin
+            .updateUserById(matchedUser.id, { ban_duration: '876000h' })
+            .catch(() => undefined);
+        }
+      }
+    }
+
+    if (!verificationLinkSentVia) {
+      res.status(502).json({
+        error:
+          deliveryError ||
+          'Could not send the verification link email right now. Ensure RESEND_API_KEY or Supabase email SMTP is configured.',
+      });
+      return;
+    }
+
+    const appeal: BanAppealServerRecord = {
+      appealId,
+      userId: matchedUser.id,
+      submittedEmail,
+      registeredEmailMatched: true,
+      registeredAuthProvider: matchedUser.authProvider,
+      appealDetails,
+      fullName: fullName || matchedUser.fullName,
+      status: 'pending_email_link',
+      verificationLinkSentVia,
+      submittedAt: new Date().toISOString(),
+      emailConfirmedAt: null,
+      reviewWaitHours: aiReviewWaitHours,
+      reviewEligibleAt: null,
+      aiVerdictAt: null,
+      aiVerdictNote: null,
+      reviewedByOwner: null,
+    };
+
+    await persistBanAppealToDb(appeal);
+
+    res.json({
+      ok: true,
+      matched: true,
+      appeal,
+      message: `Account matched (${matchedUser.authProvider === 'google' ? 'Google Login' : 'Email Login'}). A verification link has been sent to ${submittedEmail}. Tap it in your email to confirm in your browser.`,
+    });
+  });
+
+  // Real-time Ban Appeal: Browser Confirmation endpoint (clicked from email link)
+  app.post('/api/auth/ban-appeal/confirm', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    await hydrateModerationFromDb(false);
+
+    const rawToken = String(req.body?.token || req.query?.token || '').trim();
+    const verifiedToken = verifySignedAppealToken(rawToken);
+    if (!verifiedToken) {
+      res.status(400).json({
+        ok: false,
+        error: 'This appeal confirmation link is invalid or has expired. Submit a fresh appeal from the app.',
+      });
+      return;
+    }
+
+    const matchedUser = await findSupabaseUserByEmail(verifiedToken.email);
+    if (!matchedUser || (verifiedToken.userId && matchedUser.id !== verifiedToken.userId)) {
+      res.status(404).json({
+        ok: false,
+        error: 'Could not match this verification link to a registered VeriBox account.',
+      });
+      return;
+    }
+
+    const existing =
+      banAppealsByIdMap.get(verifiedToken.appealId) ||
+      banAppealsByUserIdMap.get(matchedUser.id) ||
+      banAppealsByEmailMap.get(verifiedToken.email) ||
+      null;
+
+    if (existing && existing.status === 'ai_verified_restored') {
+      res.json({ ok: true, appeal: existing, unlocked: true });
+      return;
+    }
+
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    const waitHours = existing?.reviewWaitHours || aiReviewWaitHours;
+    const reviewEligibleAt =
+      existing?.emailConfirmedAt && existing?.reviewEligibleAt
+        ? existing.reviewEligibleAt
+        : new Date(nowMs + waitHours * 3600_000).toISOString();
+
+    const confirmedAppeal: BanAppealServerRecord = {
+      appealId: existing?.appealId || verifiedToken.appealId,
+      userId: matchedUser.id,
+      submittedEmail: verifiedToken.email,
+      registeredEmailMatched: true,
+      registeredAuthProvider: matchedUser.authProvider,
+      appealDetails: existing?.appealDetails || 'Ownership verified via email confirmation link.',
+      fullName: existing?.fullName || matchedUser.fullName,
+      status: 'email_confirmed_waiting',
+      verificationLinkSentVia: existing?.verificationLinkSentVia || 'resend',
+      submittedAt: existing?.submittedAt || nowIso,
+      emailConfirmedAt: existing?.emailConfirmedAt || nowIso,
+      reviewWaitHours: waitHours,
+      reviewEligibleAt,
+      aiVerdictAt: null,
+      aiVerdictNote: `Browser email confirmation received at ${formatReadableDay(nowIso)}. AI security verification scheduled after ${waitHours}h review window.`,
+      reviewedByOwner: null,
+    };
+
+    await persistBanAppealToDb(confirmedAppeal);
+
+    res.json({
+      ok: true,
+      appeal: confirmedAppeal,
+      unlocked: false,
+      message: `Email confirmed! Return to your VeriBox app — your ${waitHours}-hour AI verification timer is now running live.`,
+    });
+  });
+
+  // Real-time Ban Appeal: Trigger/Check AI Final Verdict once wait timer completes
+  app.post('/api/auth/ban-appeal/evaluate', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    await hydrateModerationFromDb(false);
+    const evalResult = await evaluateCallerModeration(req);
+    const appeal = evalResult.appeal;
+    if (!appeal) {
+      res.status(404).json({ error: 'No active appeal found for this account.' });
+      return;
+    }
+    if (appeal.status === 'ai_verified_restored') {
+      res.json({ ok: true, unlocked: true, appeal });
+      return;
+    }
+    if (appeal.status === 'pending_email_link') {
+      res.status(400).json({
+        ok: false,
+        error: 'Please open your email and confirm the verification link in your browser first.',
+        appeal,
+      });
+      return;
+    }
+    if (appeal.reviewEligibleAt && Date.now() < Date.parse(appeal.reviewEligibleAt)) {
+      res.json({ ok: true, unlocked: false, appeal });
+      return;
+    }
+
+    const updated = await maybeAutoEvaluateAppealIfReady(appeal, evalResult.banScript);
+    res.json({
+      ok: true,
+      unlocked: updated?.status === 'ai_verified_restored',
+      appeal: updated,
     });
   });
 
@@ -6118,12 +7446,17 @@ export function createApiApp() {
 
     try {
       await hydrateModerationFromDb(true);
-      const [usersResult, walletsResult, mailboxesResult, moderationResult] = await Promise.all([
-        sb.auth.admin.listUsers({ page: 1, perPage: 200 }),
-        sb.from('wallets').select('user_id, balance'),
-        sb.from('mailboxes').select('owner_user_id, is_deleted'),
-        sb.from('user_moderation').select('user_id, email, status, reason, updated_by, updated_at'),
-      ]);
+      const [usersResult, walletsResult, mailboxesResult, moderationResult, txResult] =
+        await Promise.all([
+          sb.auth.admin.listUsers({ page: 1, perPage: 200 }),
+          sb.from('wallets').select('user_id, balance'),
+          sb.from('mailboxes').select('owner_user_id, is_deleted'),
+          sb.from('user_moderation').select('user_id, email, status, reason, updated_by, updated_at'),
+          sb
+            .from('wallet_transactions')
+            .select('user_id, tx_type, amount, status')
+            .limit(1000),
+        ]);
 
       if (usersResult.error) {
         res.status(usersResult.error.status || 500).json({
@@ -6151,10 +7484,37 @@ export function createApiApp() {
         }
       }
 
+      const depositStatsMap = new Map<string, { deposited: number; failedDeposits: number }>();
+      if (!txResult.error && Array.isArray(txResult.data)) {
+        for (const row of txResult.data) {
+          const r = row as { user_id?: string; tx_type?: string; amount?: number; status?: string };
+          const uid = String(r.user_id || '').trim();
+          if (!uid || String(r.tx_type || '').toLowerCase() !== 'deposit') continue;
+          const prev = depositStatsMap.get(uid) || { deposited: 0, failedDeposits: 0 };
+          const st = String(r.status || '').toLowerCase();
+          if (st === 'success' || st === 'completed') {
+            prev.deposited += Number(r.amount) || 0;
+          } else {
+            prev.failedDeposits += 1;
+          }
+          depositStatsMap.set(uid, prev);
+        }
+      }
+
       const modMap = new Map<string, { status: string; reason: string | null }>();
       if (!moderationResult.error && Array.isArray(moderationResult.data)) {
         for (const row of moderationResult.data) {
-          modMap.set(String(row.user_id), {
+          const uid = String(row.user_id || '');
+          if (
+            uid.startsWith('script:') ||
+            uid.startsWith('script-email:') ||
+            uid.startsWith('appeal:') ||
+            uid.startsWith('appeal-email:') ||
+            uid.startsWith('ai_settings:')
+          ) {
+            continue;
+          }
+          modMap.set(uid, {
             status: String(row.status || 'active'),
             reason: row.reason ? String(row.reason) : null,
           });
@@ -6197,6 +7557,15 @@ export function createApiApp() {
               bannedEmailsSet.has(emailLower) ||
               (lastIp && bannedIpsSet.has(lastIp)))
         );
+        const depStats = depositStatsMap.get(u.id) || { deposited: 0, failedDeposits: 0 };
+        const ageDays = Math.max(
+          0,
+          Math.floor((Date.now() - Date.parse(u.created_at)) / 86_400_000)
+        );
+        const userScript =
+          banScriptByUserIdMap.get(u.id) || banScriptByEmailMap.get(emailLower) || null;
+        const userAppeal =
+          banAppealsByUserIdMap.get(u.id) || banAppealsByEmailMap.get(emailLower) || null;
 
         return {
           id: u.id,
@@ -6211,10 +7580,14 @@ export function createApiApp() {
           createdAt: u.created_at,
           lastSignInAt: u.last_sign_in_at || null,
           emailConfirmed: Boolean(u.email_confirmed_at),
+          authProvider: extractSupabaseAuthProvider(u),
           status,
           bannedUntil,
           walletBalance: walletMap.get(u.id) || 0,
           mailboxCount: mailboxCounts.get(u.id) || 0,
+          totalDepositedNgn: depStats.deposited,
+          failedDepositAttempts: depStats.failedDeposits,
+          accountAgeDays: ageDays,
           moderationReason:
             modRow?.reason ||
             memMod?.reason ||
@@ -6222,6 +7595,8 @@ export function createApiApp() {
             null,
           strictBanned,
           lastIp,
+          banScript: userScript,
+          appeal: userAppeal,
         };
       });
 
@@ -6230,7 +7605,7 @@ export function createApiApp() {
         ...Array.from(bannedIpsSet.values()),
       ].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
 
-      res.json({ users, strictBans });
+      res.json({ users, strictBans, reviewWaitHours: aiReviewWaitHours });
     } catch (err) {
       res.status(500).json({
         error: err instanceof Error ? err.message : 'Failed to list users',
@@ -6316,7 +7691,6 @@ export function createApiApp() {
         return;
       }
 
-      // Immediately revoke active JWT sessions so banned/suspended users are kicked out in real time
       if (['ban', 'suspend'].includes(action)) {
         await sb.auth.admin.signOut(userId, 'global').catch(() => undefined);
       }
@@ -6325,6 +7699,7 @@ export function createApiApp() {
         lastKnownUserIpMap.get(userId) || strictModerationUserMap.get(userId)?.ip || null;
       const nowIso = new Date().toISOString();
 
+      let generatedBanScript: AiBanScriptRecord | null = null;
       if (['ban', 'suspend', 'restrict'].includes(action)) {
         strictModerationUserMap.set(userId, {
           status: nextStatus,
@@ -6332,6 +7707,7 @@ export function createApiApp() {
           strict: action === 'ban' && strict,
           email: targetEmail || null,
           ip: knownIp,
+          bannedAt: nowIso,
           updatedAt: Date.now(),
         });
 
@@ -6359,11 +7735,32 @@ export function createApiApp() {
             });
           }
         }
+
+        // Let the AI Security Brain inspect this user's login day, deposits, & activity and author a unique ban script
+        try {
+          const telemetry = await gatherAccountTelemetry(userId, targetEmail);
+          generatedBanScript = await generateUniqueAiBanScript({
+            telemetry,
+            moderationStatus: nextStatus,
+            ownerReason: reason,
+            matchType: 'user',
+            forceRegenerate: true,
+          });
+        } catch {
+          // Non-blocking: evaluateCallerModeration retries if AI was momentarily busy
+        }
       } else {
         strictModerationUserMap.delete(userId);
-        if (targetEmail) bannedEmailsSet.delete(targetEmail);
+        banScriptByUserIdMap.delete(userId);
+        if (targetEmail) {
+          bannedEmailsSet.delete(targetEmail);
+          banScriptByEmailMap.delete(targetEmail);
+        }
         if (knownIp) bannedIpsSet.delete(knownIp);
       }
+
+      const effectiveReason =
+        reason || generatedBanScript?.summaryParagraph?.slice(0, 240) || null;
 
       try {
         await sb.from('user_moderation').upsert(
@@ -6371,7 +7768,7 @@ export function createApiApp() {
             user_id: userId,
             email: targetEmail,
             status: nextStatus,
-            reason,
+            reason: effectiveReason,
             updated_by: verified.email,
             updated_at: nowIso,
           },
@@ -6384,7 +7781,7 @@ export function createApiApp() {
                 user_id: `email:${targetEmail}`,
                 email: targetEmail,
                 status: 'banned',
-                reason: reason || 'Strict ban by administrator',
+                reason: effectiveReason || 'Strict ban by administrator',
                 updated_by: verified.email,
                 updated_at: nowIso,
               },
@@ -6397,7 +7794,7 @@ export function createApiApp() {
                 user_id: `ip:${knownIp}`,
                 email: targetEmail || null,
                 status: 'banned',
-                reason: reason || `Strict IP ban (${targetEmail || userId})`,
+                reason: effectiveReason || `Strict IP ban (${targetEmail || userId})`,
                 updated_by: verified.email,
                 updated_at: nowIso,
               },
@@ -6405,8 +7802,10 @@ export function createApiApp() {
             );
           }
         } else if (action === 'restore' || action === 'verify') {
+          await sb.from('user_moderation').delete().eq('user_id', `script:${userId}`);
           if (targetEmail) {
             await sb.from('user_moderation').delete().eq('user_id', `email:${targetEmail}`);
+            await sb.from('user_moderation').delete().eq('user_id', `script-email:${targetEmail}`);
           }
           if (knownIp) {
             await sb.from('user_moderation').delete().eq('user_id', `ip:${knownIp}`);
@@ -6421,7 +7820,8 @@ export function createApiApp() {
         userId,
         status: nextStatus,
         strictBanned: action === 'ban' && strict,
-        reason,
+        reason: effectiveReason,
+        banScript: generatedBanScript,
         emailConfirmed: Boolean(updated?.user?.email_confirmed_at),
       });
     } catch (err) {
@@ -6450,10 +7850,10 @@ export function createApiApp() {
 
     const targetType = String(req.body?.targetType || 'email').trim().toLowerCase();
     const rawValue = String(req.body?.targetValue || '').trim();
-    const reason =
+    const customReason =
       typeof req.body?.reason === 'string' && req.body.reason.trim()
         ? req.body.reason.trim().slice(0, 240)
-        : 'Banned by administrator';
+        : null;
 
     if (!['email', 'ip'].includes(targetType) || !rawValue) {
       res.status(400).json({ error: 'Provide a valid visitor email or IP address to ban.' });
@@ -6477,6 +7877,56 @@ export function createApiApp() {
 
     const nowIso = new Date().toISOString();
     const banId = `${targetType}:${targetValue}`;
+    let matchedUserId: string | null = null;
+    let generatedScript: AiBanScriptRecord | null = null;
+
+    if (targetType === 'email') {
+      const matched = await findSupabaseUserByEmail(targetValue);
+      if (matched) {
+        matchedUserId = matched.id;
+        try {
+          await sb.auth.admin.updateUserById(matched.id, {
+            ban_duration: '876000h',
+            app_metadata: { ...(matched.appMetadata || {}), account_status: 'banned' },
+          });
+          await sb.auth.admin.signOut(matched.id, 'global').catch(() => undefined);
+        } catch {
+          // non-blocking
+        }
+      }
+      try {
+        const telemetry = await gatherAccountTelemetry(matchedUserId, targetValue);
+        generatedScript = await generateUniqueAiBanScript({
+          telemetry,
+          moderationStatus: 'banned',
+          ownerReason: customReason,
+          matchType: 'email',
+          forceRegenerate: true,
+        });
+      } catch {
+        // non-blocking
+      }
+    } else {
+      try {
+        const telemetry = await gatherAccountTelemetry(null, null);
+        telemetry.lastIp = targetValue;
+        generatedScript = await generateUniqueAiBanScript({
+          telemetry,
+          moderationStatus: 'banned',
+          ownerReason: customReason,
+          matchType: 'ip',
+          forceRegenerate: true,
+        });
+      } catch {
+        // non-blocking
+      }
+    }
+
+    const reason =
+      customReason ||
+      generatedScript?.summaryParagraph?.slice(0, 240) ||
+      'Banned by administrator';
+
     const entry: StrictBanEntryRecord = {
       id: banId,
       targetType: targetType as 'email' | 'ip',
@@ -6489,40 +7939,30 @@ export function createApiApp() {
 
     if (targetType === 'email') {
       bannedEmailsSet.set(targetValue, entry);
-      try {
-        const { data: usersRes } = await sb.auth.admin.listUsers({ page: 1, perPage: 300 });
-        const matched = (usersRes?.users || []).find(
-          (u) => (u.email || '').trim().toLowerCase() === targetValue
-        );
-        if (matched) {
-          await sb.auth.admin.updateUserById(matched.id, {
-            ban_duration: '876000h',
-            app_metadata: { ...(matched.app_metadata || {}), account_status: 'banned' },
-          });
-          await sb.auth.admin.signOut(matched.id, 'global').catch(() => undefined);
-          strictModerationUserMap.set(matched.id, {
-            status: 'banned',
-            reason,
-            strict: true,
-            email: targetValue,
-            updatedAt: Date.now(),
-          });
-          await sb
-            .from('user_moderation')
-            .upsert(
-              {
-                user_id: matched.id,
-                email: targetValue,
-                status: 'banned',
-                reason,
-                updated_by: verified.email,
-                updated_at: nowIso,
-              },
-              { onConflict: 'user_id' }
-            );
+      if (matchedUserId) {
+        strictModerationUserMap.set(matchedUserId, {
+          status: 'banned',
+          reason,
+          strict: true,
+          email: targetValue,
+          bannedAt: nowIso,
+          updatedAt: Date.now(),
+        });
+        try {
+          await sb.from('user_moderation').upsert(
+            {
+              user_id: matchedUserId,
+              email: targetValue,
+              status: 'banned',
+              reason,
+              updated_by: verified.email,
+              updated_at: nowIso,
+            },
+            { onConflict: 'user_id' }
+          );
+        } catch {
+          // non-blocking
         }
-      } catch {
-        // Non-blocking auth sync
       }
     } else {
       bannedIpsSet.set(targetValue, entry);
@@ -6544,7 +7984,12 @@ export function createApiApp() {
       // Non-blocking if user_moderation table is absent
     }
 
-    res.json({ ok: true, entry });
+    const strictBans = [
+      ...Array.from(bannedEmailsSet.values()),
+      ...Array.from(bannedIpsSet.values()),
+    ].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+
+    res.json({ ok: true, entry, banScript: generatedScript, strictBans });
   });
 
   app.post('/api/admin/bans/remove', async (req, res) => {
@@ -6573,16 +8018,15 @@ export function createApiApp() {
 
     if (targetType === 'email') {
       bannedEmailsSet.delete(val);
+      banScriptByEmailMap.delete(val);
       try {
-        const { data: usersRes } = await sb.auth.admin.listUsers({ page: 1, perPage: 300 });
-        const matched = (usersRes?.users || []).find(
-          (u) => (u.email || '').trim().toLowerCase() === val
-        );
+        const matched = await findSupabaseUserByEmail(val);
         if (matched) {
           strictModerationUserMap.delete(matched.id);
+          banScriptByUserIdMap.delete(matched.id);
           await sb.auth.admin.updateUserById(matched.id, {
             ban_duration: 'none',
-            app_metadata: { ...(matched.app_metadata || {}), account_status: 'active' },
+            app_metadata: { ...(matched.appMetadata || {}), account_status: 'active' },
           });
           await sb
             .from('user_moderation')
@@ -6597,7 +8041,9 @@ export function createApiApp() {
               },
               { onConflict: 'user_id' }
             );
+          await sb.from('user_moderation').delete().eq('user_id', `script:${matched.id}`);
         }
+        await sb.from('user_moderation').delete().eq('user_id', `script-email:${val}`);
       } catch {
         // Non-blocking
       }
@@ -6611,7 +8057,261 @@ export function createApiApp() {
       // Non-blocking
     }
 
-    res.json({ ok: true, removed: banKey });
+    const strictBans = [
+      ...Array.from(bannedEmailsSet.values()),
+      ...Array.from(bannedIpsSet.values()),
+    ].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+
+    res.json({ ok: true, removed: banKey, strictBans });
+  });
+
+  // Owner Dashboard AI Security Brain: Scan all registered accounts & surface unique behavioral insights
+  app.post('/api/admin/ai-brain/scan', async (req, res) => {
+    const verified = await verifyOwnerAdminRequest(req, res);
+    if (!verified) return;
+    const sb = verified.supabase;
+
+    try {
+      await hydrateModerationFromDb(true);
+      const [usersResult, walletsResult, mailboxesResult, txResult] = await Promise.all([
+        sb.auth.admin.listUsers({ page: 1, perPage: 200 }),
+        sb.from('wallets').select('user_id, balance'),
+        sb.from('mailboxes').select('owner_user_id, is_deleted'),
+        sb.from('wallet_transactions').select('user_id, tx_type, amount, status').limit(1000),
+      ]);
+
+      if (usersResult.error) {
+        res.status(500).json({ error: usersResult.error.message });
+        return;
+      }
+
+      const walletMap = new Map<string, number>();
+      for (const w of walletsResult.data || []) {
+        walletMap.set(String(w.user_id), Number(w.balance) || 0);
+      }
+
+      const mailboxMap = new Map<string, number>();
+      for (const m of mailboxesResult.data || []) {
+        if (m.owner_user_id && !m.is_deleted) {
+          const uid = String(m.owner_user_id);
+          mailboxMap.set(uid, (mailboxMap.get(uid) || 0) + 1);
+        }
+      }
+
+      const depMap = new Map<string, { deposited: number; failed: number }>();
+      for (const row of txResult.data || []) {
+        const r = row as { user_id?: string; tx_type?: string; amount?: number; status?: string };
+        const uid = String(r.user_id || '').trim();
+        if (!uid || String(r.tx_type || '').toLowerCase() !== 'deposit') continue;
+        const prev = depMap.get(uid) || { deposited: 0, failed: 0 };
+        const st = String(r.status || '').toLowerCase();
+        if (st === 'success' || st === 'completed') prev.deposited += Number(r.amount) || 0;
+        else prev.failed += 1;
+        depMap.set(uid, prev);
+      }
+
+      const snapshots = (usersResult.data?.users || [])
+        .filter((u) => (u.email || '').trim().toLowerCase() !== OWNER_ADMIN_EMAIL)
+        .slice(0, 60)
+        .map((u) => {
+          const dep = depMap.get(u.id) || { deposited: 0, failed: 0 };
+          const ageDays = Math.max(0, Math.floor((Date.now() - Date.parse(u.created_at)) / 86_400_000));
+          const ip = lastKnownUserIpMap.get(u.id) || null;
+          return {
+            userId: u.id,
+            email: u.email || '',
+            accountAgeDays: ageDays,
+            lastLoginDay: formatReadableDay(u.last_sign_in_at),
+            walletBalanceNgn: walletMap.get(u.id) || 0,
+            totalDepositedNgn: dep.deposited,
+            failedDepositAttempts: dep.failed,
+            mailboxCount: mailboxMap.get(u.id) || 0,
+            lastIp: ip,
+            currentStatus: strictModerationUserMap.get(u.id)?.status || (u.email_confirmed_at ? 'verified' : 'active'),
+          };
+        });
+
+      const systemInstruction = `You are the VeriBox Owner AI Security Brain connected to all registered user accounts.
+Inspect the account telemetry list and identify accounts worth flagging for the Owner:
+- Accounts attempting fake/failed deposits (failedDepositAttempts > 0)
+- Accounts active/registered for ~20-30+ days with ₦0 deposited (totalDepositedNgn === 0)
+- Heavy free-only mailbox usage with ₦0 funding
+- Already banned/suspended accounts or suspicious login patterns
+Return a concise summary and up to 12 prioritized flaggedUsers with distinct, account-specific insights (referencing exact login day, days registered, and numbers).`;
+
+      const schema = {
+        type: Type.OBJECT,
+        properties: {
+          summary: { type: Type.STRING },
+          flaggedUsers: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                userId: { type: Type.STRING },
+                email: { type: Type.STRING },
+                riskLevel: { type: Type.STRING },
+                flagType: { type: Type.STRING },
+                lastLoginDay: { type: Type.STRING },
+                accountAgeDays: { type: Type.INTEGER },
+                insight: { type: Type.STRING },
+                recommendedAction: { type: Type.STRING },
+              },
+              required: [
+                'userId',
+                'email',
+                'riskLevel',
+                'flagType',
+                'accountAgeDays',
+                'insight',
+                'recommendedAction',
+              ],
+            },
+          },
+        },
+        required: ['summary', 'flaggedUsers'],
+      };
+
+      const { data: scanOut, provider } = await callSecurityBrainLlm<{
+        summary: string;
+        flaggedUsers: Array<{
+          userId: string;
+          email: string;
+          riskLevel: 'high' | 'medium' | 'low';
+          flagType: string;
+          lastLoginDay?: string | null;
+          accountAgeDays: number;
+          insight: string;
+          recommendedAction: 'ban' | 'restrict' | 'verify' | 'monitor';
+        }>;
+      }>({
+        systemInstruction,
+        prompt: JSON.stringify({ totalUsersScanned: snapshots.length, accounts: snapshots }),
+        responseSchema: schema,
+      });
+
+      res.json({
+        analyzedAt: new Date().toISOString(),
+        provider,
+        summary: scanOut.summary,
+        reviewWaitHours: aiReviewWaitHours,
+        flaggedUsers: Array.isArray(scanOut.flaggedUsers) ? scanOut.flaggedUsers : [],
+      });
+    } catch (err) {
+      res.status(502).json({
+        error: err instanceof Error ? err.message : 'AI Security Brain scan failed',
+      });
+    }
+  });
+
+  // Owner Dashboard: Generate or regenerate a unique Facebook-style AI ban script for a user
+  app.post('/api/admin/ai-brain/ban-script', async (req, res) => {
+    const verified = await verifyOwnerAdminRequest(req, res);
+    if (!verified) return;
+
+    const userId = String(req.body?.userId || '').trim();
+    const ownerReason =
+      typeof req.body?.reason === 'string' && req.body.reason.trim()
+        ? req.body.reason.trim().slice(0, 240)
+        : null;
+    if (!userId) {
+      res.status(400).json({ error: 'userId is required' });
+      return;
+    }
+
+    try {
+      const telemetry = await gatherAccountTelemetry(userId, null);
+      const currentStatus = strictModerationUserMap.get(userId)?.status || 'banned';
+      const script = await generateUniqueAiBanScript({
+        telemetry,
+        moderationStatus: currentStatus,
+        ownerReason,
+        matchType: 'user',
+        forceRegenerate: true,
+      });
+      res.json({ ok: true, banScript: script });
+    } catch (err) {
+      res.status(502).json({
+        error: err instanceof Error ? err.message : 'Failed to generate AI ban script',
+      });
+    }
+  });
+
+  // Owner Dashboard: Configure AI Appeal verification wait window (5 to 24 hours)
+  app.post('/api/admin/ai-brain/settings', async (req, res) => {
+    const verified = await verifyOwnerAdminRequest(req, res);
+    if (!verified) return;
+    const sb = verified.supabase;
+
+    const hours = Number(req.body?.reviewWaitHours);
+    if (!Number.isFinite(hours) || hours < 1 || hours > 48) {
+      res.status(400).json({ error: 'Enter a review wait duration between 1 and 48 hours.' });
+      return;
+    }
+    aiReviewWaitHours = Math.round(hours);
+
+    try {
+      await sb.from('user_moderation').upsert(
+        {
+          user_id: 'ai_settings:config',
+          email: null,
+          status: 'meta',
+          reason: JSON.stringify({ reviewWaitHours: aiReviewWaitHours }),
+          updated_by: verified.email,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: 'user_id' }
+      );
+    } catch {
+      // non-blocking
+    }
+
+    res.json({ ok: true, reviewWaitHours: aiReviewWaitHours });
+  });
+
+  // Owner Dashboard: Manually Approve & Verify or Reject an Appeal immediately
+  app.post('/api/admin/appeals/:appealId/decide', async (req, res) => {
+    const verified = await verifyOwnerAdminRequest(req, res);
+    if (!verified) return;
+    await hydrateModerationFromDb(true);
+
+    const appealId = String(req.params.appealId || '').trim();
+    const decision = String(req.body?.decision || '').trim().toLowerCase();
+    const note =
+      typeof req.body?.note === 'string' && req.body.note.trim()
+        ? req.body.note.trim().slice(0, 240)
+        : null;
+
+    const appeal = banAppealsByIdMap.get(appealId);
+    if (!appeal || !['approve', 'reject'].includes(decision)) {
+      res.status(404).json({ error: 'Appeal not found or invalid decision.' });
+      return;
+    }
+
+    const nowIso = new Date().toISOString();
+    const updated: BanAppealServerRecord = {
+      ...appeal,
+      status: decision === 'approve' ? 'ai_verified_restored' : 'rejected',
+      aiVerdictAt: nowIso,
+      aiVerdictNote:
+        note ||
+        (decision === 'approve'
+          ? 'Approved and verified directly by VeriBox owner.'
+          : 'Appeal declined permanently by VeriBox owner.'),
+      reviewedByOwner: verified.email,
+    };
+
+    await persistBanAppealToDb(updated);
+
+    if (decision === 'approve') {
+      await restoreVerifiedAccountFromAppeal(
+        appeal.userId,
+        appeal.submittedEmail,
+        verified.email
+      );
+    }
+
+    res.json({ ok: true, appeal: updated });
   });
 
   app.post('/api/admin/test-inbound', async (req, res) => {

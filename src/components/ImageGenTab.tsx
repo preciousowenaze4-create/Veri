@@ -18,12 +18,21 @@ import {
   Wand2,
   X,
 } from 'lucide-react';
-import type { GeneratedImageItem } from '../types';
+import type { GeneratedImageItem, UserModerationLockoutState } from '../types';
 import { parseJsonResponse } from '../utils/apiFetch';
 
 interface ImageGenTabProps {
   isOwnerAdmin?: boolean;
   isAuthenticated?: boolean;
+  getAuthToken?: () => Promise<string | null>;
+  onModerationBlocked?: (
+    status: number,
+    payload: {
+      code?: string;
+      error?: string;
+      moderation?: UserModerationLockoutState;
+    }
+  ) => void;
   onRequireAuth?: (reason?: string) => void;
   onCopyText: (value: string, label: string) => void;
   onShowToast: (message: string) => void;
@@ -250,6 +259,8 @@ async function generateDirectPollinationsFallback(
 export function ImageGenTab({
   isOwnerAdmin = false,
   isAuthenticated = true,
+  getAuthToken,
+  onModerationBlocked,
   onRequireAuth,
   onCopyText,
   onShowToast,
@@ -310,11 +321,18 @@ export function ImageGenTab({
       updateMessage(assistantMsgId, { queueStatus: txt });
     };
 
+    let blockedByModeration = false;
     try {
       updateStatus('Sending to free image studio...');
+      const authToken = getAuthToken ? await getAuthToken() : null;
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (authToken) {
+        headers.Authorization = `Bearer ${authToken}`;
+      }
+
       const res = await fetch('/api/images/generate', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           prompt: imagePrompt,
           style: useStyle,
@@ -329,8 +347,21 @@ export function ImageGenTab({
         provider?: string;
         queuePosition?: number;
         waitTime?: number;
+        code?: string;
         error?: string;
+        moderation?: UserModerationLockoutState;
       }>(res);
+
+      if (res.status === 403 && data?.code === 'ACCOUNT_MODERATED') {
+        blockedByModeration = true;
+        onModerationBlocked?.(res.status, data);
+        updateMessage(assistantMsgId, {
+          generatingImage: false,
+          queueStatus: null,
+          error: data.error || 'Your access to VeriBox has been restricted by the administrator.',
+        });
+        return;
+      }
 
       if (!res.ok) {
         throw new Error(data.error || 'Image generation failed');
@@ -423,7 +454,7 @@ export function ImageGenTab({
 
       throw new Error('Unexpected response from image studio');
     } catch (serverErr) {
-      if (abortRef.current) return;
+      if (abortRef.current || blockedByModeration) return;
       try {
         updateStatus('Switching to fast direct renderer...');
         const fallbackDataUrl = await generateDirectPollinationsFallback(
@@ -551,9 +582,14 @@ export function ImageGenTab({
       }
 
       // Ask /api/ai/chat (Gemini or VeriBox AI) — handles normal chat, app Q&A, photo vision, and auto image intent!
+      const authToken = getAuthToken ? await getAuthToken() : null;
+      const chatHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (authToken) {
+        chatHeaders.Authorization = `Bearer ${authToken}`;
+      }
       const res = await fetch('/api/ai/chat', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: chatHeaders,
         body: JSON.stringify({
           message: text,
           history: historySnapshot,
@@ -570,8 +606,21 @@ export function ImageGenTab({
         reply?: string;
         imagePrompt?: string;
         provider?: string;
+        code?: string;
         error?: string;
+        moderation?: UserModerationLockoutState;
       }>(res);
+
+      if (res.status === 403 && data?.code === 'ACCOUNT_MODERATED') {
+        onModerationBlocked?.(res.status, data);
+        updateMessage(assistantMsgId, {
+          text: data.error || 'Your access to VeriBox has been restricted by the administrator.',
+          generatingImage: false,
+          queueStatus: null,
+          error: data.error || 'Access restricted',
+        });
+        return;
+      }
 
       if (!res.ok) {
         throw new Error(data.error || 'Could not reach VeriBox AI');

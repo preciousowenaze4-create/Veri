@@ -48,6 +48,7 @@ interface SmsTabProps {
   lowestDealsLoading: boolean;
   quantity: number;
   walletBalance?: number;
+  reservedBalance?: number;
   activeOrders: PrivateNumberOrder[];
   selectedOrder: PrivateNumberOrder | null;
   acquiring: boolean;
@@ -68,6 +69,7 @@ interface SmsTabProps {
   onSelectOrder: (order: PrivateNumberOrder) => void;
   onCheckOrder: (orderId: number) => void;
   onCancelOrder: (orderId: number) => void;
+  onSwapNumber?: (order: PrivateNumberOrder) => void;
   onFinishOrder: (orderId: number) => void;
   onReuseFromHistory: (order: PrivateNumberOrder) => void;
   onDeleteFromHistory: (orderId: number) => void;
@@ -198,6 +200,7 @@ export function SmsTab({
   lowestDealsLoading,
   quantity,
   walletBalance,
+  reservedBalance = 0,
   activeOrders,
   selectedOrder,
   acquiring,
@@ -218,6 +221,7 @@ export function SmsTab({
   onSelectOrder,
   onCheckOrder,
   onCancelOrder,
+  onSwapNumber,
   onFinishOrder,
   onReuseFromHistory,
   onDeleteFromHistory,
@@ -228,6 +232,7 @@ export function SmsTab({
   const [countryDropdownOpen, setCountryDropdownOpen] = useState(false);
   const [countrySearch, setCountrySearch] = useState('');
   const [countrySort, setCountrySort] = useState<'az' | 'lowest' | 'instock'>('az');
+  const [countryBudget, setCountryBudget] = useState<'all' | 'under500' | 'under1500'>('all');
   const [showAllDeals, setShowAllDeals] = useState(false);
   const [qtyDropdownOpen, setQtyDropdownOpen] = useState(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
@@ -330,6 +335,12 @@ export function SmsTab({
         )
       : [...countries];
 
+    if (countryBudget === 'under500') {
+      list = list.filter((c) => (c.minPrice || 0) > 0 && (c.minPrice || 0) <= 500);
+    } else if (countryBudget === 'under1500') {
+      list = list.filter((c) => (c.minPrice || 0) > 0 && (c.minPrice || 0) <= 1500);
+    }
+
     if (countrySort === 'instock') {
       list = list.filter((c) => (c.stockCount || 0) > 0);
       list.sort((a, b) => (b.stockCount || 0) - (a.stockCount || 0));
@@ -343,7 +354,7 @@ export function SmsTab({
       list.sort((a, b) => a.country.localeCompare(b.country));
     }
     return list;
-  }, [countries, countrySearch, countrySort]);
+  }, [countries, countrySearch, countrySort, countryBudget]);
 
   const cheapestCountryOption = useMemo(() => {
     const priced = countries.filter((c) => (c.minPrice || 0) > 0);
@@ -749,7 +760,7 @@ export function SmsTab({
                           className="h-9 w-full rounded-lg border border-[#D4AF37]/20 bg-[#FAF7F0] pl-8 pr-3 text-xs text-[#1A160D] placeholder:text-[#8A7F6A] focus:border-[#D4AF37] focus:outline-none dark:bg-[#0B0A07] dark:text-[#FAF6EC]"
                         />
                       </div>
-                      <div className="flex items-center gap-1">
+                      <div className="flex flex-wrap items-center gap-1">
                         {(
                           [
                             { id: 'az', label: 'A–Z' },
@@ -768,6 +779,27 @@ export function SmsTab({
                             }`}
                           >
                             {opt.label}
+                          </button>
+                        ))}
+                        <span className="mx-0.5 text-[#D4AF37]/40">|</span>
+                        {(
+                          [
+                            { id: 'all', label: 'All ₦' },
+                            { id: 'under500', label: '≤ ₦500' },
+                            { id: 'under1500', label: '≤ ₦1,500' },
+                          ] as const
+                        ).map((b) => (
+                          <button
+                            key={b.id}
+                            type="button"
+                            onClick={() => setCountryBudget(b.id)}
+                            className={`rounded-lg px-2 py-1 text-[10.5px] font-bold transition-colors ${
+                              countryBudget === b.id
+                                ? 'bg-emerald-600 text-white'
+                                : 'bg-[#FAF7F0] text-[#6E6552] hover:bg-emerald-500/15 dark:bg-[#0B0A07] dark:text-[#A89F8C]'
+                            }`}
+                          >
+                            {b.label}
                           </button>
                         ))}
                       </div>
@@ -1077,43 +1109,56 @@ export function SmsTab({
                     )}
                   </div>
 
-                  {/* Wallet Balance Affordability Check */}
+                  {/* Pay-on-SMS-Arrival & Available Wallet Balance Check */}
                   {typeof walletBalance === 'number' && checkoutUnitNgn ? (() => {
                     const orderTotalNgn = Math.round(checkoutUnitNgn * quantity);
-                    const hasEnough = walletBalance >= orderTotalNgn;
-                    const deficit = Math.max(0, orderTotalNgn - Math.floor(walletBalance));
+                    const availableBalance = Math.max(0, walletBalance - reservedBalance);
+                    const hasEnough = availableBalance >= orderTotalNgn;
+                    const deficit = Math.max(0, orderTotalNgn - Math.floor(availableBalance));
                     return (
-                      <div
-                        className={`flex flex-wrap items-center justify-between gap-2 rounded-xl border px-3.5 py-2.5 text-xs ${
-                          hasEnough
-                            ? 'border-emerald-500/25 bg-emerald-500/5 text-emerald-800 dark:text-emerald-300'
-                            : 'border-amber-500/35 bg-amber-500/10 text-amber-800 dark:text-amber-200'
-                        }`}
-                      >
-                        <div className="flex items-center gap-2 min-w-0">
-                          <Wallet className="h-3.5 w-3.5 shrink-0" />
-                          <span className="truncate font-semibold">
-                            Wallet: <strong className="font-mono">{formatPrice(walletBalance, 'NGN')}</strong>
-                            {' · '}
-                            Order: <strong className="font-mono">{formatPrice(orderTotalNgn, 'NGN')}</strong>
-                          </span>
-                        </div>
-                        {!hasEnough && (
-                          <div className="flex items-center gap-2 shrink-0">
-                            <span className="font-mono text-[11px] font-bold">
-                              Need {formatPrice(deficit, 'NGN')} more
+                      <div className="space-y-2">
+                        <div
+                          className={`flex flex-wrap items-center justify-between gap-2 rounded-xl border px-3.5 py-2.5 text-xs ${
+                            hasEnough
+                              ? 'border-emerald-500/25 bg-emerald-500/5 text-emerald-800 dark:text-emerald-300'
+                              : 'border-amber-500/35 bg-amber-500/10 text-amber-800 dark:text-amber-200'
+                          }`}
+                        >
+                          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 min-w-0">
+                            <Wallet className="h-3.5 w-3.5 shrink-0" />
+                            <span className="font-semibold">
+                              Wallet: <strong className="font-mono">{formatPrice(walletBalance, 'NGN')}</strong>
                             </span>
-                            {onOpenDeposit && (
-                              <button
-                                type="button"
-                                onClick={onOpenDeposit}
-                                className="rounded-lg bg-[#D4AF37] px-2.5 py-1 text-[11px] font-extrabold text-[#0A0906] hover:bg-[#E5C150]"
-                              >
-                                Top Up
-                              </button>
+                            {reservedBalance > 0 && (
+                              <span className="font-semibold text-amber-700 dark:text-amber-300">
+                                · Held: <strong className="font-mono">{formatPrice(reservedBalance, 'NGN')}</strong>
+                                {' · '}Avail: <strong className="font-mono">{formatPrice(availableBalance, 'NGN')}</strong>
+                              </span>
                             )}
+                            <span className="font-semibold">
+                              · Order: <strong className="font-mono">{formatPrice(orderTotalNgn, 'NGN')}</strong>
+                            </span>
                           </div>
-                        )}
+                          {!hasEnough && (
+                            <div className="flex items-center gap-2 shrink-0">
+                              <span className="font-mono text-[11px] font-bold">
+                                Need {formatPrice(deficit, 'NGN')} more
+                              </span>
+                              {onOpenDeposit && (
+                                <button
+                                  type="button"
+                                  onClick={onOpenDeposit}
+                                  className="rounded-lg bg-[#D4AF37] px-2.5 py-1 text-[11px] font-extrabold text-[#0A0906] hover:bg-[#E5C150]"
+                                >
+                                  Top Up
+                                </button>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                        <p className="rounded-xl border border-[#D4AF37]/20 bg-[#FAF7F0] px-3 py-2 text-[11px] font-semibold text-[#6E6552] dark:bg-[#0B0A07] dark:text-[#A89F8C]">
+                          Pay only when SMS arrives — ₦0 is deducted until your verification code is delivered.
+                        </p>
                       </div>
                     );
                   })() : null}
@@ -1222,6 +1267,15 @@ export function SmsTab({
                               ) : null}
                             </>
                           ) : null}
+                          <span
+                            className={`rounded px-1.5 py-0.5 text-[10px] font-extrabold ${
+                              order.charged || order.sms.length > 0
+                                ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+                                : 'bg-amber-500/15 text-amber-700 dark:text-amber-300'
+                            }`}
+                          >
+                            {order.charged || order.sms.length > 0 ? 'Paid' : '₦0 Hold · Pay on Code'}
+                          </span>
                         </div>
                         <p className="mt-1.5 font-mono text-xl sm:text-2xl font-extrabold tracking-tight text-[#1A160D] dark:text-[#FAF6EC]">
                           {order.phone}
@@ -1319,14 +1373,27 @@ export function SmsTab({
 
                   {selectedOrder.sms.length === 0 &&
                     ['PENDING', 'RECEIVED'].includes(selectedOrder.status) && (
-                      <button
-                        type="button"
-                        onClick={() => onCancelOrder(selectedOrder.id)}
-                        className="inline-flex min-h-[40px] items-center gap-1.5 rounded-xl border border-rose-500/35 px-3 py-2 text-xs font-bold text-rose-600 hover:bg-rose-500/10 dark:text-rose-300"
-                      >
-                        <XCircle className="h-3.5 w-3.5" />
-                        <span>Cancel</span>
-                      </button>
+                      <>
+                        {onSwapNumber && (
+                          <button
+                            type="button"
+                            disabled={acquiring}
+                            onClick={() => onSwapNumber(selectedOrder)}
+                            className="inline-flex min-h-[40px] items-center gap-1.5 rounded-xl border border-[#D4AF37]/40 bg-[#FAF7F0] px-3 py-2 text-xs font-bold text-[#8A6208] hover:bg-[#D4AF37]/15 disabled:opacity-60 dark:bg-[#0B0A07] dark:text-[#F5D77A]"
+                          >
+                            <RotateCcw className="h-3.5 w-3.5" />
+                            <span>Swap Number</span>
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => onCancelOrder(selectedOrder.id)}
+                          className="inline-flex min-h-[40px] items-center gap-1.5 rounded-xl border border-rose-500/35 px-3 py-2 text-xs font-bold text-rose-600 hover:bg-rose-500/10 dark:text-rose-300"
+                        >
+                          <XCircle className="h-3.5 w-3.5" />
+                          <span>Cancel</span>
+                        </button>
+                      </>
                     )}
 
                   {selectedOrder.sms.length > 0 && selectedOrder.status !== 'FINISHED' && (
@@ -1346,11 +1413,11 @@ export function SmsTab({
                 {selectedOrder.sms.length === 0 &&
                 ['PENDING', 'RECEIVED'].includes(selectedOrder.status) ? (
                   <p className="rounded-xl border border-[#D4AF37]/20 bg-[#FAF7F0] px-3 py-2 text-[11px] font-semibold text-[#6E6552] dark:bg-[#0B0A07] dark:text-[#A89F8C]">
-                    No SMS yet · Tap Cancel anytime for a full{' '}
+                    No SMS yet · Pay only when SMS arrives (
                     {selectedOrder.price
                       ? formatPrice(selectedOrder.price, selectedOrder.currency)
-                      : ''}{' '}
-                    wallet refund.
+                      : 'quoted rate'}
+                    ). Tap Swap Number or Cancel anytime with ₦0 charged.
                   </p>
                 ) : selectedOrder.sms.length > 0 ? (
                   <p className="rounded-xl border border-emerald-500/25 bg-emerald-500/10 px-3 py-2 text-[11px] font-semibold text-emerald-700 dark:text-emerald-300">
@@ -1485,6 +1552,21 @@ export function SmsTab({
                           ) : null}
                           <span aria-hidden="true">·</span>
                           <span className="tabular-nums">{formatRelativeTime(item.createdAt)}</span>
+                          <span
+                            className={`rounded px-1.5 py-0.5 text-[10px] font-bold ${
+                              item.charged || item.sms.length > 0
+                                ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+                                : ['CANCELED', 'TIMEOUT', 'BANNED'].includes(item.status)
+                                  ? 'bg-[#D4AF37]/10 text-[#6E6552] dark:text-[#A89F8C]'
+                                  : 'bg-amber-500/15 text-amber-700 dark:text-amber-300'
+                            }`}
+                          >
+                            {item.charged || item.sms.length > 0
+                              ? 'Paid'
+                              : ['CANCELED', 'TIMEOUT', 'BANNED'].includes(item.status)
+                                ? '₦0 (Cancelled)'
+                                : 'Hold'}
+                          </span>
                         </div>
 
                         <p className="mt-1.5 font-mono text-lg font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
@@ -1498,7 +1580,7 @@ export function SmsTab({
                         )}
                       </div>
 
-                      <div className="flex items-center gap-1.5 shrink-0">
+                      <div className="flex flex-wrap items-center gap-1.5 shrink-0">
                         <button
                           type="button"
                           onClick={() => onReuseFromHistory(item)}
@@ -1507,6 +1589,18 @@ export function SmsTab({
                           <RotateCcw className="h-3.5 w-3.5" />
                           <span>Reuse</span>
                         </button>
+
+                        {onSwapNumber && (
+                          <button
+                            type="button"
+                            disabled={acquiring}
+                            onClick={() => onSwapNumber({ ...item, sms: [], status: 'FINISHED' })}
+                            className="inline-flex min-h-[40px] items-center gap-1.5 rounded-xl border border-[#D4AF37]/35 px-3 py-2 text-xs font-bold text-[#8A6208] hover:bg-[#D4AF37]/10 disabled:opacity-60 dark:text-[#F5D77A]"
+                          >
+                            <Sparkles className="h-3.5 w-3.5" />
+                            <span>Fresh</span>
+                          </button>
+                        )}
 
                         <button
                           type="button"

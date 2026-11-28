@@ -177,6 +177,9 @@ export interface PrivateNumberOrder {
   expires: string;
   createdAt: string;
   sms: SmsMessageEntry[];
+  charged?: boolean;
+  chargeOnCode?: boolean;
+  chargeToken?: string;
 }
 
 export interface GeneratedImageItem {
@@ -259,10 +262,17 @@ export interface AdminDnsCheck {
   mxRecords: string[];
   spfOk: boolean;
   spfRecord: string | null;
+  sendSpfOk?: boolean;
+  sendSpfRecord?: string | null;
   dmarcOk: boolean;
   dmarcRecord: string | null;
+  dkimOk?: boolean;
+  dkimRecord?: string | null;
   aRecords: string[];
   error: string | null;
+  recommendedSpfRecord?: string;
+  trustScore?: number;
+  antiBanNotice?: string;
 }
 
 export interface AdminDomainConnectionCheck {
@@ -361,6 +371,24 @@ export interface AdminDiagnosticsResponse {
 export type UserModerationStatus = 'active' | 'verified' | 'restricted' | 'suspended' | 'banned';
 export type UserModerationAction = 'verify' | 'restrict' | 'suspend' | 'ban' | 'restore';
 
+export interface StrictBanEntry {
+  id: string;
+  targetType: 'user' | 'email' | 'ip';
+  targetValue: string;
+  reason: string | null;
+  strict: boolean;
+  bannedBy: string | null;
+  createdAt: string;
+}
+
+export interface UserModerationLockoutState {
+  blocked: boolean;
+  status: UserModerationStatus;
+  reason: string | null;
+  strict: boolean;
+  matchType?: 'user' | 'email' | 'ip' | null;
+}
+
 export interface AdminManagedUser {
   id: string;
   email: string;
@@ -374,6 +402,8 @@ export interface AdminManagedUser {
   walletBalance: number;
   mailboxCount: number;
   moderationReason: string | null;
+  strictBanned?: boolean;
+  lastIp?: string | null;
 }
 
 export interface AdminReadinessCheckItem {

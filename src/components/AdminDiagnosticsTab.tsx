@@ -4,8 +4,10 @@ import {
   ArrowLeft,
   ArrowLeftRight,
   Ban,
+  Check,
   CheckCircle2,
   Clock,
+  Copy,
   Database,
   Globe,
   Loader2,
@@ -14,7 +16,9 @@ import {
   Play,
   RefreshCw,
   Search,
+  Send,
   Server,
+  Shield,
   ShieldAlert,
   ShieldCheck,
   Trash2,
@@ -57,6 +61,12 @@ interface AdminDiagnosticsTabProps {
   onModerateUser?: (userId: string, action: UserModerationAction) => void;
   onRefreshTransfers?: () => void;
   onClearAlerts?: () => void;
+  onSendEmail?: (payload: {
+    fromAddress: string;
+    toAddress: string;
+    subject: string;
+    text: string;
+  }) => Promise<{ ok: boolean; id?: string | null; error?: string }>;
   onSwitchToUserView: () => void;
 }
 
@@ -149,6 +159,7 @@ export function AdminDiagnosticsTab({
   onModerateUser,
   onRefreshTransfers,
   onClearAlerts,
+  onSendEmail,
   onSwitchToUserView,
 }: AdminDiagnosticsTabProps) {
   const defaultTarget = activeEmailAddress || `diag.test@${emailDomain}`;
@@ -159,10 +170,53 @@ export function AdminDiagnosticsTab({
   const [transferFilter, setTransferFilter] = useState<
     'all' | 'p2p_transfer' | 'deposit' | 'debit' | 'refund' | 'issues'
   >('all');
+  const [copiedSpf, setCopiedSpf] = useState(false);
+  const [warmupFrom, setWarmupFrom] = useState(activeEmailAddress || `hello@${emailDomain}`);
+  const [warmupTo, setWarmupTo] = useState(ownerEmail);
+  const [warmupSubject, setWarmupSubject] = useState('Quick hello from VeriBox Mail');
+  const [warmupText, setWarmupText] = useState(
+    'Hi there, testing real two-way mail delivery from my @veribox.name.ng inbox. Please reply back from Gmail to confirm the thread works!'
+  );
+  const [warmupSending, setWarmupSending] = useState(false);
+  const [warmupStatus, setWarmupStatus] = useState<{ ok: boolean; text: string } | null>(null);
+
+  const recommendedSpf =
+    diagnostics?.dnsCheck?.recommendedSpfRecord || `v=spf1 include:send.${emailDomain} ~all`;
+
+  const handleCopySpf = () => {
+    void navigator.clipboard.writeText(recommendedSpf);
+    setCopiedSpf(true);
+    setTimeout(() => setCopiedSpf(false), 2500);
+  };
+
+  const handleSendWarmup = async () => {
+    if (!onSendEmail || warmupSending) return;
+    setWarmupSending(true);
+    setWarmupStatus(null);
+    const res = await onSendEmail({
+      fromAddress: warmupFrom.trim().toLowerCase(),
+      toAddress: warmupTo.trim().toLowerCase(),
+      subject: warmupSubject.trim(),
+      text: warmupText.trim(),
+    });
+    setWarmupSending(false);
+    if (res.ok) {
+      setWarmupStatus({
+        ok: true,
+        text: `Sent via Resend (${res.id || 'queued'}). Reply from ${warmupTo.trim()} to see the real-time reply inside ${warmupFrom.trim()}.`,
+      });
+    } else {
+      setWarmupStatus({
+        ok: false,
+        text: res.error || 'Could not send email via Resend.',
+      });
+    }
+  };
 
   useEffect(() => {
     if (activeEmailAddress) {
       setTestAddress(activeEmailAddress);
+      setWarmupFrom(activeEmailAddress);
     }
   }, [activeEmailAddress]);
 
@@ -577,57 +631,204 @@ export function AdminDiagnosticsTab({
                       DNS Lookup Error: {diagnostics.dnsCheck.error}
                     </p>
                   ) : (
-                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-[11px]">
-                      <div className="rounded-lg border border-[#D4AF37]/15 bg-white p-2 dark:bg-[#14120D]">
-                        <p className="font-bold text-[#6E6552] dark:text-[#A89F8C]">
-                          MX Records:{' '}
-                          <span
-                            className={
-                              diagnostics.dnsCheck.mxOk
-                                ? 'text-emerald-600 dark:text-emerald-400'
-                                : 'text-rose-600 dark:text-rose-400'
-                            }
-                          >
-                            {diagnostics.dnsCheck.mxOk ? 'Resend MX OK' : 'Missing MX'}
-                          </span>
-                        </p>
-                        <p className="mt-0.5 font-mono text-[10px] text-[#1A160D] dark:text-[#FAF6EC] break-all">
-                          {diagnostics.dnsCheck.mxRecords.join(', ') || 'None found'}
-                        </p>
+                    <div className="space-y-3">
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px]">
+                        <div className="rounded-lg border border-[#D4AF37]/15 bg-white p-2 dark:bg-[#14120D]">
+                          <p className="font-bold text-[#6E6552] dark:text-[#A89F8C]">
+                            MX Records:{' '}
+                            <span
+                              className={
+                                diagnostics.dnsCheck.mxOk
+                                  ? 'text-emerald-600 dark:text-emerald-400'
+                                  : 'text-rose-600 dark:text-rose-400'
+                              }
+                            >
+                              {diagnostics.dnsCheck.mxOk ? 'Resend MX OK' : 'Missing MX'}
+                            </span>
+                          </p>
+                          <p className="mt-0.5 font-mono text-[10px] text-[#1A160D] dark:text-[#FAF6EC] break-all">
+                            {diagnostics.dnsCheck.mxRecords[0] || 'None found'}
+                          </p>
+                        </div>
+                        <div className="rounded-lg border border-[#D4AF37]/15 bg-white p-2 dark:bg-[#14120D]">
+                          <p className="font-bold text-[#6E6552] dark:text-[#A89F8C]">
+                            SPF Authentication:{' '}
+                            <span
+                              className={
+                                diagnostics.dnsCheck.spfOk
+                                  ? 'text-emerald-600 dark:text-emerald-400'
+                                  : 'text-rose-600 dark:text-rose-400 font-extrabold'
+                              }
+                            >
+                              {diagnostics.dnsCheck.spfOk ? 'Valid' : 'Missing (Crucial)'}
+                            </span>
+                          </p>
+                          <p className="mt-0.5 font-mono text-[10px] text-[#1A160D] dark:text-[#FAF6EC] break-all">
+                            {diagnostics.dnsCheck.spfRecord || 'No SPF TXT record'}
+                          </p>
+                        </div>
+                        <div className="rounded-lg border border-[#D4AF37]/15 bg-white p-2 dark:bg-[#14120D]">
+                          <p className="font-bold text-[#6E6552] dark:text-[#A89F8C]">
+                            DKIM Signature:{' '}
+                            <span
+                              className={
+                                diagnostics.dnsCheck.dkimOk
+                                  ? 'text-emerald-600 dark:text-emerald-400'
+                                  : 'text-amber-600 dark:text-amber-400'
+                              }
+                            >
+                              {diagnostics.dnsCheck.dkimOk ? 'Resend DKIM OK' : 'Pending'}
+                            </span>
+                          </p>
+                          <p className="mt-0.5 font-mono text-[10px] text-[#1A160D] dark:text-[#FAF6EC] truncate">
+                            {diagnostics.dnsCheck.dkimRecord ? 'resend._domainkey verified' : 'resend._domainkey'}
+                          </p>
+                        </div>
+                        <div className="rounded-lg border border-[#D4AF37]/15 bg-white p-2 dark:bg-[#14120D]">
+                          <p className="font-bold text-[#6E6552] dark:text-[#A89F8C]">
+                            DMARC Policy:{' '}
+                            <span
+                              className={
+                                diagnostics.dnsCheck.dmarcOk
+                                  ? 'text-emerald-600 dark:text-emerald-400'
+                                  : 'text-amber-600 dark:text-amber-400'
+                              }
+                            >
+                              {diagnostics.dnsCheck.dmarcOk ? 'Configured' : 'Missing'}
+                            </span>
+                          </p>
+                          <p className="mt-0.5 font-mono text-[10px] text-[#1A160D] dark:text-[#FAF6EC] break-all">
+                            {diagnostics.dnsCheck.dmarcRecord || 'No _dmarc TXT record'}
+                          </p>
+                        </div>
                       </div>
-                      <div className="rounded-lg border border-[#D4AF37]/15 bg-white p-2 dark:bg-[#14120D]">
-                        <p className="font-bold text-[#6E6552] dark:text-[#A89F8C]">
-                          SPF:{' '}
-                          <span
-                            className={
-                              diagnostics.dnsCheck.spfOk
-                                ? 'text-emerald-600 dark:text-emerald-400'
-                                : 'text-amber-600 dark:text-amber-400'
-                            }
-                          >
-                            {diagnostics.dnsCheck.spfOk ? 'Valid' : 'Missing'}
-                          </span>
-                        </p>
-                        <p className="mt-0.5 font-mono text-[10px] text-[#1A160D] dark:text-[#FAF6EC] break-all">
-                          {diagnostics.dnsCheck.spfRecord || 'No SPF TXT record'}
-                        </p>
-                      </div>
-                      <div className="rounded-lg border border-[#D4AF37]/15 bg-white p-2 dark:bg-[#14120D]">
-                        <p className="font-bold text-[#6E6552] dark:text-[#A89F8C]">
-                          DMARC:{' '}
-                          <span
-                            className={
-                              diagnostics.dnsCheck.dmarcOk
-                                ? 'text-emerald-600 dark:text-emerald-400'
-                                : 'text-amber-600 dark:text-amber-400'
-                            }
-                          >
-                            {diagnostics.dnsCheck.dmarcOk ? 'Configured' : 'Missing'}
-                          </span>
-                        </p>
-                        <p className="mt-0.5 font-mono text-[10px] text-[#1A160D] dark:text-[#FAF6EC] break-all">
-                          {diagnostics.dnsCheck.dmarcRecord || 'No _dmarc TXT record'}
-                        </p>
+
+                      {/* Critical Facebook & Instagram Anti-Ban Action Card if Root SPF is missing */}
+                      {!diagnostics.dnsCheck.spfOk && (
+                        <div className="rounded-xl border border-rose-500/50 bg-rose-500/10 p-3.5 text-xs text-rose-800 dark:text-rose-200 space-y-2.5">
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="flex items-center gap-1.5 font-extrabold text-rose-700 dark:text-rose-300">
+                              <AlertTriangle className="h-4 w-4 shrink-0 text-rose-600" />
+                              <span>Critical: Missing Root SPF TXT Record ({emailDomain})</span>
+                            </div>
+                            <span className="rounded bg-rose-600 px-2 py-0.5 font-mono text-[10px] font-extrabold text-white">
+                              Fix Required
+                            </span>
+                          </div>
+
+                          <p className="leading-relaxed text-[11px]">
+                            Resend already set <code className="font-mono">send.{emailDomain}</code> ({diagnostics.dnsCheck.sendSpfOk ? 'Active' : 'Checking'}) and DKIM, but <strong>root <code className="font-mono">@</code> has no SPF TXT record yet</strong>. Meta/Facebook and Gmail check root SPF.
+                          </p>
+
+                          <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-2.5 text-[11px] text-amber-900 dark:text-amber-200">
+                            <strong>Important Cloudflare Fix:</strong> Do <strong>NOT</strong> open <em>Cloudflare → Email → Email Routing</em> (that causes the <em>&quot;Existing non-Cloudflare MX records conflict&quot;</em> error because Resend owns your MX records). Instead go to <strong>Cloudflare → DNS → Records → Add record</strong>.
+                          </div>
+
+                          <div className="rounded-lg border border-rose-500/30 bg-white/80 p-2.5 font-mono text-[11px] space-y-1.5 dark:bg-[#14120D]">
+                            <p className="font-bold text-[#1A160D] dark:text-[#FAF6EC]">
+                              Add in Cloudflare → DNS → Records:
+                            </p>
+                            <div className="grid grid-cols-1 sm:grid-cols-3 gap-1.5 text-[10px]">
+                              <div><span className="opacity-75">Type:</span> <strong>TXT</strong></div>
+                              <div><span className="opacity-75">Name:</span> <strong>@</strong> (or {emailDomain})</div>
+                              <div><span className="opacity-75">TTL:</span> <strong>Auto</strong></div>
+                            </div>
+                            <div className="flex items-center justify-between gap-2 pt-1 border-t border-[#D4AF37]/20">
+                              <span className="text-[#1A160D] dark:text-[#F5D77A] font-bold select-all break-all">
+                                {recommendedSpf}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={handleCopySpf}
+                                className="inline-flex items-center gap-1 shrink-0 rounded-md bg-[#D4AF37] px-2.5 py-1 text-[10px] font-extrabold text-[#0A0906] hover:bg-[#E5C150] cursor-pointer"
+                              >
+                                {copiedSpf ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+                                <span>{copiedSpf ? 'Copied!' : 'Copy Value'}</span>
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
+                      {onSendEmail && (
+                        <div className="rounded-xl border border-[#D4AF37]/30 bg-white p-3.5 space-y-2.5 dark:bg-[#14120D]">
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="flex items-center gap-1.5 font-bold text-xs text-[#1A160D] dark:text-[#FAF6EC]">
+                              <Send className="h-4 w-4 text-[#D4AF37]" />
+                              <span>Gmail Two-Way Trust &amp; Domain Warmup</span>
+                            </div>
+                            <span className="font-mono text-[10px] text-[#6E6552] dark:text-[#A89F8C]">
+                              Real Resend Outbound + Inbound Reply
+                            </span>
+                          </div>
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                            <input
+                              type="email"
+                              value={warmupFrom}
+                              onChange={(e) => setWarmupFrom(e.target.value)}
+                              placeholder={`From (@${emailDomain})`}
+                              className="h-9 rounded-lg border border-[#D4AF37]/25 bg-[#FAF7F0] px-2.5 font-mono text-xs text-[#1A160D] focus:border-[#D4AF37] focus:outline-none dark:bg-[#0B0A07] dark:text-[#FAF6EC]"
+                            />
+                            <input
+                              type="email"
+                              value={warmupTo}
+                              onChange={(e) => setWarmupTo(e.target.value)}
+                              placeholder="To (e.g. yourname@gmail.com)"
+                              className="h-9 rounded-lg border border-[#D4AF37]/25 bg-[#FAF7F0] px-2.5 font-mono text-xs text-[#1A160D] focus:border-[#D4AF37] focus:outline-none dark:bg-[#0B0A07] dark:text-[#FAF6EC]"
+                            />
+                          </div>
+                          <input
+                            type="text"
+                            value={warmupSubject}
+                            onChange={(e) => setWarmupSubject(e.target.value)}
+                            placeholder="Subject"
+                            className="h-9 w-full rounded-lg border border-[#D4AF37]/25 bg-[#FAF7F0] px-2.5 text-xs text-[#1A160D] focus:border-[#D4AF37] focus:outline-none dark:bg-[#0B0A07] dark:text-[#FAF6EC]"
+                          />
+                          <textarea
+                            rows={2}
+                            value={warmupText}
+                            onChange={(e) => setWarmupText(e.target.value)}
+                            placeholder="Write a real message to warm up domain trust..."
+                            className="w-full rounded-lg border border-[#D4AF37]/25 bg-[#FAF7F0] p-2.5 text-xs text-[#1A160D] focus:border-[#D4AF37] focus:outline-none dark:bg-[#0B0A07] dark:text-[#FAF6EC]"
+                          />
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <button
+                              type="button"
+                              disabled={warmupSending}
+                              onClick={() => void handleSendWarmup()}
+                              className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg bg-[#D4AF37] px-3.5 text-xs font-extrabold text-[#0A0906] hover:bg-[#E5C150] disabled:opacity-60 cursor-pointer"
+                            >
+                              {warmupSending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
+                              <span>{warmupSending ? 'Sending...' : 'Send Real Email to Gmail'}</span>
+                            </button>
+                            {warmupStatus && (
+                              <p
+                                className={`text-[11px] font-semibold ${
+                                  warmupStatus.ok
+                                    ? 'text-emerald-700 dark:text-emerald-300'
+                                    : 'text-rose-600 dark:text-rose-300'
+                                }`}
+                              >
+                                {warmupStatus.text}
+                              </p>
+                            )}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Social Platform Registration Guide */}
+                      <div className="rounded-xl border border-[#D4AF37]/25 bg-white p-3 space-y-2 dark:bg-[#14120D]">
+                        <div className="flex items-center gap-1.5 font-bold text-xs text-[#1A160D] dark:text-[#FAF6EC]">
+                          <ShieldCheck className="h-4 w-4 text-[#D4AF37]" />
+                          <span>Social Anti-Ban Checklist (Facebook, Instagram &amp; TikTok)</span>
+                        </div>
+                        <ul className="space-y-1 text-[11px] text-[#6E6552] dark:text-[#A89F8C] leading-relaxed">
+                          <li>• <strong>1. Cloudflare DNS Root SPF:</strong> Add <code className="font-mono">{recommendedSpf}</code> under <strong>Cloudflare → DNS → Records</strong> (not Email Routing) so Meta verifies email authenticity.</li>
+                          <li>• <strong>2. Fresh Incognito Window:</strong> Clear any Meta-flagged cookies before creating a new account.</li>
+                          <li>• <strong>3. Clean Cellular IP (4G/5G):</strong> Avoid VPNs or data-center IPs when opening social accounts.</li>
+                          <li>• <strong>4. Realistic Human Identity:</strong> Match the Facebook First &amp; Last Name to your generated <code className="font-mono">firstname.lastname@{emailDomain}</code> mailbox.</li>
+                          <li>• <strong>5. Two-Way Gmail Trust:</strong> Send and reply to real Gmail messages first so the mailbox &amp; domain build positive history.</li>
+                        </ul>
                       </div>
                     </div>
                   ))}

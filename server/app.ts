@@ -1077,51 +1077,54 @@ function roundToNaira(costUsd: number, rate: number): number {
 
 async function detectFiveSimRatioCurrency(apiKey: string): Promise<'RUB' | 'USD'> {
   if (!apiKey) return 'USD';
-  try {
-    const [authRes, pubRes] = await Promise.all([
-      fetch('https://5sim.net/v1/guest/prices?product=tiktok', {
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          Accept: 'application/json',
-          'User-Agent': USER_AGENT,
-        },
-        signal: AbortSignal.timeout(5000),
-      }),
-      fetch('https://5sim.net/v1/guest/prices?product=tiktok', {
-        headers: { Accept: 'application/json', 'User-Agent': USER_AGENT },
-        signal: AbortSignal.timeout(5000),
-      }),
-    ]);
-    if (!authRes.ok || !pubRes.ok) return 'USD';
-    const authJson = (await authRes.json()) as Record<
-      string,
-      Record<string, Record<string, { cost?: number; count?: number }>>
-    >;
-    const pubJson = (await pubRes.json()) as Record<
-      string,
-      Record<string, Record<string, { cost?: number; count?: number }>>
-    >;
-    const authMap = authJson.tiktok || {};
-    const pubMap = pubJson.tiktok || {};
-    const ratios: number[] = [];
-    for (const [slug, opMap] of Object.entries(authMap)) {
-      for (const [opName, st] of Object.entries(opMap || {})) {
-        const authCost = Number(st?.cost || 0);
-        const pubCost = Number(pubMap[slug]?.[opName]?.cost || 0);
-        if (authCost > 0 && pubCost > 0) {
-          ratios.push(authCost / pubCost);
-          if (ratios.length >= 12) break;
+  for (const product of ['whatsapp', 'tiktok']) {
+    try {
+      const [authRes, pubRes] = await Promise.all([
+        fetch(`https://5sim.net/v1/guest/prices?product=${product}`, {
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            Accept: 'application/json',
+            'User-Agent': USER_AGENT,
+          },
+          signal: AbortSignal.timeout(5000),
+        }),
+        fetch(`https://5sim.net/v1/guest/prices?product=${product}`, {
+          headers: { Accept: 'application/json', 'User-Agent': USER_AGENT },
+          signal: AbortSignal.timeout(5000),
+        }),
+      ]);
+      if (!authRes.ok || !pubRes.ok) continue;
+      const authJson = (await authRes.json()) as Record<
+        string,
+        Record<string, Record<string, { cost?: number; count?: number }>>
+      >;
+      const pubJson = (await pubRes.json()) as Record<
+        string,
+        Record<string, Record<string, { cost?: number; count?: number }>>
+      >;
+      const authMap = authJson[product] || {};
+      const pubMap = pubJson[product] || {};
+      const ratios: number[] = [];
+      for (const [slug, opMap] of Object.entries(authMap)) {
+        for (const [opName, st] of Object.entries(opMap || {})) {
+          const authCost = Number(st?.cost || 0);
+          const pubCost = Number(pubMap[slug]?.[opName]?.cost || 0);
+          if (authCost > 0 && pubCost > 0) {
+            ratios.push(authCost / pubCost);
+            if (ratios.length >= 12) break;
+          }
         }
+        if (ratios.length >= 12) break;
       }
-      if (ratios.length >= 12) break;
+      if (ratios.length > 0) {
+        ratios.sort((a, b) => a - b);
+        const median = ratios[Math.floor(ratios.length / 2)];
+        if (median > 8) return 'RUB';
+        return 'USD';
+      }
+    } catch {
+      // Try next product or fall back
     }
-    if (ratios.length > 0) {
-      ratios.sort((a, b) => a - b);
-      const median = ratios[Math.floor(ratios.length / 2)];
-      if (median > 12) return 'RUB';
-    }
-  } catch {
-    // Non-blocking fallback to USD
   }
   return 'USD';
 }
@@ -1204,7 +1207,8 @@ async function getFiveSimCountriesForPlatform(
     priceHeaders.Authorization = `Bearer ${apiKey}`;
   }
 
-  const needCurrencyProbe = Boolean(apiKey) && fiveSimCurrencyCache.expiresAt <= Date.now();
+  const needCurrencyProbe = Boolean(apiKey) && fiveSimCurrencyCache.currency !== 'RUB';
+  let usedAuthFeed = Boolean(apiKey);
 
   const fetchAuthPrices = async () => {
     const first = await fetch(
@@ -1212,6 +1216,7 @@ async function getFiveSimCountriesForPlatform(
       { headers: priceHeaders, signal: AbortSignal.timeout(8000) }
     );
     if ((first.status === 401 || first.status === 403) && priceHeaders.Authorization) {
+      usedAuthFeed = false;
       return fetch(`https://5sim.net/v1/guest/prices?product=${encodeURIComponent(product)}`, {
         headers: { Accept: 'application/json', 'User-Agent': USER_AGENT },
         signal: AbortSignal.timeout(8000),
@@ -1295,14 +1300,13 @@ async function getFiveSimCountriesForPlatform(
       operators.push({ operator: opName, cost, count, rate });
     }
 
-    if (totalStock <= 0 || allPricedOperators.length === 0) continue;
+    if (totalStock <= 0 || operators.length === 0) continue;
 
-    // Grab the lowest real-time amount across the country's operators (matching 5sim's Any operator price)
+    // Grab the lowest real-time IN-STOCK amount across the country's operators
     allPricedOperators.sort((a, b) => a.cost - b.cost || b.count - a.count || b.rate - a.rate);
     operators.sort((a, b) => a.cost - b.cost || b.count - a.count || b.rate - a.rate);
 
-    const lowestAnyOp = allPricedOperators[0];
-    const lowestInStockOp = operators[0] || lowestAnyOp;
+    const lowestInStockOp = operators[0] || allPricedOperators[0];
 
     rawOptions.push({
       slug,
@@ -1310,20 +1314,20 @@ async function getFiveSimCountriesForPlatform(
       countryCode: isoKey ? isoKey.toUpperCase() : '',
       dialCode: prefixKey || '',
       stockCount: totalStock,
-      minPrice: lowestAnyOp.cost,
+      minPrice: lowestInStockOp.cost,
       inStockMinPrice: lowestInStockOp.cost,
-      rawLowestCost: lowestAnyOp.cost,
-      currency: accountCurrency,
-      bestOperator: lowestAnyOp.operator,
+      rawLowestCost: lowestInStockOp.cost,
+      currency: usedAuthFeed ? accountCurrency : 'USD',
+      bestOperator: lowestInStockOp.operator,
       maxRate,
       operators: operators.slice(0, 12),
-      lowestOperators: allPricedOperators.slice(0, 8).map((o) => o.operator),
+      lowestOperators: operators.slice(0, 8).map((o) => o.operator),
     });
   }
 
-  // Accurately detect if authenticated 5sim prices are in RUB (even if profile.currency is missing)
-  let effectiveCurrency = accountCurrency;
-  if (rawOptions.length > 0 && (effectiveCurrency === 'USD' || !effectiveCurrency)) {
+  // Accurately detect if authenticated 5sim prices are in RUB (even if profile.currency is missing or unauth probe matched)
+  let effectiveCurrency = usedAuthFeed ? accountCurrency : 'USD';
+  if (usedAuthFeed && rawOptions.length > 0 && (effectiveCurrency === 'USD' || !effectiveCurrency)) {
     const ratios: number[] = [];
     for (const opt of rawOptions) {
       const pubCost = Number(publicProductMap[opt.slug]?.[opt.bestOperator]?.cost || 0);
@@ -1335,18 +1339,32 @@ async function getFiveSimCountriesForPlatform(
     if (ratios.length > 0) {
       ratios.sort((a, b) => a - b);
       const medianRatio = ratios[Math.floor(ratios.length / 2)];
-      if (medianRatio > 12) {
+      if (medianRatio > 8) {
         effectiveCurrency = 'RUB';
         fiveSimCurrencyCache.currency = 'RUB';
         fiveSimCurrencyCache.expiresAt = Date.now() + 5 * 60 * 1000;
       }
-    } else {
-      const sample = rawOptions.find((o) => o.slug === 'nigeria') || rawOptions[0];
+    }
+
+    if (effectiveCurrency === 'USD') {
+      const sample =
+        rawOptions.find((o) => o.slug === 'indonesia') ||
+        rawOptions.find((o) => o.slug === 'nigeria') ||
+        rawOptions.find((o) => o.slug === 'england') ||
+        rawOptions[0];
       const publicUsd = await getUnauthUsdSamplePrice(sample.slug, sample.bestOperator, product);
-      if (publicUsd > 0 && sample.rawLowestCost / publicUsd > 12) {
+      if (publicUsd > 0 && sample.rawLowestCost / publicUsd > 8) {
         effectiveCurrency = 'RUB';
         fiveSimCurrencyCache.currency = 'RUB';
         fiveSimCurrencyCache.expiresAt = Date.now() + 5 * 60 * 1000;
+      } else {
+        const sortedCosts = rawOptions.map((o) => o.rawLowestCost).sort((a, b) => a - b);
+        const medianRaw = sortedCosts[Math.floor(sortedCosts.length / 2)] || 0;
+        if (medianRaw > 10) {
+          effectiveCurrency = 'RUB';
+          fiveSimCurrencyCache.currency = 'RUB';
+          fiveSimCurrencyCache.expiresAt = Date.now() + 5 * 60 * 1000;
+        }
       }
     }
   }
@@ -1356,7 +1374,7 @@ async function getFiveSimCountriesForPlatform(
     const usdInStockMin = convertCurrencyAmountToUsd(rest.inStockMinPrice, effectiveCurrency, rates);
     return {
       ...rest,
-      minPrice: usdMin,
+      minPrice: usdInStockMin > 0 ? usdInStockMin : usdMin,
       inStockMinPrice: usdInStockMin > 0 ? usdInStockMin : usdMin,
       currency: 'USD',
       operators: rest.operators.map((op) => ({
@@ -1546,14 +1564,30 @@ function toPublicNumberOrder(
   serviceNameHint?: string,
   countryCodeHint?: string,
   currencyHint = 'USD',
-  rates?: ExchangeRates
+  rates?: ExchangeRates,
+  expectedUsdHint?: number
 ) {
   const norm = normalizeFiveSimOrder(raw, countryCodeHint);
   const service = norm.product || 'other';
   const effectiveRates = rates || cachedExchangeRates;
+  let effectiveCurrency = currencyHint;
+  if (effectiveCurrency === 'USD' && fiveSimCurrencyCache.currency === 'RUB') {
+    effectiveCurrency = 'RUB';
+  } else if (
+    effectiveCurrency === 'USD' &&
+    norm.price > 8 &&
+    typeof expectedUsdHint === 'number' &&
+    expectedUsdHint > 0 &&
+    expectedUsdHint < 5 &&
+    norm.price / expectedUsdHint > 8
+  ) {
+    effectiveCurrency = 'RUB';
+    fiveSimCurrencyCache.currency = 'RUB';
+    fiveSimCurrencyCache.expiresAt = Date.now() + 5 * 60 * 1000;
+  }
   const rawUsd =
     norm.price > 0
-      ? convertCurrencyAmountToUsd(norm.price, currencyHint, effectiveRates)
+      ? convertCurrencyAmountToUsd(norm.price, effectiveCurrency, effectiveRates)
       : 0;
   const nairaPrice = rawUsd > 0 ? roundToNaira(rawUsd, effectiveRates.NGN) : 0;
   return {
@@ -2307,6 +2341,20 @@ export function createApiApp() {
     }
   );
 
+  app.get(['/security.txt', '/.well-known/security.txt'], (_req, res) => {
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.send(
+      `Contact: mailto:security@${CUSTOM_EMAIL_DOMAIN}\nExpires: 2028-12-31T23:59:59.000Z\nPreferred-Languages: en\nCanonical: https://${CUSTOM_EMAIL_DOMAIN}/.well-known/security.txt\nPolicy: https://${CUSTOM_EMAIL_DOMAIN}\n`
+    );
+  });
+
+  app.get('/robots.txt', (_req, res) => {
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.send('User-agent: *\nAllow: /\nDisallow: /api/\n');
+  });
+
   app.get('/api/health', (_req, res) => {
     res.json({
       ok: true,
@@ -2616,13 +2664,287 @@ export function createApiApp() {
   });
 
   // ==========================================
-  // Custom Domain Email Engine (veribox.name.ng) & Number Holds
+  // Custom Domain Email Engine, Number Holds, Anti-Duplicate Pool & Strict Ban Engine
   // ==========================================
-  const numberOrderHoldMap = new Map<
-    number,
-    { userId?: string; amountNgn: number; provider: string; refunded?: boolean }
-  >();
+  interface NumberOrderHoldRecord {
+    orderId: number;
+    userId?: string;
+    email?: string | null;
+    amountNgn: number;
+    rawPriceUsd?: number;
+    provider: 'fivesim' | 'grizzly';
+    service: string;
+    serviceName: string;
+    phone: string;
+    digits: string;
+    country?: string;
+    countryCode?: string;
+    charged: boolean;
+    settled: boolean;
+    cancelled: boolean;
+    refunded?: boolean;
+    createdAt: number;
+  }
+
+  const numberOrderHoldMap = new Map<number, NumberOrderHoldRecord>();
   const walletAdjustmentRefs = new Map<string, { balance: number; delta: number }>();
+
+  // Global cross-user issued phone number registry (never issue the same digits twice across users)
+  const issuedPhoneNumbersSet = new Set<string>();
+  const reservingPhoneDigitsSet = new Set<string>();
+  let issuedNumbersHydratedAt = 0;
+
+  function normalizePhoneDigits(raw: unknown): string {
+    return String(raw || '').replace(/\D/g, '');
+  }
+
+  async function hydrateIssuedNumbersFromDb(force = false): Promise<void> {
+    if (!force && Date.now() - issuedNumbersHydratedAt < 60_000) return;
+    issuedNumbersHydratedAt = Date.now();
+    const sb = getSupabaseServerClient();
+    if (!sb) return;
+    try {
+      const [issuedRes, txRes] = await Promise.all([
+        sb
+          .from('issued_phone_numbers')
+          .select('digits')
+          .order('created_at', { ascending: false })
+          .limit(2000),
+        sb
+          .from('wallet_transactions')
+          .select('details')
+          .eq('tx_type', 'debit')
+          .order('created_at', { ascending: false })
+          .limit(500),
+      ]);
+      if (!issuedRes.error && Array.isArray(issuedRes.data)) {
+        for (const r of issuedRes.data) {
+          const d = normalizePhoneDigits((r as { digits?: unknown }).digits);
+          if (d.length >= 7) issuedPhoneNumbersSet.add(d);
+        }
+      }
+      if (!txRes.error && Array.isArray(txRes.data)) {
+        for (const row of txRes.data) {
+          const details = String((row as { details?: unknown }).details || '');
+          const m = details.match(/\+?(\d{7,16})/);
+          if (m?.[1]) issuedPhoneNumbersSet.add(m[1]);
+        }
+      }
+    } catch {
+      // Non-blocking fallback to in-memory set
+    }
+  }
+
+  async function isPhoneNumberAlreadyIssued(rawDigits: string): Promise<boolean> {
+    const digits = normalizePhoneDigits(rawDigits);
+    if (!digits || digits.length < 7) return true;
+    if (reservingPhoneDigitsSet.has(digits) || issuedPhoneNumbersSet.has(digits)) {
+      return true;
+    }
+    await hydrateIssuedNumbersFromDb(false);
+    if (issuedPhoneNumbersSet.has(digits)) return true;
+
+    const sb = getSupabaseServerClient();
+    if (sb) {
+      try {
+        const { data, error } = await sb
+          .from('issued_phone_numbers')
+          .select('digits')
+          .eq('digits', digits)
+          .limit(1)
+          .maybeSingle();
+        if (!error && data && (data as { digits?: unknown }).digits) {
+          issuedPhoneNumbersSet.add(digits);
+          return true;
+        }
+      } catch {
+        // Table may not exist yet; rely on in-memory + hydrated wallet_transactions
+      }
+    }
+    return false;
+  }
+
+  async function markPhoneNumberIssued(params: {
+    digits: string;
+    phone: string;
+    provider: string;
+    service: string;
+    country: string;
+    userId?: string;
+    orderId: number;
+  }): Promise<void> {
+    const digits = normalizePhoneDigits(params.digits);
+    if (!digits) return;
+    issuedPhoneNumbersSet.add(digits);
+    reservingPhoneDigitsSet.delete(digits);
+    const sb = getSupabaseServerClient();
+    if (!sb) return;
+    try {
+      await sb.from('issued_phone_numbers').upsert(
+        {
+          digits,
+          phone: params.phone,
+          provider: params.provider,
+          service: params.service,
+          country: params.country,
+          user_id: params.userId || null,
+          order_id: params.orderId,
+          created_at: new Date().toISOString(),
+        },
+        { onConflict: 'digits' }
+      );
+    } catch {
+      // Non-blocking if issued_phone_numbers table not created yet
+    }
+  }
+
+  function getPendingHoldTotalForUser(userId?: string): number {
+    if (!userId) return 0;
+    const normId = normalizeWalletUserId(userId);
+    const cutoff = Date.now() - 30 * 60 * 1000;
+    let total = 0;
+    for (const hold of numberOrderHoldMap.values()) {
+      if (
+        hold.userId === normId &&
+        !hold.charged &&
+        !hold.settled &&
+        !hold.cancelled &&
+        hold.createdAt >= cutoff &&
+        hold.amountNgn > 0
+      ) {
+        total += hold.amountNgn;
+      }
+    }
+    return Math.round(total);
+  }
+
+  // Strict Moderation & Visitor Ban Registry (supports User ID, Email & IP blocking)
+  type ModerationStatusValue = 'active' | 'verified' | 'restricted' | 'suspended' | 'banned';
+  interface StrictBanEntryRecord {
+    id: string;
+    targetType: 'user' | 'email' | 'ip';
+    targetValue: string;
+    reason: string | null;
+    strict: boolean;
+    bannedBy: string | null;
+    createdAt: string;
+  }
+
+  const strictModerationUserMap = new Map<
+    string,
+    {
+      status: ModerationStatusValue;
+      reason: string | null;
+      strict: boolean;
+      email?: string | null;
+      ip?: string | null;
+      updatedAt: number;
+    }
+  >();
+  const bannedEmailsSet = new Map<string, StrictBanEntryRecord>();
+  const bannedIpsSet = new Map<string, StrictBanEntryRecord>();
+  const lastKnownUserIpMap = new Map<string, string>();
+  let moderationDbHydratedAt = 0;
+
+  function getRequestClientIp(req: express.Request): string {
+    const cfIp = typeof req.headers['cf-connecting-ip'] === 'string' ? req.headers['cf-connecting-ip'].trim() : '';
+    const xff = typeof req.headers['x-forwarded-for'] === 'string' ? req.headers['x-forwarded-for'].split(',')[0].trim() : '';
+    const realIp = typeof req.headers['x-real-ip'] === 'string' ? req.headers['x-real-ip'].trim() : '';
+    const raw = (cfIp || xff || realIp || req.ip || req.socket?.remoteAddress || '').trim();
+    return raw.replace(/^::ffff:/i, '').slice(0, 80);
+  }
+
+  function recordUserVisitIp(userId: string, ip: string): void {
+    if (!userId || !ip || ip === '127.0.0.1' || ip === '::1') return;
+    lastKnownUserIpMap.set(userId, ip);
+  }
+
+  async function hydrateModerationFromDb(force = false): Promise<void> {
+    if (!force && Date.now() - moderationDbHydratedAt < 15_000) return;
+    moderationDbHydratedAt = Date.now();
+    const sb = getSupabaseServerClient();
+    if (!sb) return;
+    try {
+      const { data, error } = await sb
+        .from('user_moderation')
+        .select('user_id, email, status, reason, updated_by, updated_at');
+      if (error || !Array.isArray(data)) return;
+      for (const row of data) {
+        const r = row as {
+          user_id?: string | null;
+          email?: string | null;
+          status?: string | null;
+          reason?: string | null;
+          updated_by?: string | null;
+          updated_at?: string | null;
+        };
+        const uid = String(r.user_id || '').trim();
+        const email = String(r.email || '').trim().toLowerCase();
+        const status = String(r.status || 'active').toLowerCase() as ModerationStatusValue;
+        const reason = r.reason ? String(r.reason) : null;
+        if (email === OWNER_ADMIN_EMAIL) continue;
+
+        if (uid.startsWith('ip:')) {
+          const ipVal = uid.slice(3).trim();
+          if (status === 'banned' && ipVal) {
+            bannedIpsSet.set(ipVal, {
+              id: uid,
+              targetType: 'ip',
+              targetValue: ipVal,
+              reason,
+              strict: true,
+              bannedBy: r.updated_by || null,
+              createdAt: r.updated_at || new Date().toISOString(),
+            });
+          } else if (ipVal) {
+            bannedIpsSet.delete(ipVal);
+          }
+          continue;
+        }
+
+        if (uid.startsWith('email:')) {
+          const emVal = (uid.slice(6) || email).trim().toLowerCase();
+          if (status === 'banned' && emVal) {
+            bannedEmailsSet.set(emVal, {
+              id: uid,
+              targetType: 'email',
+              targetValue: emVal,
+              reason,
+              strict: true,
+              bannedBy: r.updated_by || null,
+              createdAt: r.updated_at || new Date().toISOString(),
+            });
+          } else if (emVal) {
+            bannedEmailsSet.delete(emVal);
+          }
+          continue;
+        }
+
+        if (uid) {
+          strictModerationUserMap.set(uid, {
+            status,
+            reason,
+            strict: status === 'banned',
+            email: email || null,
+            updatedAt: Date.now(),
+          });
+          if (status === 'banned' && email) {
+            bannedEmailsSet.set(email, {
+              id: `email:${email}`,
+              targetType: 'email',
+              targetValue: email,
+              reason,
+              strict: true,
+              bannedBy: r.updated_by || null,
+              createdAt: r.updated_at || new Date().toISOString(),
+            });
+          }
+        }
+      }
+    } catch {
+      // Non-blocking fallback to in-memory map
+    }
+  }
 
   interface CustomMailboxRecord {
     id: string;
@@ -2672,6 +2994,76 @@ export function createApiApp() {
     );
   }
 
+  function createOrderChargeToken(params: {
+    orderId: number;
+    userId: string;
+    amountNgn: number;
+    provider: string;
+    phone: string;
+    serviceName: string;
+  }): string {
+    const payload = Buffer.from(
+      JSON.stringify({
+        orderId: params.orderId,
+        userId: params.userId,
+        amountNgn: Math.round(params.amountNgn),
+        provider: params.provider,
+        phone: params.phone,
+        serviceName: params.serviceName,
+      }),
+      'utf8'
+    ).toString('base64url');
+    const sig = crypto
+      .createHmac('sha256', getMailboxSigningSecret())
+      .update(`ord:${payload}`)
+      .digest('hex')
+      .slice(0, 32);
+    return `${payload}.${sig}`;
+  }
+
+  function verifyOrderChargeToken(
+    rawToken: unknown,
+    expectedOrderId: number
+  ): {
+    orderId: number;
+    userId: string;
+    amountNgn: number;
+    provider: 'fivesim' | 'grizzly';
+    phone: string;
+    serviceName: string;
+  } | null {
+    if (typeof rawToken !== 'string' || !rawToken.includes('.')) return null;
+    const [payload, sig] = rawToken.split('.');
+    if (!payload || !sig) return null;
+    const expectedSig = crypto
+      .createHmac('sha256', getMailboxSigningSecret())
+      .update(`ord:${payload}`)
+      .digest('hex')
+      .slice(0, 32);
+    if (!safeSecretsEqual(sig, expectedSig)) return null;
+    try {
+      const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as {
+        orderId?: number;
+        userId?: string;
+        amountNgn?: number;
+        provider?: string;
+        phone?: string;
+        serviceName?: string;
+      };
+      if (Number(parsed.orderId) !== expectedOrderId || !parsed.userId) return null;
+      return {
+        orderId: expectedOrderId,
+        userId: String(parsed.userId),
+        amountNgn: Math.max(0, Math.round(Number(parsed.amountNgn) || 0)),
+        provider: parsed.provider === 'grizzly' ? 'grizzly' : 'fivesim',
+        phone: String(parsed.phone || ''),
+        serviceName: String(parsed.serviceName || 'Verification'),
+      };
+    } catch {
+      return null;
+    }
+  }
+
   function createSignedMailboxToken(rawAddress: unknown): string {
     const addr = normalizeRecipientString(rawAddress);
     const nonce = crypto.randomBytes(16).toString('hex');
@@ -2717,9 +3109,12 @@ export function createApiApp() {
         typeof (data.user as { banned_until?: string | null }).banned_until === 'string'
           ? (data.user as { banned_until?: string | null }).banned_until || null
           : null;
+      const uid = String(data.user.id);
+      const email = String(data.user.email || '').trim().toLowerCase();
+      recordUserVisitIp(uid, getRequestClientIp(req));
       return {
-        id: String(data.user.id),
-        email: String(data.user.email || '').trim().toLowerCase(),
+        id: uid,
+        email,
         accountStatus: String(appMeta.account_status || 'active').toLowerCase(),
         bannedUntil,
       };
@@ -2733,27 +3128,141 @@ export function createApiApp() {
     return Boolean(user && user.email === OWNER_ADMIN_EMAIL);
   }
 
+  async function evaluateCallerModeration(req: express.Request): Promise<{
+    ownerUnlimited: boolean;
+    blocked: boolean;
+    status: ModerationStatusValue;
+    reason: string | null;
+    strict: boolean;
+    matchType: 'user' | 'email' | 'ip' | null;
+    user: { id: string; email: string; accountStatus: string; bannedUntil: string | null } | null;
+  }> {
+    await hydrateModerationFromDb(false);
+    const user = await getVerifiedSupabaseBearerUser(req);
+    if (user && user.email === OWNER_ADMIN_EMAIL) {
+      return {
+        ownerUnlimited: true,
+        blocked: false,
+        status: 'verified',
+        reason: null,
+        strict: false,
+        matchType: null,
+        user,
+      };
+    }
+
+    const clientIp = getRequestClientIp(req);
+    if (clientIp && bannedIpsSet.has(clientIp)) {
+      const ipBan = bannedIpsSet.get(clientIp)!;
+      return {
+        ownerUnlimited: false,
+        blocked: true,
+        status: 'banned',
+        reason: ipBan.reason || 'Your network / device has been permanently banned by the administrator.',
+        strict: true,
+        matchType: 'ip',
+        user,
+      };
+    }
+
+    const bodyEmail =
+      typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    const checkEmail = user?.email || bodyEmail;
+    if (checkEmail && checkEmail !== OWNER_ADMIN_EMAIL && bannedEmailsSet.has(checkEmail)) {
+      const emBan = bannedEmailsSet.get(checkEmail)!;
+      return {
+        ownerUnlimited: false,
+        blocked: true,
+        status: 'banned',
+        reason: emBan.reason || 'This email address has been banned by the administrator.',
+        strict: true,
+        matchType: 'email',
+        user,
+      };
+    }
+
+    const checkUserId =
+      user?.id ||
+      (typeof req.body?.userId === 'string' && req.body.userId.trim()
+        ? req.body.userId.trim()
+        : typeof req.query?.userId === 'string' && req.query.userId.trim()
+          ? req.query.userId.trim()
+          : '');
+
+    if (checkUserId) {
+      const cachedMod = strictModerationUserMap.get(checkUserId);
+      if (cachedMod && ['banned', 'suspended', 'restricted'].includes(cachedMod.status)) {
+        return {
+          ownerUnlimited: false,
+          blocked: true,
+          status: cachedMod.status,
+          reason:
+            cachedMod.reason ||
+            `Account is ${cachedMod.status}. Access to VeriBox services has been disabled.`,
+          strict: cachedMod.strict,
+          matchType: 'user',
+          user,
+        };
+      }
+    }
+
+    if (user) {
+      const isTimeBanned = user.bannedUntil ? Date.parse(user.bannedUntil) > Date.now() : false;
+      const metaStatus = user.accountStatus as ModerationStatusValue;
+      if (isTimeBanned || ['banned', 'suspended', 'restricted'].includes(metaStatus)) {
+        const effStatus: ModerationStatusValue =
+          metaStatus === 'banned' || metaStatus === 'suspended' || metaStatus === 'restricted'
+            ? metaStatus
+            : 'banned';
+        return {
+          ownerUnlimited: false,
+          blocked: true,
+          status: effStatus,
+          reason: `Account is currently ${effStatus}. Contact the administrator for support.`,
+          strict: effStatus === 'banned',
+          matchType: 'user',
+          user,
+        };
+      }
+    }
+
+    return {
+      ownerUnlimited: false,
+      blocked: false,
+      status: user?.accountStatus === 'verified' ? 'verified' : 'active',
+      reason: null,
+      strict: false,
+      matchType: null,
+      user,
+    };
+  }
+
   async function assertCallerNotModerated(
     req: express.Request,
     res: express.Response
-  ): Promise<{ ownerUnlimited: boolean } | null> {
-    const user = await getVerifiedSupabaseBearerUser(req);
-    if (!user) return { ownerUnlimited: false };
-    if (user.email === OWNER_ADMIN_EMAIL) return { ownerUnlimited: true };
-
-    const isTimeBanned = user.bannedUntil ? Date.parse(user.bannedUntil) > Date.now() : false;
-    if (
-      isTimeBanned ||
-      user.accountStatus === 'banned' ||
-      user.accountStatus === 'suspended' ||
-      user.accountStatus === 'restricted'
-    ) {
+  ): Promise<{ ownerUnlimited: boolean; userId?: string; email?: string } | null> {
+    const evalResult = await evaluateCallerModeration(req);
+    if (evalResult.blocked) {
       res.status(403).json({
-        error: `Account is currently ${user.accountStatus || 'restricted'}. Contact support for access.`,
+        code: 'ACCOUNT_MODERATED',
+        error:
+          evalResult.reason ||
+          `Account is currently ${evalResult.status}. Access blocked.`,
+        moderation: {
+          blocked: true,
+          status: evalResult.status,
+          reason: evalResult.reason,
+          strict: evalResult.strict,
+          matchType: evalResult.matchType,
+        },
       });
       return null;
     }
-    return { ownerUnlimited: false };
+    return {
+      ownerUnlimited: evalResult.ownerUnlimited,
+      userId: evalResult.user?.id,
+      email: evalResult.user?.email,
+    };
   }
 
   function hashEmailPassword(password: string, salt?: string): { salt: string; hash: string } {
@@ -3317,22 +3826,75 @@ export function createApiApp() {
     const first = String(req.query.firstName || '')
       .toLowerCase()
       .replace(/[^a-z0-9]/g, '')
-      .slice(0, 12);
+      .slice(0, 14);
     const second = String(req.query.lastName || '')
       .toLowerCase()
       .replace(/[^a-z0-9]/g, '')
-      .slice(0, 12);
+      .slice(0, 14);
 
-    const firstFinal = first || 'user';
-    const secondFinal = second || 'mail';
+    const realisticFirsts = [
+      'david',
+      'alex',
+      'sarah',
+      'michael',
+      'daniel',
+      'emmanuel',
+      'james',
+      'amara',
+      'grace',
+      'victor',
+      'john',
+      'rachel',
+      'joshua',
+      'chris',
+      'brian',
+      'samuel',
+      'chidi',
+      'jessica',
+      'anthony',
+      'fiona',
+      'kevin',
+    ];
+    const realisticLasts = [
+      'turner',
+      'eze',
+      'martins',
+      'okafor',
+      'clark',
+      'adebayo',
+      'stone',
+      'miller',
+      'johnson',
+      'davis',
+      'brown',
+      'okeke',
+      'adams',
+      'walker',
+      'taylor',
+      'wilson',
+    ];
 
+    let firstFinal = first;
+    let secondFinal = second;
+    if (!firstFinal || firstFinal === 'user' || firstFinal === 'veribox' || firstFinal.length < 2) {
+      firstFinal = realisticFirsts[Math.floor(Math.random() * realisticFirsts.length)];
+      if (!secondFinal || secondFinal === 'mail') {
+        secondFinal = realisticLasts[Math.floor(Math.random() * realisticLasts.length)];
+      }
+    }
+    if (!secondFinal || secondFinal === 'mail') {
+      secondFinal = realisticLasts[Math.floor(Math.random() * realisticLasts.length)];
+    }
+
+    const yr = String(Math.floor(88 + Math.random() * 14));
     const seedCandidates = [
-      `${firstFinal}${secondFinal}`,
       `${firstFinal}.${secondFinal}`,
+      `${firstFinal}${secondFinal}`,
+      `${firstFinal}.${secondFinal}${yr}`,
+      `${firstFinal.slice(0, 1)}.${secondFinal}`,
+      `${firstFinal}${secondFinal}${yr}`,
       `${firstFinal.slice(0, 1)}${secondFinal}${Math.floor(12 + Math.random() * 87)}`,
-      `${firstFinal}${Math.floor(101 + Math.random() * 890)}`,
-      `${firstFinal}.${secondFinal}${Math.floor(14 + Math.random() * 85)}`,
-      `${secondFinal}.${firstFinal}${Math.floor(10 + Math.random() * 89)}`,
+      `${secondFinal}.${firstFinal}`,
     ];
 
     const available: Array<{
@@ -3734,6 +4296,8 @@ export function createApiApp() {
   });
 
   app.get('/api/email/list', async (req, res) => {
+    const modCheck = await assertCallerNotModerated(req, res);
+    if (!modCheck) return;
     const requestedUserId = normalizeWalletUserId(req.query.userId);
     const verifiedUser = await getVerifiedSupabaseBearerUser(req);
     const effectiveUserId = verifiedUser ? verifiedUser.id : requestedUserId;
@@ -4427,6 +4991,9 @@ export function createApiApp() {
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
 
+    const modCheck = await assertCallerNotModerated(req, res);
+    if (!modCheck) return;
+
     const requestedEmail = normalizeRecipientString(
       req.headers['x-email-address'] ?? req.query.address
     );
@@ -4481,6 +5048,202 @@ export function createApiApp() {
         error: error instanceof Error ? error.message : 'Failed to fetch emails',
         messages: [],
       });
+    }
+  });
+
+  // Outbound email rate limiter (protects @veribox.name.ng domain reputation from spam abuse)
+  const outboundRateBuckets = new Map<string, number[]>();
+  function checkOutboundRateLimit(key: string, maxPerHour: number): { allowed: boolean; retryAfterSec: number } {
+    const now = Date.now();
+    const windowMs = 60 * 60 * 1000;
+    const prev = outboundRateBuckets.get(key) || [];
+    const recent = prev.filter((ts) => now - ts < windowMs);
+    if (recent.length >= maxPerHour) {
+      const oldest = recent[0] || now;
+      const retryAfterSec = Math.max(1, Math.ceil((oldest + windowMs - now) / 1000));
+      outboundRateBuckets.set(key, recent);
+      return { allowed: false, retryAfterSec };
+    }
+    recent.push(now);
+    outboundRateBuckets.set(key, recent);
+    return { allowed: true, retryAfterSec: 0 };
+  }
+
+  function formatSenderDisplayName(address: string, explicitName?: string): string {
+    const raw = (explicitName || '').replace(/[\r\n<>"]/g, ' ').replace(/\s+/g, ' ').trim();
+    if (raw.length >= 2) return raw.slice(0, 60);
+    const localPart = address.split('@')[0] || 'VeriBox';
+    const tokens = localPart
+      .replace(/[0-9]+$/g, '')
+      .split(/[._-]+/)
+      .map((part) => part.trim())
+      .filter((part) => part.length >= 2);
+    if (tokens.length === 0) return 'VeriBox Mail';
+    return tokens
+      .slice(0, 3)
+      .map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+      .join(' ')
+      .slice(0, 60);
+  }
+
+  app.post('/api/email/send', async (req, res) => {
+    const callerMod = await assertCallerNotModerated(req, res);
+    if (!callerMod) return;
+
+    const rawFromInput = normalizeRecipientString(
+      req.headers['x-email-address'] ?? req.body?.fromAddress
+    );
+    if (!rawFromInput || !rawFromInput.endsWith(`@${CUSTOM_EMAIL_DOMAIN}`)) {
+      res.status(400).json({
+        error: `Sender address must be a valid @${CUSTOM_EMAIL_DOMAIN} mailbox.`,
+      });
+      return;
+    }
+
+    // Ensure verifyMailboxRequest checks against the resolved fromAddress
+    if (!req.headers['x-email-address']) {
+      req.headers['x-email-address'] = rawFromInput;
+    }
+
+    const verifiedMailbox = await verifyMailboxRequest(req);
+    const verifiedSupabaseUser = await getVerifiedSupabaseBearerUser(req);
+    const isOwner = Boolean(
+      callerMod.ownerUnlimited ||
+        (verifiedSupabaseUser && verifiedSupabaseUser.email === OWNER_ADMIN_EMAIL)
+    );
+
+    if (!verifiedMailbox && !isOwner) {
+      res.status(401).json({
+        error: `Sign in or select an active @${CUSTOM_EMAIL_DOMAIN} mailbox to send emails.`,
+      });
+      return;
+    }
+
+    const fromAddress = verifiedMailbox?.address || rawFromInput;
+    if (!fromAddress.endsWith(`@${CUSTOM_EMAIL_DOMAIN}`)) {
+      res.status(403).json({
+        error: `Outbound sending is restricted to @${CUSTOM_EMAIL_DOMAIN} addresses.`,
+      });
+      return;
+    }
+
+    const toAddress = String(req.body?.toAddress || '')
+      .replace(/[\r\n<>]/g, '')
+      .trim()
+      .toLowerCase();
+    const emailPattern = /^[^\s@<>,"']+@[^\s@<>,"']+\.[^\s@<>,"']{2,}$/;
+    if (!toAddress || toAddress.length > 160 || !emailPattern.test(toAddress)) {
+      res.status(400).json({
+        error: 'Enter a valid recipient email address (e.g. name@gmail.com).',
+      });
+      return;
+    }
+    if (toAddress === INBOUND_AUDIT_ADDRESS) {
+      res.status(400).json({ error: 'Cannot send email to internal system audit address.' });
+      return;
+    }
+
+    const subject = String(req.body?.subject || '')
+      .replace(/[\r\n]+/g, ' ')
+      .trim()
+      .slice(0, 160);
+    if (!subject) {
+      res.status(400).json({ error: 'Email subject is required.' });
+      return;
+    }
+
+    const textBody = String(req.body?.text || '')
+      .replace(/\r\n/g, '\n')
+      .trim()
+      .slice(0, 8000);
+    if (!textBody) {
+      res.status(400).json({ error: 'Email message body cannot be empty.' });
+      return;
+    }
+
+    const forwardedFor =
+      typeof req.headers['x-forwarded-for'] === 'string'
+        ? req.headers['x-forwarded-for'].split(',')[0].trim()
+        : '';
+    const callerIp = forwardedFor || req.ip || req.socket?.remoteAddress || 'unknown';
+    const rateKey = isOwner
+      ? `owner:${fromAddress}`
+      : `user:${verifiedSupabaseUser?.id || callerIp}:${fromAddress}`;
+    const rateResult = checkOutboundRateLimit(rateKey, isOwner ? 30 : 8);
+    if (!rateResult.allowed) {
+      res.status(429).json({
+        error: `Hourly send limit reached to protect @${CUSTOM_EMAIL_DOMAIN} domain reputation. Try again in ${Math.ceil(rateResult.retryAfterSec / 60)} min.`,
+      });
+      return;
+    }
+
+    const resendApiKey = getResendApiKey();
+    if (!resendApiKey) {
+      res.status(503).json({
+        error: 'RESEND_API_KEY is not configured on the backend server.',
+      });
+      return;
+    }
+
+    const mailboxRec = await findMailboxRecord(fromAddress);
+    const senderName = formatSenderDisplayName(
+      fromAddress,
+      typeof req.body?.fromName === 'string'
+        ? req.body.fromName
+        : mailboxRec?.displayName
+    );
+    const formattedFrom = senderName ? `${senderName} <${fromAddress}>` : fromAddress;
+
+    try {
+      const resend = new Resend(resendApiKey);
+      const sendResult = await resend.emails.send({
+        from: formattedFrom,
+        to: [toAddress],
+        replyTo: fromAddress,
+        subject,
+        text: textBody,
+      });
+
+      if (sendResult.error || !sendResult.data?.id) {
+        const errMsg = sendResult.error?.message || 'Resend rejected the outbound email request.';
+        const errCode = sendResult.error?.name || 'RESEND_SEND_ERR';
+        recordAppError({
+          source: 'webhook',
+          severity: 'error',
+          code: errCode,
+          message: `Outbound email failed (${fromAddress} -> ${toAddress}): ${errMsg}`,
+          detail: sendResult.error?.statusCode ? `HTTP ${sendResult.error.statusCode}` : null,
+        });
+        const statusCode =
+          typeof sendResult.error?.statusCode === 'number' && sendResult.error.statusCode >= 400
+            ? sendResult.error.statusCode
+            : 502;
+        res.status(statusCode).json({
+          ok: false,
+          error: errMsg,
+          code: errCode,
+        });
+        return;
+      }
+
+      res.json({
+        ok: true,
+        id: sendResult.data.id,
+        from: fromAddress,
+        fromName: senderName,
+        to: toAddress,
+        subject,
+        sentAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : 'Failed to send email via Resend';
+      recordAppError({
+        source: 'webhook',
+        severity: 'error',
+        code: 'RESEND_SEND_EX',
+        message: `Outbound email exception (${fromAddress} -> ${toAddress}): ${errMsg}`,
+      });
+      res.status(502).json({ ok: false, error: errMsg });
     }
   });
 
@@ -4552,6 +5315,8 @@ export function createApiApp() {
         : [];
     };
 
+    const recommendedSpf = `v=spf1 include:send.${domain} ~all`;
+
     try {
       const nativeResult = await withTimeout(
         Promise.all([
@@ -4563,7 +5328,15 @@ export function createApiApp() {
           ),
           dns.resolveTxt(domain).then((chunks) => chunks.map((c) => c.join(''))),
           dns
+            .resolveTxt(`send.${domain}`)
+            .then((chunks) => chunks.map((c) => c.join('')))
+            .catch(() => [] as string[]),
+          dns
             .resolveTxt(`_dmarc.${domain}`)
+            .then((chunks) => chunks.map((c) => c.join('')))
+            .catch(() => [] as string[]),
+          dns
+            .resolveTxt(`resend._domainkey.${domain}`)
             .then((chunks) => chunks.map((c) => c.join('')))
             .catch(() => [] as string[]),
           dns.resolve4(domain).catch(() => [] as string[]),
@@ -4572,32 +5345,62 @@ export function createApiApp() {
         'Native DNS lookup'
       ).catch(() => null);
 
-      const [mxRecords, txtRecords, dmarcRecords, aRecords] =
+      const [mxRecords, txtRecords, sendTxtRecords, dmarcRecords, dkimRecords, aRecords] =
         nativeResult && (nativeResult[0].length > 0 || nativeResult[1].length > 0)
           ? nativeResult
           : await Promise.all([
               resolveDoh(domain, 'MX'),
               resolveDoh(domain, 'TXT'),
+              resolveDoh(`send.${domain}`, 'TXT').catch(() => [] as string[]),
               resolveDoh(`_dmarc.${domain}`, 'TXT').catch(() => [] as string[]),
+              resolveDoh(`resend._domainkey.${domain}`, 'TXT').catch(() => [] as string[]),
               resolveDoh(domain, 'A').catch(() => [] as string[]),
             ]);
 
       const spfRecord = txtRecords.find((t) => /v=spf1/i.test(t)) || null;
+      const sendSpfRecord = sendTxtRecords.find((t) => /v=spf1/i.test(t)) || null;
       const dmarcRecord = dmarcRecords.find((t) => /v=DMARC1/i.test(t)) || null;
+      const dkimRecord =
+        dkimRecords.find((t) => /p=[a-zA-Z0-9+/=]+/i.test(t) || /v=DKIM1/i.test(t)) ||
+        dkimRecords[0] ||
+        null;
       const mxOk =
-        mxRecords.some((m) => /inbound-smtp|amazonaws\.com|resend/i.test(m)) ||
+        mxRecords.some((m) => /inbound-smtp|amazonaws\.com|resend|rmta\.net|forge/i.test(m)) ||
         mxRecords.length > 0;
+      const spfOk = Boolean(spfRecord);
+      const sendSpfOk = Boolean(sendSpfRecord);
+      const dkimOk = Boolean(dkimRecord);
+      const dmarcOk = Boolean(dmarcRecord);
+
+      let trustScore = 0;
+      if (mxOk) trustScore += 30;
+      if (spfOk) trustScore += 35;
+      else if (sendSpfOk) trustScore += 10;
+      if (dkimOk) trustScore += 20;
+      if (dmarcOk) trustScore += 15;
+
+      const antiBanNotice = !spfOk
+        ? `CRITICAL FOR FACEBOOK, INSTAGRAM & GMAIL: Root SPF TXT is missing on ${domain} (@). In Cloudflare Dashboard, do NOT open Email -> Email Routing (that requires Cloudflare MX and conflicts with Resend MX). Instead go to Cloudflare -> DNS -> Records -> Add record -> Type: TXT, Name: @, Content: "${recommendedSpf}".`
+        : 'Domain DNS authentication is configured (MX, Root SPF, DKIM, DMARC). For best trust with Facebook & Gmail, ensure DMARC uses p=quarantine and maintain steady two-way email activity.';
+
       return {
         checkedAt,
         domain,
         mxOk,
         mxRecords,
-        spfOk: Boolean(spfRecord),
+        spfOk,
         spfRecord,
-        dmarcOk: Boolean(dmarcRecord),
+        sendSpfOk,
+        sendSpfRecord,
+        dmarcOk,
         dmarcRecord,
+        dkimOk,
+        dkimRecord,
         aRecords,
         error: null,
+        recommendedSpfRecord: recommendedSpf,
+        trustScore,
+        antiBanNotice,
       };
     } catch (err) {
       return {
@@ -4607,10 +5410,17 @@ export function createApiApp() {
         mxRecords: [],
         spfOk: false,
         spfRecord: null,
+        sendSpfOk: false,
+        sendSpfRecord: null,
         dmarcOk: false,
         dmarcRecord: null,
+        dkimOk: false,
+        dkimRecord: null,
         aRecords: [],
         error: err instanceof Error ? err.message : 'DNS resolution check failed',
+        recommendedSpfRecord: recommendedSpf,
+        trustScore: 30,
+        antiBanNotice: `Could not complete DNS check. Add TXT @ "${recommendedSpf}" inside Cloudflare -> DNS -> Records (not Email Routing).`,
       };
     }
   }
@@ -4996,9 +5806,16 @@ export function createApiApp() {
         pushLiveError({ source: 'routing', severity: 'warning', code: 'MX_MISSING', message: msg, detail: null });
       }
       if (!dnsCheck.spfOk) {
-        const msg = `Missing SPF TXT record on ${CUSTOM_EMAIL_DOMAIN}`;
+        const spfValue = `v=spf1 include:send.${CUSTOM_EMAIL_DOMAIN} ~all`;
+        const msg = `Missing root SPF TXT record on ${CUSTOM_EMAIL_DOMAIN} (@). Meta & Gmail check root SPF. Do NOT enable Cloudflare Email Routing; go to Cloudflare -> DNS -> Records and add TXT @ "${spfValue}".`;
         connectionErrors.push(msg);
-        pushLiveError({ source: 'routing', severity: 'warning', code: 'SPF_MISSING', message: msg, detail: null });
+        pushLiveError({
+          source: 'routing',
+          severity: 'warning',
+          code: 'SPF_MISSING',
+          message: msg,
+          detail: `Cloudflare -> DNS -> Records -> Add TXT record with Name: @, Content: "${spfValue}" (keep Resend MX active)`,
+        });
       }
     }
     if (!resendApiKeyConfigured) {
@@ -5280,6 +6097,19 @@ export function createApiApp() {
     res.json({ cleared: true });
   });
 
+  app.get('/api/auth/moderation-status', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    const evalResult = await evaluateCallerModeration(req);
+    res.json({
+      blocked: evalResult.blocked,
+      status: evalResult.status,
+      reason: evalResult.reason,
+      strict: evalResult.strict,
+      matchType: evalResult.matchType,
+      ownerUnlimited: evalResult.ownerUnlimited,
+    });
+  });
+
   app.get('/api/admin/users', async (req, res) => {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     const verified = await verifyOwnerAdminRequest(req, res);
@@ -5287,17 +6117,19 @@ export function createApiApp() {
     const sb = verified.supabase;
 
     try {
+      await hydrateModerationFromDb(true);
       const [usersResult, walletsResult, mailboxesResult, moderationResult] = await Promise.all([
         sb.auth.admin.listUsers({ page: 1, perPage: 200 }),
         sb.from('wallets').select('user_id, balance'),
         sb.from('mailboxes').select('owner_user_id, is_deleted'),
-        sb.from('user_moderation').select('user_id, status, reason'),
+        sb.from('user_moderation').select('user_id, email, status, reason, updated_by, updated_at'),
       ]);
 
       if (usersResult.error) {
         res.status(usersResult.error.status || 500).json({
           error: `Supabase auth.admin.listUsers failed: ${usersResult.error.message}`,
           users: [],
+          strictBans: [],
         });
         return;
       }
@@ -5336,16 +6168,35 @@ export function createApiApp() {
           typeof (u as { banned_until?: string | null }).banned_until === 'string'
             ? (u as { banned_until?: string | null }).banned_until || null
             : null;
+        const emailLower = (u.email || '').trim().toLowerCase();
         const modRow = modMap.get(u.id);
+        const memMod = strictModerationUserMap.get(u.id);
         let status: 'active' | 'verified' | 'restricted' | 'suspended' | 'banned' = 'active';
-        const rawStatus = String(modRow?.status || appMeta.account_status || '').toLowerCase();
-        if (rawStatus === 'banned' || rawStatus === 'suspended' || rawStatus === 'restricted' || rawStatus === 'verified') {
+        const rawStatus = String(
+          modRow?.status || memMod?.status || appMeta.account_status || ''
+        ).toLowerCase();
+        if (
+          rawStatus === 'banned' ||
+          rawStatus === 'suspended' ||
+          rawStatus === 'restricted' ||
+          rawStatus === 'verified'
+        ) {
           status = rawStatus;
+        } else if (bannedEmailsSet.has(emailLower)) {
+          status = 'banned';
         } else if (bannedUntil && Date.parse(bannedUntil) > Date.now()) {
           status = 'suspended';
         } else if (u.email_confirmed_at) {
           status = 'verified';
         }
+
+        const lastIp = lastKnownUserIpMap.get(u.id) || memMod?.ip || null;
+        const strictBanned = Boolean(
+          status === 'banned' &&
+            (memMod?.strict ||
+              bannedEmailsSet.has(emailLower) ||
+              (lastIp && bannedIpsSet.has(lastIp)))
+        );
 
         return {
           id: u.id,
@@ -5364,15 +6215,27 @@ export function createApiApp() {
           bannedUntil,
           walletBalance: walletMap.get(u.id) || 0,
           mailboxCount: mailboxCounts.get(u.id) || 0,
-          moderationReason: modRow?.reason || null,
+          moderationReason:
+            modRow?.reason ||
+            memMod?.reason ||
+            bannedEmailsSet.get(emailLower)?.reason ||
+            null,
+          strictBanned,
+          lastIp,
         };
       });
 
-      res.json({ users });
+      const strictBans = [
+        ...Array.from(bannedEmailsSet.values()),
+        ...Array.from(bannedIpsSet.values()),
+      ].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+
+      res.json({ users, strictBans });
     } catch (err) {
       res.status(500).json({
         error: err instanceof Error ? err.message : 'Failed to list users',
         users: [],
+        strictBans: [],
       });
     }
   });
@@ -5384,7 +6247,11 @@ export function createApiApp() {
 
     const userId = String(req.params.userId || '').trim();
     const action = String(req.body?.action || '').trim().toLowerCase();
-    const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim().slice(0, 240) : null;
+    const reason =
+      typeof req.body?.reason === 'string' && req.body.reason.trim()
+        ? req.body.reason.trim().slice(0, 240)
+        : null;
+    const strict = req.body?.strict !== false;
 
     if (!userId || !['verify', 'restrict', 'suspend', 'ban', 'restore'].includes(action)) {
       res.status(400).json({ error: 'Invalid userId or moderation action' });
@@ -5403,7 +6270,7 @@ export function createApiApp() {
         return;
       }
 
-      const nextStatus =
+      const nextStatus: ModerationStatusValue =
         action === 'verify'
           ? 'verified'
           : action === 'restrict'
@@ -5449,6 +6316,55 @@ export function createApiApp() {
         return;
       }
 
+      // Immediately revoke active JWT sessions so banned/suspended users are kicked out in real time
+      if (['ban', 'suspend'].includes(action)) {
+        await sb.auth.admin.signOut(userId, 'global').catch(() => undefined);
+      }
+
+      const knownIp =
+        lastKnownUserIpMap.get(userId) || strictModerationUserMap.get(userId)?.ip || null;
+      const nowIso = new Date().toISOString();
+
+      if (['ban', 'suspend', 'restrict'].includes(action)) {
+        strictModerationUserMap.set(userId, {
+          status: nextStatus,
+          reason,
+          strict: action === 'ban' && strict,
+          email: targetEmail || null,
+          ip: knownIp,
+          updatedAt: Date.now(),
+        });
+
+        if (action === 'ban' && strict) {
+          if (targetEmail) {
+            bannedEmailsSet.set(targetEmail, {
+              id: `email:${targetEmail}`,
+              targetType: 'email',
+              targetValue: targetEmail,
+              reason: reason || 'Strict ban by administrator',
+              strict: true,
+              bannedBy: verified.email,
+              createdAt: nowIso,
+            });
+          }
+          if (knownIp) {
+            bannedIpsSet.set(knownIp, {
+              id: `ip:${knownIp}`,
+              targetType: 'ip',
+              targetValue: knownIp,
+              reason: reason || `Associated with banned user ${targetEmail || userId}`,
+              strict: true,
+              bannedBy: verified.email,
+              createdAt: nowIso,
+            });
+          }
+        }
+      } else {
+        strictModerationUserMap.delete(userId);
+        if (targetEmail) bannedEmailsSet.delete(targetEmail);
+        if (knownIp) bannedIpsSet.delete(knownIp);
+      }
+
       try {
         await sb.from('user_moderation').upsert(
           {
@@ -5457,10 +6373,45 @@ export function createApiApp() {
             status: nextStatus,
             reason,
             updated_by: verified.email,
-            updated_at: new Date().toISOString(),
+            updated_at: nowIso,
           },
           { onConflict: 'user_id' }
         );
+        if (action === 'ban' && strict) {
+          if (targetEmail) {
+            await sb.from('user_moderation').upsert(
+              {
+                user_id: `email:${targetEmail}`,
+                email: targetEmail,
+                status: 'banned',
+                reason: reason || 'Strict ban by administrator',
+                updated_by: verified.email,
+                updated_at: nowIso,
+              },
+              { onConflict: 'user_id' }
+            );
+          }
+          if (knownIp) {
+            await sb.from('user_moderation').upsert(
+              {
+                user_id: `ip:${knownIp}`,
+                email: targetEmail || null,
+                status: 'banned',
+                reason: reason || `Strict IP ban (${targetEmail || userId})`,
+                updated_by: verified.email,
+                updated_at: nowIso,
+              },
+              { onConflict: 'user_id' }
+            );
+          }
+        } else if (action === 'restore' || action === 'verify') {
+          if (targetEmail) {
+            await sb.from('user_moderation').delete().eq('user_id', `email:${targetEmail}`);
+          }
+          if (knownIp) {
+            await sb.from('user_moderation').delete().eq('user_id', `ip:${knownIp}`);
+          }
+        }
       } catch {
         // Non-blocking if user_moderation table hasn't been created yet
       }
@@ -5469,6 +6420,8 @@ export function createApiApp() {
         ok: true,
         userId,
         status: nextStatus,
+        strictBanned: action === 'ban' && strict,
+        reason,
         emailConfirmed: Boolean(updated?.user?.email_confirmed_at),
       });
     } catch (err) {
@@ -5476,6 +6429,189 @@ export function createApiApp() {
         error: err instanceof Error ? err.message : 'Failed to update user status',
       });
     }
+  });
+
+  app.get('/api/admin/bans', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    const verified = await verifyOwnerAdminRequest(req, res);
+    if (!verified) return;
+    await hydrateModerationFromDb(true);
+    const bans = [
+      ...Array.from(bannedEmailsSet.values()),
+      ...Array.from(bannedIpsSet.values()),
+    ].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+    res.json({ bans });
+  });
+
+  app.post('/api/admin/bans', async (req, res) => {
+    const verified = await verifyOwnerAdminRequest(req, res);
+    if (!verified) return;
+    const sb = verified.supabase;
+
+    const targetType = String(req.body?.targetType || 'email').trim().toLowerCase();
+    const rawValue = String(req.body?.targetValue || '').trim();
+    const reason =
+      typeof req.body?.reason === 'string' && req.body.reason.trim()
+        ? req.body.reason.trim().slice(0, 240)
+        : 'Banned by administrator';
+
+    if (!['email', 'ip'].includes(targetType) || !rawValue) {
+      res.status(400).json({ error: 'Provide a valid visitor email or IP address to ban.' });
+      return;
+    }
+
+    const targetValue = targetType === 'email' ? rawValue.toLowerCase() : rawValue.replace(/^::ffff:/i, '');
+    if (targetType === 'email') {
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(targetValue)) {
+        res.status(400).json({ error: 'Enter a valid email address.' });
+        return;
+      }
+      if (targetValue === OWNER_ADMIN_EMAIL) {
+        res.status(400).json({ error: 'Cannot ban the owner account.' });
+        return;
+      }
+    } else if (!/^[a-fA-F0-9:.]{3,64}$/.test(targetValue)) {
+      res.status(400).json({ error: 'Enter a valid IPv4 or IPv6 address.' });
+      return;
+    }
+
+    const nowIso = new Date().toISOString();
+    const banId = `${targetType}:${targetValue}`;
+    const entry: StrictBanEntryRecord = {
+      id: banId,
+      targetType: targetType as 'email' | 'ip',
+      targetValue,
+      reason,
+      strict: true,
+      bannedBy: verified.email,
+      createdAt: nowIso,
+    };
+
+    if (targetType === 'email') {
+      bannedEmailsSet.set(targetValue, entry);
+      try {
+        const { data: usersRes } = await sb.auth.admin.listUsers({ page: 1, perPage: 300 });
+        const matched = (usersRes?.users || []).find(
+          (u) => (u.email || '').trim().toLowerCase() === targetValue
+        );
+        if (matched) {
+          await sb.auth.admin.updateUserById(matched.id, {
+            ban_duration: '876000h',
+            app_metadata: { ...(matched.app_metadata || {}), account_status: 'banned' },
+          });
+          await sb.auth.admin.signOut(matched.id, 'global').catch(() => undefined);
+          strictModerationUserMap.set(matched.id, {
+            status: 'banned',
+            reason,
+            strict: true,
+            email: targetValue,
+            updatedAt: Date.now(),
+          });
+          await sb
+            .from('user_moderation')
+            .upsert(
+              {
+                user_id: matched.id,
+                email: targetValue,
+                status: 'banned',
+                reason,
+                updated_by: verified.email,
+                updated_at: nowIso,
+              },
+              { onConflict: 'user_id' }
+            );
+        }
+      } catch {
+        // Non-blocking auth sync
+      }
+    } else {
+      bannedIpsSet.set(targetValue, entry);
+    }
+
+    try {
+      await sb.from('user_moderation').upsert(
+        {
+          user_id: banId,
+          email: targetType === 'email' ? targetValue : null,
+          status: 'banned',
+          reason,
+          updated_by: verified.email,
+          updated_at: nowIso,
+        },
+        { onConflict: 'user_id' }
+      );
+    } catch {
+      // Non-blocking if user_moderation table is absent
+    }
+
+    res.json({ ok: true, entry });
+  });
+
+  app.post('/api/admin/bans/remove', async (req, res) => {
+    const verified = await verifyOwnerAdminRequest(req, res);
+    if (!verified) return;
+    const sb = verified.supabase;
+
+    const rawId = String(req.body?.id || '').trim();
+    const targetType = String(
+      req.body?.targetType || (rawId.startsWith('ip:') ? 'ip' : 'email')
+    )
+      .trim()
+      .toLowerCase();
+    const rawVal = String(
+      req.body?.targetValue ||
+        (rawId.includes(':') ? rawId.slice(rawId.indexOf(':') + 1) : '')
+    ).trim();
+
+    if (!rawVal || !['email', 'ip'].includes(targetType)) {
+      res.status(400).json({ error: 'Invalid ban identifier' });
+      return;
+    }
+
+    const val = targetType === 'email' ? rawVal.toLowerCase() : rawVal;
+    const banKey = `${targetType}:${val}`;
+
+    if (targetType === 'email') {
+      bannedEmailsSet.delete(val);
+      try {
+        const { data: usersRes } = await sb.auth.admin.listUsers({ page: 1, perPage: 300 });
+        const matched = (usersRes?.users || []).find(
+          (u) => (u.email || '').trim().toLowerCase() === val
+        );
+        if (matched) {
+          strictModerationUserMap.delete(matched.id);
+          await sb.auth.admin.updateUserById(matched.id, {
+            ban_duration: 'none',
+            app_metadata: { ...(matched.app_metadata || {}), account_status: 'active' },
+          });
+          await sb
+            .from('user_moderation')
+            .upsert(
+              {
+                user_id: matched.id,
+                email: val,
+                status: 'active',
+                reason: null,
+                updated_by: verified.email,
+                updated_at: new Date().toISOString(),
+              },
+              { onConflict: 'user_id' }
+            );
+        }
+      } catch {
+        // Non-blocking
+      }
+    } else {
+      bannedIpsSet.delete(val);
+    }
+
+    try {
+      await sb.from('user_moderation').delete().eq('user_id', banKey);
+    } catch {
+      // Non-blocking
+    }
+
+    res.json({ ok: true, removed: banKey });
   });
 
   app.post('/api/admin/test-inbound', async (req, res) => {
@@ -6099,7 +7235,136 @@ export function createApiApp() {
     }
   });
 
+  async function settleNumberOrderChargeIfSmsArrived(params: {
+    orderId: number;
+    smsCount: number;
+    chargeToken?: unknown;
+    fallbackUserId?: unknown;
+    fallbackEmail?: string | null;
+    provider?: 'fivesim' | 'grizzly';
+    phone?: string;
+    serviceName?: string;
+    priceNgn?: number;
+  }): Promise<{
+    charged: boolean;
+    chargedNow: boolean;
+    chargedAmount: number;
+    walletBalance: number | null;
+    reservedBalance: number;
+    availableBalance: number | null;
+  }> {
+    const heldRecord = numberOrderHoldMap.get(params.orderId);
+    const verifiedToken = verifyOrderChargeToken(params.chargeToken, params.orderId);
+    const targetUserId =
+      heldRecord?.userId ||
+      verifiedToken?.userId ||
+      (params.fallbackUserId ? normalizeWalletUserId(params.fallbackUserId) : undefined);
+
+    const amountNgn = Math.max(
+      0,
+      Math.round(
+        heldRecord?.amountNgn || verifiedToken?.amountNgn || params.priceNgn || 0
+      )
+    );
+
+    if (params.smsCount <= 0) {
+      const reserved = targetUserId ? getPendingHoldTotalForUser(targetUserId) : 0;
+      const bal = targetUserId ? (await getUserWalletBalance(targetUserId)).balance : null;
+      return {
+        charged: Boolean(heldRecord?.charged),
+        chargedNow: false,
+        chargedAmount: 0,
+        walletBalance: bal,
+        reservedBalance: reserved,
+        availableBalance: bal !== null ? Math.max(0, bal - reserved) : null,
+      };
+    }
+
+    if (!targetUserId || amountNgn <= 0) {
+      return {
+        charged: Boolean(heldRecord?.charged),
+        chargedNow: false,
+        chargedAmount: 0,
+        walletBalance: null,
+        reservedBalance: 0,
+        availableBalance: null,
+      };
+    }
+
+    if (heldRecord?.charged) {
+      const reserved = getPendingHoldTotalForUser(targetUserId);
+      const bal = (await getUserWalletBalance(targetUserId)).balance;
+      return {
+        charged: true,
+        chargedNow: false,
+        chargedAmount: 0,
+        walletBalance: bal,
+        reservedBalance: reserved,
+        availableBalance: bal !== null ? Math.max(0, bal - reserved) : null,
+      };
+    }
+
+    const phoneLabel = heldRecord?.phone || verifiedToken?.phone || params.phone || String(params.orderId);
+    const svcLabel = heldRecord?.serviceName || verifiedToken?.serviceName || params.serviceName || 'Verification';
+    const adj = await adjustUserWalletBalance({
+      userId: targetUserId,
+      email: heldRecord?.email || params.fallbackEmail || null,
+      deltaNgn: -amountNgn,
+      reference: `order-${params.orderId}`,
+      details: `${svcLabel} private number (${phoneLabel}) — SMS arrived`,
+    });
+
+    if (heldRecord) {
+      heldRecord.charged = true;
+      heldRecord.settled = true;
+    }
+
+    const reserved = getPendingHoldTotalForUser(targetUserId);
+    const bal = adj.balance ?? (await getUserWalletBalance(targetUserId)).balance;
+    return {
+      charged: true,
+      chargedNow: !adj.alreadyProcessed && !adj.insufficient,
+      chargedAmount: !adj.alreadyProcessed && !adj.insufficient ? amountNgn : 0,
+      walletBalance: bal,
+      reservedBalance: reserved,
+      availableBalance: bal !== null ? Math.max(0, bal - reserved) : null,
+    };
+  }
+
+  async function releaseNumberOrderHold(
+    orderId: number,
+    chargeToken?: unknown,
+    fallbackUserId?: unknown
+  ): Promise<{
+    walletBalance: number | null;
+    reservedBalance: number;
+    availableBalance: number | null;
+  }> {
+    const heldRecord = numberOrderHoldMap.get(orderId);
+    const verifiedToken = verifyOrderChargeToken(chargeToken, orderId);
+    const targetUserId =
+      heldRecord?.userId ||
+      verifiedToken?.userId ||
+      (fallbackUserId ? normalizeWalletUserId(fallbackUserId) : undefined);
+
+    if (heldRecord && !heldRecord.charged) {
+      heldRecord.cancelled = true;
+      heldRecord.settled = true;
+    }
+
+    const reserved = targetUserId ? getPendingHoldTotalForUser(targetUserId) : 0;
+    const bal = targetUserId ? (await getUserWalletBalance(targetUserId)).balance : null;
+    return {
+      walletBalance: bal,
+      reservedBalance: reserved,
+      availableBalance: bal !== null ? Math.max(0, bal - reserved) : null,
+    };
+  }
+
   app.post('/api/numbers/acquire', async (req, res) => {
+    const caller = await assertCallerNotModerated(req, res);
+    if (!caller) return;
+
     const requestedProvider = String(req.body?.provider || 'fivesim').toLowerCase();
     const provider: 'fivesim' | 'grizzly' =
       requestedProvider === 'grizzly' ? 'grizzly' : 'fivesim';
@@ -6114,7 +7379,8 @@ export function createApiApp() {
     const countryCodeHint =
       typeof req.body?.countryCode === 'string' ? req.body.countryCode.toUpperCase() : undefined;
     const quantity = Math.min(10, Math.max(1, Number(req.body?.quantity || 1) || 1));
-    const userId = req.body?.userId ? normalizeWalletUserId(req.body.userId) : undefined;
+    const rawBodyUserId = req.body?.userId ? normalizeWalletUserId(req.body.userId) : undefined;
+    const userId = caller.userId ? normalizeWalletUserId(caller.userId) : rawBodyUserId;
     const rawClientBalance = Number(req.body?.walletBalance);
     let clientWalletBalance = rawClientBalance;
     if (userId) {
@@ -6123,6 +7389,13 @@ export function createApiApp() {
         clientWalletBalance = serverBal.balance;
       }
     }
+
+    const pendingHoldNgn = userId ? getPendingHoldTotalForUser(userId) : 0;
+    const availableBeforeBuy = Number.isFinite(clientWalletBalance)
+      ? Math.max(0, clientWalletBalance - pendingHoldNgn)
+      : Number.POSITIVE_INFINITY;
+
+    await hydrateIssuedNumbersFromDb(false);
 
     // STRICTLY ISOLATED GRIZZLY SMS FLOW
     if (provider === 'grizzly') {
@@ -6161,136 +7434,143 @@ export function createApiApp() {
         const liveUnitNgn = liveUnitUsd > 0 ? roundToNaira(liveUnitUsd, rates.NGN) : 0;
 
         if (
-          Number.isFinite(clientWalletBalance) &&
+          Number.isFinite(availableBeforeBuy) &&
           liveUnitNgn > 0 &&
-          clientWalletBalance < liveUnitNgn * quantity
+          availableBeforeBuy < liveUnitNgn * quantity
         ) {
           res.status(402).json({
-            error: `Insufficient wallet balance for the current live Grizzly SMS price (₦${(liveUnitNgn * quantity).toLocaleString()} required, wallet has ₦${clientWalletBalance.toLocaleString()}). Please top up first.`,
+            error: `Insufficient available wallet balance (₦${(liveUnitNgn * quantity).toLocaleString()} needed, available ₦${availableBeforeBuy.toLocaleString()}${pendingHoldNgn > 0 ? `, ₦${pendingHoldNgn.toLocaleString()} held on waiting numbers` : ''}). Top up first — funds are only deducted once an SMS arrives.`,
           });
           return;
         }
 
         const orders = [];
+        let reservedThisBatch = 0;
         let lastError = 'No numbers available on Grizzly SMS for this selection right now.';
 
         for (let i = 0; i < quantity; i++) {
           let acquiredOrder = null;
-          try {
-            const grizzlyReqParams: Record<string, string> = {
-              action: 'getNumberV2',
-              service: grizzlyService,
-              country: grizzlyCountryId,
-            };
-            if (liveUnitUsd > 0) {
-              grizzlyReqParams.maxPrice = String(liveUnitUsd);
-            }
-            const v2Raw = await callGrizzlyApi(grizzlyReqParams, grizzlyKey);
-
-            if (v2Raw.startsWith('{')) {
-              const parsed = JSON.parse(v2Raw) as {
-                activationId?: number | string;
-                phoneNumber?: string;
-                activationCost?: number | string;
-                activationTime?: string;
-                activationEndTime?: string;
-              };
-              const actId = Number(parsed.activationId || 0);
-              const phoneRaw = String(parsed.phoneNumber || '');
-              const digits = phoneRaw.replace(/\D/g, '');
-              const phone = phoneRaw.startsWith('+') ? phoneRaw : digits ? `+${digits}` : phoneRaw;
-              const costUsd = Number(parsed.activationCost || liveUnitUsd || 0);
-              const costNgn = costUsd > 0 ? roundToNaira(costUsd, rates.NGN) : liveUnitNgn;
-
-              if (actId > 0 && digits) {
-                acquiredOrder = {
-                  id: actId,
-                  provider: 'grizzly' as const,
-                  phone,
-                  digits,
-                  country: countryMeta?.country || countryNameHint || 'Country',
-                  countryCode: countryCodeHint || countryMeta?.countryCode,
-                  service,
-                  serviceName,
-                  price: costNgn > 0 ? costNgn : undefined,
-                  rawPriceUsd: costUsd > 0 ? roundUnitPrice(costUsd) : undefined,
-                  currency: 'NGN',
-                  status: 'PENDING',
-                  expires: String(parsed.activationEndTime || ''),
-                  createdAt: new Date().toISOString(),
-                  sms: [],
-                };
-              }
-            } else if (v2Raw.startsWith('ACCESS_NUMBER:')) {
-              const parts = v2Raw.split(':');
-              const actId = Number(parts[1] || 0);
-              const phoneRaw = String(parts[2] || '');
-              const digits = phoneRaw.replace(/\D/g, '');
-              const phone = phoneRaw.startsWith('+') ? phoneRaw : digits ? `+${digits}` : phoneRaw;
-              if (actId > 0 && digits) {
-                acquiredOrder = {
-                  id: actId,
-                  provider: 'grizzly' as const,
-                  phone,
-                  digits,
-                  country: countryMeta?.country || countryNameHint || 'Country',
-                  countryCode: countryCodeHint || countryMeta?.countryCode,
-                  service,
-                  serviceName,
-                  price: liveUnitNgn > 0 ? liveUnitNgn : undefined,
-                  rawPriceUsd: liveUnitUsd > 0 ? roundUnitPrice(liveUnitUsd) : undefined,
-                  currency: 'NGN',
-                  status: 'PENDING',
-                  expires: '',
-                  createdAt: new Date().toISOString(),
-                  sms: [],
-                };
-              }
-            } else if (v2Raw === 'BAD_ACTION') {
-              const v1Params: Record<string, string> = {
-                action: 'getNumber',
+          for (let attempt = 0; attempt < 4; attempt++) {
+            try {
+              const grizzlyReqParams: Record<string, string> = {
+                action: 'getNumberV2',
                 service: grizzlyService,
                 country: grizzlyCountryId,
               };
               if (liveUnitUsd > 0) {
-                v1Params.maxPrice = String(liveUnitUsd);
+                grizzlyReqParams.maxPrice = String(liveUnitUsd);
               }
-              const v1Raw = await callGrizzlyApi(v1Params, grizzlyKey);
-              if (v1Raw.startsWith('ACCESS_NUMBER:')) {
-                const parts = v1Raw.split(':');
-                const actId = Number(parts[1] || 0);
-                const phoneRaw = String(parts[2] || '');
-                const digits = phoneRaw.replace(/\D/g, '');
-                const phone = phoneRaw.startsWith('+') ? phoneRaw : digits ? `+${digits}` : phoneRaw;
-                if (actId > 0 && digits) {
-                  acquiredOrder = {
-                    id: actId,
-                    provider: 'grizzly' as const,
-                    phone,
-                    digits,
-                    country: countryMeta?.country || countryNameHint || 'Country',
-                    countryCode: countryCodeHint || countryMeta?.countryCode,
-                    service,
-                    serviceName,
-                    price: liveUnitNgn > 0 ? liveUnitNgn : undefined,
-                    rawPriceUsd: liveUnitUsd > 0 ? roundUnitPrice(liveUnitUsd) : undefined,
-                    currency: 'NGN',
-                    status: 'PENDING',
-                    expires: '',
-                    createdAt: new Date().toISOString(),
-                    sms: [],
-                  };
+              const v2Raw = await callGrizzlyApi(grizzlyReqParams, grizzlyKey);
+
+              let candidateActId = 0;
+              let candidatePhoneRaw = '';
+              let candidateCostUsd = liveUnitUsd;
+              let candidateExpires = '';
+
+              if (v2Raw.startsWith('{')) {
+                const parsed = JSON.parse(v2Raw) as {
+                  activationId?: number | string;
+                  phoneNumber?: string;
+                  activationCost?: number | string;
+                  activationEndTime?: string;
+                };
+                candidateActId = Number(parsed.activationId || 0);
+                candidatePhoneRaw = String(parsed.phoneNumber || '');
+                candidateCostUsd = Number(parsed.activationCost || liveUnitUsd || 0);
+                candidateExpires = String(parsed.activationEndTime || '');
+              } else if (v2Raw.startsWith('ACCESS_NUMBER:')) {
+                const parts = v2Raw.split(':');
+                candidateActId = Number(parts[1] || 0);
+                candidatePhoneRaw = String(parts[2] || '');
+              } else if (v2Raw === 'BAD_ACTION') {
+                const v1Params: Record<string, string> = {
+                  action: 'getNumber',
+                  service: grizzlyService,
+                  country: grizzlyCountryId,
+                };
+                if (liveUnitUsd > 0) {
+                  v1Params.maxPrice = String(liveUnitUsd);
+                }
+                const v1Raw = await callGrizzlyApi(v1Params, grizzlyKey);
+                if (v1Raw.startsWith('ACCESS_NUMBER:')) {
+                  const parts = v1Raw.split(':');
+                  candidateActId = Number(parts[1] || 0);
+                  candidatePhoneRaw = String(parts[2] || '');
+                } else {
+                  lastError = sanitizeNumberApiError(v1Raw);
                 }
               } else {
-                lastError = sanitizeNumberApiError(v1Raw);
+                lastError = sanitizeNumberApiError(v2Raw);
               }
-            } else {
-              lastError = sanitizeNumberApiError(v2Raw);
+
+              const digits = normalizePhoneDigits(candidatePhoneRaw);
+              if (candidateActId > 0 && digits) {
+                const phone = candidatePhoneRaw.startsWith('+') ? candidatePhoneRaw : `+${digits}`;
+                const costNgn = candidateCostUsd > 0 ? roundToNaira(candidateCostUsd, rates.NGN) : liveUnitNgn;
+                const remainingAvailable = Number.isFinite(availableBeforeBuy)
+                  ? availableBeforeBuy - reservedThisBatch
+                  : Number.POSITIVE_INFINITY;
+                const exceedsCap =
+                  liveUnitNgn > 0 && costNgn > Math.max(liveUnitNgn * 1.15, liveUnitNgn + 40);
+
+                if (costNgn > remainingAvailable || exceedsCap) {
+                  await callGrizzlyApi(
+                    { action: 'setStatus', status: '8', id: String(candidateActId) },
+                    grizzlyKey
+                  ).catch(() => undefined);
+                  lastError = `Lowest price (₦${liveUnitNgn.toLocaleString()}) changed upstream (₦${costNgn.toLocaleString()}). Try another country or provider.`;
+                  break;
+                }
+
+                const dup = await isPhoneNumberAlreadyIssued(digits);
+                if (dup) {
+                  await callGrizzlyApi(
+                    { action: 'setStatus', status: '8', id: String(candidateActId) },
+                    grizzlyKey
+                  ).catch(() => undefined);
+                  lastError = 'Fresh unused number unavailable right now — please try another country or provider.';
+                  continue;
+                }
+
+                reservingPhoneDigitsSet.add(digits);
+                const resolvedCountry = countryMeta?.country || countryNameHint || 'Country';
+                await markPhoneNumberIssued({
+                  digits,
+                  phone,
+                  provider: 'grizzly',
+                  service,
+                  country: resolvedCountry,
+                  userId,
+                  orderId: candidateActId,
+                });
+
+                reservedThisBatch += costNgn || liveUnitNgn;
+                acquiredOrder = {
+                  id: candidateActId,
+                  provider: 'grizzly' as const,
+                  phone,
+                  digits,
+                  country: resolvedCountry,
+                  countryCode: countryCodeHint || countryMeta?.countryCode,
+                  service,
+                  serviceName,
+                  price: costNgn > 0 ? costNgn : undefined,
+                  rawPriceUsd: candidateCostUsd > 0 ? roundUnitPrice(candidateCostUsd) : undefined,
+                  currency: 'NGN',
+                  status: 'PENDING',
+                  expires: candidateExpires,
+                  createdAt: new Date().toISOString(),
+                  sms: [],
+                  charged: false,
+                  chargeOnCode: true,
+                };
+                break;
+              }
+            } catch (err) {
+              lastError = sanitizeNumberApiError(
+                err instanceof Error ? err.message : 'Grizzly SMS purchase failed'
+              );
             }
-          } catch (err) {
-            lastError = sanitizeNumberApiError(
-              err instanceof Error ? err.message : 'Grizzly SMS purchase failed'
-            );
           }
 
           if (!acquiredOrder) {
@@ -6300,16 +7580,51 @@ export function createApiApp() {
           orders.push(acquiredOrder);
         }
 
-        for (const ord of orders) {
+        const ordersWithTokens = orders.map((ord) => {
+          const chargeToken =
+            userId && ord.id && typeof ord.price === 'number' && ord.price > 0
+              ? createOrderChargeToken({
+                  orderId: ord.id,
+                  userId,
+                  amountNgn: ord.price,
+                  provider: 'grizzly',
+                  phone: ord.phone,
+                  serviceName: ord.serviceName,
+                })
+              : undefined;
           if (ord.id && typeof ord.price === 'number' && ord.price > 0) {
             numberOrderHoldMap.set(ord.id, {
+              orderId: ord.id,
               userId,
+              email: caller.email || null,
               amountNgn: ord.price,
+              rawPriceUsd: ord.rawPriceUsd,
               provider: 'grizzly',
+              service: ord.service,
+              serviceName: ord.serviceName,
+              phone: ord.phone,
+              digits: ord.digits,
+              country: ord.country,
+              countryCode: ord.countryCode,
+              charged: false,
+              settled: false,
+              cancelled: false,
+              createdAt: Date.now(),
             });
           }
-        }
-        res.json({ orders });
+          return { ...ord, chargeToken };
+        });
+
+        const reservedBalance = userId ? getPendingHoldTotalForUser(userId) : 0;
+        const walletBalance = Number.isFinite(clientWalletBalance) ? clientWalletBalance : null;
+        res.json({
+          orders: ordersWithTokens,
+          chargeOnCode: true,
+          walletBalance,
+          reservedBalance,
+          availableBalance:
+            walletBalance !== null ? Math.max(0, walletBalance - reservedBalance) : null,
+        });
         return;
       } catch (err) {
         const message = sanitizeNumberApiError(
@@ -6341,61 +7656,99 @@ export function createApiApp() {
       const countryMeta = countriesList.find((c) => c.slug === country);
       const lowestOps = countryMeta?.lowestOperators || [];
       const sortedInStockOps = countryMeta?.operators.map((o) => o.operator) || [];
-      // Strictly try the cheapest operators first, then 'any' (matching 5sim's Any operator rate), then other in-stock operators
       const operatorCandidates = Array.from(new Set([...lowestOps, 'any', ...sortedInStockOps]));
 
       const liveUnitUsd = countryMeta?.minPrice || 0;
       const liveUnitNgn = liveUnitUsd > 0 ? roundToNaira(liveUnitUsd, rates.NGN) : 0;
       if (
-        Number.isFinite(clientWalletBalance) &&
+        Number.isFinite(availableBeforeBuy) &&
         liveUnitNgn > 0 &&
-        clientWalletBalance < liveUnitNgn * quantity
+        availableBeforeBuy < liveUnitNgn * quantity
       ) {
         res.status(402).json({
-          error: `Insufficient wallet balance for the current live lowest price (₦${(liveUnitNgn * quantity).toLocaleString()} required, wallet has ₦${clientWalletBalance.toLocaleString()}). Please top up first.`,
+          error: `Insufficient available wallet balance (₦${(liveUnitNgn * quantity).toLocaleString()} needed, available ₦${availableBeforeBuy.toLocaleString()}${pendingHoldNgn > 0 ? `, ₦${pendingHoldNgn.toLocaleString()} held on waiting numbers` : ''}). Top up first — funds are only deducted once an SMS arrives.`,
         });
         return;
       }
 
       const orders = [];
-      let spentNgn = 0;
+      let reservedHoldNgn = 0;
       let lastError = 'No numbers available for this selection right now.';
 
       for (let i = 0; i < quantity; i++) {
         let acquired: ReturnType<typeof toPublicNumberOrder> | null = null;
-        for (const op of operatorCandidates) {
-          try {
-            const raw = await callFiveSimUserApi(
-              `buy/activation/${encodeURIComponent(country)}/${encodeURIComponent(op)}/${encodeURIComponent(service)}`,
-              apiKey
-            );
-            const candidate = toPublicNumberOrder(raw, serviceName, countryCodeHint, resolvedCurrency, rates);
-            const orderNgn = candidate.price || 0;
-            const remainingWallet = Number.isFinite(clientWalletBalance)
-              ? clientWalletBalance - spentNgn
-              : Number.POSITIVE_INFINITY;
-            const exceedsListedMin =
-              liveUnitNgn > 0 && orderNgn > Math.max(liveUnitNgn * 1.25, liveUnitNgn + 50);
+        let dupRetries = 0;
 
-            if ((orderNgn > remainingWallet || exceedsListedMin) && candidate.id > 0) {
-              // Auto-cancel if upstream assigned a higher-cost operator so user/key balance is never overcharged
-              await callFiveSimUserApi(`cancel/${candidate.id}`, apiKey).catch(() => undefined);
-              lastError = `Lowest rate (₦${liveUnitNgn.toLocaleString()}) is temporarily out of stock right now (live operator fill was ₦${orderNgn.toLocaleString()}). Try the other provider or another country.`;
-              continue;
-            }
-            acquired = candidate;
-            spentNgn += orderNgn || liveUnitNgn;
-            break;
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : '';
-            lastError = sanitizeNumberApiError(msg);
-            if (
-              msg.toLowerCase().includes('balance') ||
-              msg.toLowerCase().includes('unauthorized')
-            ) {
-              throw new Error(lastError);
+        for (const op of operatorCandidates) {
+          let retrySameOp = true;
+          while (retrySameOp) {
+            retrySameOp = false;
+            try {
+              const raw = await callFiveSimUserApi(
+                `buy/activation/${encodeURIComponent(country)}/${encodeURIComponent(op)}/${encodeURIComponent(service)}`,
+                apiKey
+              );
+              const candidate = toPublicNumberOrder(
+                raw,
+                serviceName,
+                countryCodeHint,
+                resolvedCurrency,
+                rates,
+                liveUnitUsd
+              );
+              const orderNgn = candidate.price || 0;
+              const remainingAvailable = Number.isFinite(availableBeforeBuy)
+                ? availableBeforeBuy - reservedHoldNgn
+                : Number.POSITIVE_INFINITY;
+              const exceedsListedMin =
+                liveUnitNgn > 0 && orderNgn > Math.max(liveUnitNgn * 1.15, liveUnitNgn + 40);
+
+              if ((orderNgn > remainingAvailable || exceedsListedMin) && candidate.id > 0) {
+                await callFiveSimUserApi(`cancel/${candidate.id}`, apiKey).catch(() => undefined);
+                lastError = `Lowest rate (₦${liveUnitNgn.toLocaleString()}) is temporarily out of stock right now (live operator fill was ₦${orderNgn.toLocaleString()}). Try the other provider or another country.`;
+                break;
+              }
+
+              const dup = await isPhoneNumberAlreadyIssued(candidate.digits);
+              if (dup) {
+                if (candidate.id > 0) {
+                  await callFiveSimUserApi(`cancel/${candidate.id}`, apiKey).catch(() => undefined);
+                }
+                dupRetries += 1;
+                lastError = 'Previously assigned number skipped — requesting a fresh unique number.';
+                if (dupRetries < 4) {
+                  retrySameOp = true;
+                  continue;
+                }
+                break;
+              }
+
+              reservingPhoneDigitsSet.add(normalizePhoneDigits(candidate.digits));
+              await markPhoneNumberIssued({
+                digits: candidate.digits,
+                phone: candidate.phone,
+                provider: 'fivesim',
+                service,
+                country: candidate.country || countryNameHint || country,
+                userId,
+                orderId: candidate.id,
+              });
+
+              acquired = candidate;
+              reservedHoldNgn += orderNgn || liveUnitNgn;
+              break;
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : '';
+              lastError = sanitizeNumberApiError(msg);
+              if (
+                msg.toLowerCase().includes('balance') ||
+                msg.toLowerCase().includes('unauthorized')
+              ) {
+                throw new Error(lastError);
+              }
             }
           }
+          if (acquired || dupRetries >= 5) break;
         }
         if (!acquired) {
           if (orders.length > 0) break;
@@ -6404,16 +7757,56 @@ export function createApiApp() {
         orders.push(acquired);
       }
 
-      for (const ord of orders) {
+      const ordersWithTokens = orders.map((ord) => {
+        const chargeToken =
+          userId && ord.id && typeof ord.price === 'number' && ord.price > 0
+            ? createOrderChargeToken({
+                orderId: ord.id,
+                userId,
+                amountNgn: ord.price,
+                provider: 'fivesim',
+                phone: ord.phone,
+                serviceName: ord.serviceName,
+              })
+            : undefined;
         if (ord.id && typeof ord.price === 'number' && ord.price > 0) {
           numberOrderHoldMap.set(ord.id, {
+            orderId: ord.id,
             userId,
+            email: caller.email || null,
             amountNgn: ord.price,
+            rawPriceUsd: ord.rawPriceUsd,
             provider: 'fivesim',
+            service: ord.service,
+            serviceName: ord.serviceName,
+            phone: ord.phone,
+            digits: ord.digits,
+            country: ord.country,
+            countryCode: ord.countryCode,
+            charged: false,
+            settled: false,
+            cancelled: false,
+            createdAt: Date.now(),
           });
         }
-      }
-      res.json({ orders });
+        return {
+          ...ord,
+          charged: false,
+          chargeOnCode: true,
+          chargeToken,
+        };
+      });
+
+      const reservedBalance = userId ? getPendingHoldTotalForUser(userId) : 0;
+      const walletBalance = Number.isFinite(clientWalletBalance) ? clientWalletBalance : null;
+      res.json({
+        orders: ordersWithTokens,
+        chargeOnCode: true,
+        walletBalance,
+        reservedBalance,
+        availableBalance:
+          walletBalance !== null ? Math.max(0, walletBalance - reservedBalance) : null,
+      });
     } catch (err) {
       const message = sanitizeNumberApiError(
         err instanceof Error ? err.message : 'Unable to assign number'
@@ -6423,8 +7816,16 @@ export function createApiApp() {
   });
 
   app.get('/api/numbers/check/:orderId', async (req, res) => {
+    const caller = await assertCallerNotModerated(req, res);
+    if (!caller) return;
+
     const provider = String(req.query.provider || 'fivesim').toLowerCase();
     const orderId = req.params.orderId.replace(/[^0-9]/g, '');
+    const numericOrderId = Number(orderId);
+    const chargeToken = req.query.chargeToken;
+    const reqUserId = caller.userId || (typeof req.query.userId === 'string' ? req.query.userId : undefined);
+    const heldRecord = numberOrderHoldMap.get(numericOrderId);
+
     if (!orderId) {
       res.status(400).json({ error: 'Invalid number ID' });
       return;
@@ -6438,14 +7839,47 @@ export function createApiApp() {
       }
       try {
         const statusText = await callGrizzlyApi({ action: 'getStatus', id: orderId }, grizzlyKey);
-        const parsed = parseGrizzlyStatus(statusText, Number(orderId), 'other');
+        const parsed = parseGrizzlyStatus(statusText, numericOrderId, 'other');
+
+        let settlement = {
+          charged: Boolean(heldRecord?.charged),
+          chargedNow: false,
+          chargedAmount: 0,
+          walletBalance: null as number | null,
+          reservedBalance: 0,
+          availableBalance: null as number | null,
+        };
+
+        if (parsed.sms.length > 0) {
+          settlement = await settleNumberOrderChargeIfSmsArrived({
+            orderId: numericOrderId,
+            smsCount: parsed.sms.length,
+            chargeToken,
+            fallbackUserId: reqUserId,
+            fallbackEmail: caller.email || null,
+            provider: 'grizzly',
+          });
+        } else if (['CANCELED', 'TIMEOUT', 'BANNED'].includes(parsed.status)) {
+          const rel = await releaseNumberOrderHold(numericOrderId, chargeToken, reqUserId);
+          settlement.walletBalance = rel.walletBalance;
+          settlement.reservedBalance = rel.reservedBalance;
+          settlement.availableBalance = rel.availableBalance;
+        }
+
         res.json({
           order: {
-            id: Number(orderId),
+            id: numericOrderId,
             provider: 'grizzly',
             status: parsed.status,
             sms: parsed.sms,
+            charged: settlement.charged,
+            chargeOnCode: true,
           },
+          chargedNow: settlement.chargedNow,
+          chargedAmount: settlement.chargedAmount,
+          walletBalance: settlement.walletBalance,
+          reservedBalance: settlement.reservedBalance,
+          availableBalance: settlement.availableBalance,
         });
       } catch (err) {
         res.status(502).json({
@@ -6467,7 +7901,60 @@ export function createApiApp() {
         getFiveSimAccountCurrency(apiKey),
         getExchangeRates(),
       ]);
-      res.json({ order: toPublicNumberOrder(raw, undefined, undefined, accountCurrency, rates) });
+      const baseOrder = toPublicNumberOrder(
+        raw,
+        heldRecord?.serviceName,
+        heldRecord?.countryCode,
+        accountCurrency,
+        rates,
+        heldRecord?.rawPriceUsd
+      );
+      const order = {
+        ...baseOrder,
+        price: heldRecord?.amountNgn || baseOrder.price,
+        rawPriceUsd: heldRecord?.rawPriceUsd || baseOrder.rawPriceUsd,
+      };
+
+      let settlement = {
+        charged: Boolean(heldRecord?.charged),
+        chargedNow: false,
+        chargedAmount: 0,
+        walletBalance: null as number | null,
+        reservedBalance: 0,
+        availableBalance: null as number | null,
+      };
+
+      if (order.sms.length > 0) {
+        settlement = await settleNumberOrderChargeIfSmsArrived({
+          orderId: numericOrderId,
+          smsCount: order.sms.length,
+          chargeToken,
+          fallbackUserId: reqUserId,
+          fallbackEmail: caller.email || null,
+          provider: 'fivesim',
+          phone: order.phone,
+          serviceName: order.serviceName,
+          priceNgn: order.price,
+        });
+      } else if (['CANCELED', 'TIMEOUT', 'BANNED'].includes(order.status)) {
+        const rel = await releaseNumberOrderHold(numericOrderId, chargeToken, reqUserId);
+        settlement.walletBalance = rel.walletBalance;
+        settlement.reservedBalance = rel.reservedBalance;
+        settlement.availableBalance = rel.availableBalance;
+      }
+
+      res.json({
+        order: {
+          ...order,
+          charged: settlement.charged,
+          chargeOnCode: true,
+        },
+        chargedNow: settlement.chargedNow,
+        chargedAmount: settlement.chargedAmount,
+        walletBalance: settlement.walletBalance,
+        reservedBalance: settlement.reservedBalance,
+        availableBalance: settlement.availableBalance,
+      });
     } catch (err) {
       res.status(502).json({
         error: sanitizeNumberApiError(err instanceof Error ? err.message : 'Check failed'),
@@ -6476,8 +7963,22 @@ export function createApiApp() {
   });
 
   app.get('/api/numbers/stream/:orderId', async (req, res) => {
+    const modEval = await evaluateCallerModeration(req);
+    if (modEval.blocked) {
+      res.status(403).json({
+        code: 'ACCOUNT_MODERATED',
+        error: modEval.reason || `Account is currently ${modEval.status}. Access blocked.`,
+      });
+      return;
+    }
+
     const provider = String(req.query.provider || 'fivesim').toLowerCase();
     const orderId = req.params.orderId.replace(/[^0-9]/g, '');
+    const numericOrderId = Number(orderId);
+    const chargeToken = req.query.chargeToken;
+    const reqUserId =
+      modEval.user?.id || (typeof req.query.userId === 'string' ? req.query.userId : undefined);
+    const heldRecord = numberOrderHoldMap.get(numericOrderId);
     const apiKey = provider === 'grizzly' ? getGrizzlyApiKey() : getFiveSimApiKey();
     if (!apiKey || !orderId) {
       res.status(400).end();
@@ -6504,14 +8005,52 @@ export function createApiApp() {
       try {
         if (provider === 'grizzly') {
           const statusText = await callGrizzlyApi({ action: 'getStatus', id: orderId }, apiKey);
-          const parsed = parseGrizzlyStatus(statusText, Number(orderId), 'other');
+          const parsed = parseGrizzlyStatus(statusText, numericOrderId, 'other');
+
+          let settlement = {
+            charged: Boolean(heldRecord?.charged),
+            chargedNow: false,
+            chargedAmount: 0,
+            walletBalance: null as number | null,
+            reservedBalance: 0,
+            availableBalance: null as number | null,
+          };
+
+          if (parsed.sms.length > 0) {
+            settlement = await settleNumberOrderChargeIfSmsArrived({
+              orderId: numericOrderId,
+              smsCount: parsed.sms.length,
+              chargeToken,
+              fallbackUserId: reqUserId,
+              fallbackEmail: modEval.user?.email || null,
+              provider: 'grizzly',
+            });
+          } else if (['CANCELED', 'TIMEOUT', 'BANNED'].includes(parsed.status)) {
+            const rel = await releaseNumberOrderHold(numericOrderId, chargeToken, reqUserId);
+            settlement.walletBalance = rel.walletBalance;
+            settlement.reservedBalance = rel.reservedBalance;
+            settlement.availableBalance = rel.availableBalance;
+          }
+
           const order = {
-            id: Number(orderId),
+            id: numericOrderId,
             provider: 'grizzly',
             status: parsed.status,
             sms: parsed.sms,
+            charged: settlement.charged,
+            chargeOnCode: true,
           };
-          res.write(`data: ${JSON.stringify({ type: 'order', order })}\n\n`);
+          res.write(
+            `data: ${JSON.stringify({
+              type: 'order',
+              order,
+              chargedNow: settlement.chargedNow,
+              chargedAmount: settlement.chargedAmount,
+              walletBalance: settlement.walletBalance,
+              reservedBalance: settlement.reservedBalance,
+              availableBalance: settlement.availableBalance,
+            })}\n\n`
+          );
           if (['FINISHED', 'CANCELED', 'TIMEOUT', 'BANNED'].includes(order.status)) {
             closed = true;
             clearInterval(interval);
@@ -6521,8 +8060,62 @@ export function createApiApp() {
         }
 
         const raw = await callFiveSimUserApi(`check/${orderId}`, apiKey);
-        const order = toPublicNumberOrder(raw, undefined, undefined, accountCurrency, rates);
-        res.write(`data: ${JSON.stringify({ type: 'order', order })}\n\n`);
+        const baseOrder = toPublicNumberOrder(
+          raw,
+          heldRecord?.serviceName,
+          heldRecord?.countryCode,
+          accountCurrency,
+          rates,
+          heldRecord?.rawPriceUsd
+        );
+        const orderPrice = heldRecord?.amountNgn || baseOrder.price;
+
+        let settlement = {
+          charged: Boolean(heldRecord?.charged),
+          chargedNow: false,
+          chargedAmount: 0,
+          walletBalance: null as number | null,
+          reservedBalance: 0,
+          availableBalance: null as number | null,
+        };
+
+        if (baseOrder.sms.length > 0) {
+          settlement = await settleNumberOrderChargeIfSmsArrived({
+            orderId: numericOrderId,
+            smsCount: baseOrder.sms.length,
+            chargeToken,
+            fallbackUserId: reqUserId,
+            fallbackEmail: modEval.user?.email || null,
+            provider: 'fivesim',
+            phone: baseOrder.phone,
+            serviceName: baseOrder.serviceName,
+            priceNgn: orderPrice,
+          });
+        } else if (['CANCELED', 'TIMEOUT', 'BANNED'].includes(baseOrder.status)) {
+          const rel = await releaseNumberOrderHold(numericOrderId, chargeToken, reqUserId);
+          settlement.walletBalance = rel.walletBalance;
+          settlement.reservedBalance = rel.reservedBalance;
+          settlement.availableBalance = rel.availableBalance;
+        }
+
+        const order = {
+          ...baseOrder,
+          price: orderPrice,
+          rawPriceUsd: heldRecord?.rawPriceUsd || baseOrder.rawPriceUsd,
+          charged: settlement.charged,
+          chargeOnCode: true,
+        };
+        res.write(
+          `data: ${JSON.stringify({
+            type: 'order',
+            order,
+            chargedNow: settlement.chargedNow,
+            chargedAmount: settlement.chargedAmount,
+            walletBalance: settlement.walletBalance,
+            reservedBalance: settlement.reservedBalance,
+            availableBalance: settlement.availableBalance,
+          })}\n\n`
+        );
         if (['FINISHED', 'CANCELED', 'TIMEOUT', 'BANNED'].includes(order.status)) {
           closed = true;
           clearInterval(interval);
@@ -6547,12 +8140,17 @@ export function createApiApp() {
   });
 
   app.post('/api/numbers/:action(cancel|finish|ban)/:orderId', async (req, res) => {
+    const caller = await assertCallerNotModerated(req, res);
+    if (!caller) return;
+
     const provider = String(req.query.provider || req.body?.provider || 'fivesim').toLowerCase();
     const action = req.params.action;
     const orderId = req.params.orderId.replace(/[^0-9]/g, '');
     const numericOrderId = Number(orderId);
-    const reqUserId = req.body?.userId || req.query.userId;
+    const chargeToken = req.body?.chargeToken || req.query.chargeToken;
+    const reqUserId = caller.userId || req.body?.userId || req.query.userId;
     const reqRefundAmount = Number(req.body?.refundAmount || 0);
+    const wasLegacyCharged = Boolean(req.body?.wasCharged);
 
     if (!orderId) {
       res.status(400).json({ error: 'Invalid number ID' });
@@ -6560,11 +8158,14 @@ export function createApiApp() {
     }
 
     const heldRecord = numberOrderHoldMap.get(numericOrderId);
-    const refundUserId = reqUserId
+    const verifiedToken = verifyOrderChargeToken(chargeToken, numericOrderId);
+    const effectiveUserId = reqUserId
       ? normalizeWalletUserId(reqUserId)
-      : heldRecord?.userId;
+      : heldRecord?.userId || verifiedToken?.userId;
     const refundAmountNgn = Math.round(
-      heldRecord?.amountNgn || (Number.isFinite(reqRefundAmount) && reqRefundAmount > 0 ? reqRefundAmount : 0)
+      heldRecord?.amountNgn ||
+        verifiedToken?.amountNgn ||
+        (Number.isFinite(reqRefundAmount) && reqRefundAmount > 0 ? reqRefundAmount : 0)
     );
 
     if (provider === 'grizzly') {
@@ -6579,6 +8180,15 @@ export function createApiApp() {
           const liveStatusText = await callGrizzlyApi({ action: 'getStatus', id: orderId }, grizzlyKey);
           const parsedLive = parseGrizzlyStatus(liveStatusText, numericOrderId, 'other');
           if (parsedLive.sms.length > 0) {
+            const settlement = await settleNumberOrderChargeIfSmsArrived({
+              orderId: numericOrderId,
+              smsCount: parsedLive.sms.length,
+              chargeToken,
+              fallbackUserId: effectiveUserId,
+              fallbackEmail: caller.email || null,
+              provider: 'grizzly',
+              priceNgn: refundAmountNgn,
+            });
             res.status(409).json({
               cancelled: false,
               alreadyHasSms: true,
@@ -6588,7 +8198,12 @@ export function createApiApp() {
                 provider: 'grizzly',
                 status: parsedLive.status,
                 sms: parsedLive.sms,
+                charged: settlement.charged,
+                chargeOnCode: true,
               },
+              walletBalance: settlement.walletBalance,
+              reservedBalance: settlement.reservedBalance,
+              availableBalance: settlement.availableBalance,
             });
             return;
           }
@@ -6600,11 +8215,20 @@ export function createApiApp() {
       const statusCode = action === 'finish' ? '6' : '8';
       try {
         await callGrizzlyApi({ action: 'setStatus', status: statusCode, id: orderId }, grizzlyKey);
+        const released = await releaseNumberOrderHold(numericOrderId, chargeToken, effectiveUserId);
+
         let refunded = false;
-        let walletBalance: number | null = null;
-        if (action === 'cancel' && refundUserId && refundAmountNgn > 0 && !heldRecord?.refunded) {
+        let walletBalance: number | null = released.walletBalance;
+        const shouldRefundLegacy =
+          action === 'cancel' &&
+          (heldRecord?.charged === true || (wasLegacyCharged && !heldRecord)) &&
+          effectiveUserId &&
+          refundAmountNgn > 0 &&
+          !heldRecord?.refunded;
+
+        if (shouldRefundLegacy && effectiveUserId) {
           const adj = await adjustUserWalletBalance({
-            userId: refundUserId,
+            userId: effectiveUserId,
             deltaNgn: refundAmountNgn,
             reference: `refund-${orderId}`,
           });
@@ -6612,15 +8236,21 @@ export function createApiApp() {
           refunded = !adj.alreadyProcessed;
           walletBalance = adj.balance;
         }
+
         res.json({
           cancelled: action === 'cancel',
+          holdReleased: action === 'cancel' && !refunded,
           refunded,
           refundedAmount: refunded ? refundAmountNgn : 0,
           walletBalance,
+          reservedBalance: released.reservedBalance,
+          availableBalance:
+            walletBalance !== null ? Math.max(0, walletBalance - released.reservedBalance) : null,
           order: {
             id: numericOrderId,
             provider: 'grizzly',
             status: action === 'finish' ? 'FINISHED' : 'CANCELED',
+            charged: Boolean(heldRecord?.charged && !refunded),
           },
         });
       } catch (err) {
@@ -6646,13 +8276,42 @@ export function createApiApp() {
       if (action === 'cancel') {
         try {
           const liveRaw = await callFiveSimUserApi(`check/${orderId}`, apiKey);
-          const liveOrder = toPublicNumberOrder(liveRaw, undefined, undefined, accountCurrency, rates);
+          const liveBase = toPublicNumberOrder(
+            liveRaw,
+            heldRecord?.serviceName,
+            heldRecord?.countryCode,
+            accountCurrency,
+            rates,
+            heldRecord?.rawPriceUsd
+          );
+          const liveOrder = {
+            ...liveBase,
+            price: heldRecord?.amountNgn || liveBase.price,
+          };
           if (liveOrder.sms.length > 0) {
+            const settlement = await settleNumberOrderChargeIfSmsArrived({
+              orderId: numericOrderId,
+              smsCount: liveOrder.sms.length,
+              chargeToken,
+              fallbackUserId: effectiveUserId,
+              fallbackEmail: caller.email || null,
+              provider: 'fivesim',
+              phone: liveOrder.phone,
+              serviceName: liveOrder.serviceName,
+              priceNgn: liveOrder.price,
+            });
             res.status(409).json({
               cancelled: false,
               alreadyHasSms: true,
               error: 'Verification code already arrived on this number — charge finalized.',
-              order: liveOrder,
+              order: {
+                ...liveOrder,
+                charged: settlement.charged,
+                chargeOnCode: true,
+              },
+              walletBalance: settlement.walletBalance,
+              reservedBalance: settlement.reservedBalance,
+              availableBalance: settlement.availableBalance,
             });
             return;
           }
@@ -6662,20 +8321,34 @@ export function createApiApp() {
       }
 
       const raw = await callFiveSimUserApi(`${action}/${orderId}`, apiKey);
-      const order = toPublicNumberOrder(raw, undefined, undefined, accountCurrency, rates);
+      const baseOrder = toPublicNumberOrder(
+        raw,
+        heldRecord?.serviceName,
+        heldRecord?.countryCode,
+        accountCurrency,
+        rates,
+        heldRecord?.rawPriceUsd
+      );
+      const order = {
+        ...baseOrder,
+        price: heldRecord?.amountNgn || baseOrder.price,
+      };
+      const released = await releaseNumberOrderHold(numericOrderId, chargeToken, effectiveUserId);
 
       let refunded = false;
-      let walletBalance: number | null = null;
-      if (
+      let walletBalance: number | null = released.walletBalance;
+      const shouldRefundLegacy =
         action === 'cancel' &&
         order.sms.length === 0 &&
-        refundUserId &&
+        (heldRecord?.charged === true || (wasLegacyCharged && !heldRecord)) &&
+        effectiveUserId &&
         (order.price || refundAmountNgn) > 0 &&
-        !heldRecord?.refunded
-      ) {
+        !heldRecord?.refunded;
+
+      if (shouldRefundLegacy && effectiveUserId) {
         const effectiveRefund = Math.round(order.price || refundAmountNgn);
         const adj = await adjustUserWalletBalance({
-          userId: refundUserId,
+          userId: effectiveUserId,
           deltaNgn: effectiveRefund,
           reference: `refund-${orderId}`,
         });
@@ -6686,10 +8359,17 @@ export function createApiApp() {
 
       res.json({
         cancelled: action === 'cancel',
+        holdReleased: action === 'cancel' && !refunded,
         refunded,
         refundedAmount: refunded ? Math.round(order.price || refundAmountNgn) : 0,
         walletBalance,
-        order,
+        reservedBalance: released.reservedBalance,
+        availableBalance:
+          walletBalance !== null ? Math.max(0, walletBalance - released.reservedBalance) : null,
+        order: {
+          ...order,
+          charged: Boolean(heldRecord?.charged && !refunded),
+        },
       });
     } catch (err) {
       res.status(502).json({
@@ -7195,15 +8875,22 @@ export function createApiApp() {
   app.get('/api/wallet/balance', async (req, res) => {
     const userId = normalizeWalletUserId(req.query.userId);
     const { balance, supabasePersisted } = await getUserWalletBalance(userId);
+    const reservedBalance = getPendingHoldTotalForUser(userId);
+    const availableBalance =
+      typeof balance === 'number' ? Math.max(0, balance - reservedBalance) : null;
     res.json({
       userId,
       balance,
+      reservedBalance,
+      availableBalance,
       supabasePersisted,
       currency: 'NGN',
     });
   });
 
   app.post('/api/wallet/initialize', async (req, res) => {
+    const modCaller = await assertCallerNotModerated(req, res);
+    if (!modCaller) return;
     const amount = Number(req.body?.amount);
     if (!Number.isFinite(amount) || amount < 100) {
       res.status(400).json({ error: 'Minimum deposit is ₦100' });
@@ -7486,6 +9173,8 @@ export function createApiApp() {
   });
 
   app.post('/api/wallet/deduct', async (req, res) => {
+    const modCaller = await assertCallerNotModerated(req, res);
+    if (!modCaller) return;
     const amount = Math.round(Number(req.body?.amount));
     if (!Number.isFinite(amount) || amount <= 0) {
       res.status(400).json({ error: 'Invalid deduction amount' });
@@ -7516,6 +9205,8 @@ export function createApiApp() {
   });
 
   app.post('/api/wallet/refund', async (req, res) => {
+    const modCaller = await assertCallerNotModerated(req, res);
+    if (!modCaller) return;
     const amount = Math.round(Number(req.body?.amount));
     if (!Number.isFinite(amount) || amount <= 0) {
       res.status(400).json({ error: 'Invalid refund amount' });
@@ -7536,6 +9227,8 @@ export function createApiApp() {
   });
 
   app.post('/api/wallet/demo-credit', async (req, res) => {
+    const modCaller = await assertCallerNotModerated(req, res);
+    if (!modCaller) return;
     if (getPaystackSecretKey()) {
       res.status(403).json({
         error: 'Test credit is disabled when live Paystack checkout is configured.',
@@ -8265,6 +9958,8 @@ export function createApiApp() {
   }
 
   app.post('/api/images/generate', async (req, res) => {
+    const modCaller = await assertCallerNotModerated(req, res);
+    if (!modCaller) return;
     const rawPrompt = typeof req.body?.prompt === 'string' ? req.body.prompt.trim() : '';
     if (!rawPrompt || rawPrompt.length < 3) {
       res.status(400).json({ error: 'Please enter a descriptive prompt (at least 3 characters).' });
@@ -8524,6 +10219,8 @@ You MUST return strict JSON with keys: "intent", "reply", and "imagePrompt".
   }
 
   app.post('/api/ai/chat', async (req, res) => {
+    const modCaller = await assertCallerNotModerated(req, res);
+    if (!modCaller) return;
     const message = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
     const mode = req.body?.mode === 'chat' || req.body?.mode === 'image' ? req.body.mode : 'auto';
     const imageDataUrl =

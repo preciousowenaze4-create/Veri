@@ -11,8 +11,10 @@ import {
   MailPlus,
   Phone,
   RefreshCw,
+  Send,
   Sparkles,
   Trash2,
+  X,
 } from 'lucide-react';
 import type { EmailMessageDetail, EmailMessageSummary, TempEmailAccount } from '../types';
 import { formatRelativeTime } from '../utils/clipboard';
@@ -43,6 +45,12 @@ interface HomeEmailTabProps {
   onOpenMessage: (id: string) => void;
   onCloseMessage: () => void;
   onDeleteMessage: (id: string) => void;
+  onSendEmail?: (payload: {
+    fromAddress: string;
+    toAddress: string;
+    subject: string;
+    text: string;
+  }) => Promise<{ ok: boolean; id?: string | null; error?: string }>;
   onCopyText: (
     value: string,
     label: string,
@@ -82,12 +90,22 @@ export function HomeEmailTab({
   onOpenMessage,
   onCloseMessage,
   onDeleteMessage,
+  onSendEmail,
   onCopyText,
 }: HomeEmailTabProps) {
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [switcherOpen, setSwitcherOpen] = useState(false);
   const [confirmDeleteAddress, setConfirmDeleteAddress] = useState<string | null>(null);
   const [showPasswordChip, setShowPasswordChip] = useState(false);
+  const [composeOpen, setComposeOpen] = useState(false);
+  const [toAddress, setToAddress] = useState('');
+  const [composeSubject, setComposeSubject] = useState('');
+  const [composeBody, setComposeBody] = useState('');
+  const [sendingEmail, setSendingEmail] = useState(false);
+  const [sendFeedback, setSendFeedback] = useState<{
+    type: 'success' | 'error';
+    text: string;
+  } | null>(null);
 
   const dailyRemaining = Math.max(0, dailyGenerateLimit - dailyGenerateUsed);
 
@@ -95,6 +113,39 @@ export function HomeEmailTab({
     onCopyText(value, label, otpSource ? { source: otpSource, channel: 'Email' } : undefined);
     setCopiedKey(key);
     window.setTimeout(() => setCopiedKey((prev) => (prev === key ? null : prev)), 1600);
+  };
+
+  const openComposer = (prefillTo = '', prefillSubject = '') => {
+    setSendFeedback(null);
+    if (prefillTo) setToAddress(prefillTo);
+    if (prefillSubject) setComposeSubject(prefillSubject);
+    setComposeOpen(true);
+  };
+
+  const handleSubmitSend = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!activeEmail || !onSendEmail || sendingEmail) return;
+    setSendingEmail(true);
+    setSendFeedback(null);
+    const result = await onSendEmail({
+      fromAddress: activeEmail.address,
+      toAddress: toAddress.trim().toLowerCase(),
+      subject: composeSubject.trim(),
+      text: composeBody.trim(),
+    });
+    setSendingEmail(false);
+    if (result.ok) {
+      setComposeBody('');
+      setSendFeedback({
+        type: 'success',
+        text: `Sent to ${toAddress.trim()}! When they reply from Gmail, their message will appear in your inbox here.`,
+      });
+    } else {
+      setSendFeedback({
+        type: 'error',
+        text: result.error || 'Failed to send email',
+      });
+    }
   };
 
   return (
@@ -193,6 +244,29 @@ export function HomeEmailTab({
               </p>
 
               <div className="flex items-center gap-1.5 shrink-0">
+                {onSendEmail && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (composeOpen && !selectedMessage) {
+                        setComposeOpen(false);
+                      } else {
+                        openComposer();
+                      }
+                    }}
+                    aria-label="Send email or chat with Gmail"
+                    title="Send email to Gmail"
+                    className={`inline-flex h-8 items-center gap-1 rounded-lg border px-2.5 text-[11px] font-bold transition-colors cursor-pointer ${
+                      composeOpen && !selectedMessage
+                        ? 'border-[#D4AF37] bg-[#D4AF37] text-[#0A0906]'
+                        : 'border-[#D4AF37]/40 bg-[#D4AF37]/10 text-[#8A6208] hover:bg-[#D4AF37]/20 dark:text-[#F5D77A]'
+                    }`}
+                  >
+                    <Send className="h-3.5 w-3.5" />
+                    <span className="hidden sm:inline">Send</span>
+                  </button>
+                )}
+
                 <button
                   type="button"
                   onClick={() =>
@@ -241,6 +315,83 @@ export function HomeEmailTab({
                 </button>
               )}
             </div>
+
+            {onSendEmail && composeOpen && !selectedMessage && (
+              <form
+                onSubmit={(e) => void handleSubmitSend(e)}
+                className="mt-3 rounded-xl border border-[#D4AF37]/30 bg-white p-3 space-y-2.5 dark:bg-[#14120D]"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5 text-xs font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
+                    <Send className="h-3.5 w-3.5 text-[#D4AF37]" />
+                    <span>Send Email (Two-Way Gmail Chat)</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setComposeOpen(false)}
+                    aria-label="Close composer"
+                    className="rounded-lg p-1 text-[#6E6552] hover:bg-black/5 cursor-pointer dark:text-[#A89F8C]"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+                <p className="text-[11px] text-[#6E6552] dark:text-[#A89F8C]">
+                  Sends from <span className="font-mono font-bold">{activeEmail.address}</span> via Resend. Replies from Gmail come straight back to this inbox.
+                </p>
+                <input
+                  type="email"
+                  required
+                  value={toAddress}
+                  onChange={(e) => setToAddress(e.target.value)}
+                  placeholder="To Gmail or email (e.g. friend@gmail.com)"
+                  className="h-9 w-full rounded-lg border border-[#D4AF37]/25 bg-[#FAF7F0] px-2.5 font-mono text-xs text-[#1A160D] focus:border-[#D4AF37] focus:outline-none dark:bg-[#0B0A07] dark:text-[#FAF6EC]"
+                />
+                <input
+                  type="text"
+                  required
+                  value={composeSubject}
+                  onChange={(e) => setComposeSubject(e.target.value)}
+                  placeholder="Subject"
+                  className="h-9 w-full rounded-lg border border-[#D4AF37]/25 bg-[#FAF7F0] px-2.5 text-xs text-[#1A160D] focus:border-[#D4AF37] focus:outline-none dark:bg-[#0B0A07] dark:text-[#FAF6EC]"
+                />
+                <textarea
+                  rows={3}
+                  required
+                  value={composeBody}
+                  onChange={(e) => setComposeBody(e.target.value)}
+                  placeholder="Write your message..."
+                  className="w-full rounded-lg border border-[#D4AF37]/25 bg-[#FAF7F0] p-2.5 text-xs text-[#1A160D] focus:border-[#D4AF37] focus:outline-none dark:bg-[#0B0A07] dark:text-[#FAF6EC]"
+                />
+                {sendFeedback && (
+                  <p
+                    className={`rounded-lg px-2.5 py-1.5 text-[11px] font-semibold ${
+                      sendFeedback.type === 'success'
+                        ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+                        : 'bg-rose-500/10 text-rose-700 dark:text-rose-200'
+                    }`}
+                  >
+                    {sendFeedback.text}
+                  </p>
+                )}
+                <div className="flex items-center justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setComposeOpen(false)}
+                    className="min-h-[34px] rounded-lg px-3 text-xs font-bold text-[#6E6552] hover:bg-black/5 cursor-pointer dark:text-[#A89F8C]"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={sendingEmail}
+                    className="inline-flex min-h-[34px] items-center gap-1.5 rounded-lg bg-[#D4AF37] px-3.5 text-xs font-extrabold text-[#0A0906] hover:bg-[#E5C150] disabled:opacity-60 cursor-pointer"
+                  >
+                    {sendingEmail ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
+                    <span>{sendingEmail ? 'Sending...' : 'Send Email'}</span>
+                  </button>
+                </div>
+              </form>
+            )}
 
             {confirmDeleteAddress === activeEmail.address && (
               <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-rose-500/30 bg-rose-500/10 px-3.5 py-2.5">
@@ -388,14 +539,32 @@ export function HomeEmailTab({
                 <span>Back to Inbox</span>
               </button>
 
-              <button
-                type="button"
-                onClick={() => onDeleteMessage(selectedMessage.id)}
-                className="inline-flex min-h-[40px] items-center gap-1.5 rounded-xl border border-rose-500/30 px-3 py-1.5 text-xs font-bold text-rose-600 hover:bg-rose-500/10 dark:text-rose-300"
-              >
-                <Trash2 className="h-3.5 w-3.5" />
-                <span>Delete</span>
-              </button>
+              <div className="flex items-center gap-2">
+                {onSendEmail && selectedMessage.fromAddress && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const reSubject = /^re:/i.test(selectedMessage.subject)
+                        ? selectedMessage.subject
+                        : `Re: ${selectedMessage.subject}`;
+                      openComposer(selectedMessage.fromAddress, reSubject);
+                    }}
+                    className="inline-flex min-h-[40px] items-center gap-1.5 rounded-xl bg-[#D4AF37] px-3 py-1.5 text-xs font-extrabold text-[#0A0906] hover:bg-[#E5C150] cursor-pointer"
+                  >
+                    <Send className="h-3.5 w-3.5" />
+                    <span>Reply</span>
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={() => onDeleteMessage(selectedMessage.id)}
+                  className="inline-flex min-h-[40px] items-center gap-1.5 rounded-xl border border-rose-500/30 px-3 py-1.5 text-xs font-bold text-rose-600 hover:bg-rose-500/10 dark:text-rose-300"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                  <span>Delete</span>
+                </button>
+              </div>
             </div>
 
             {loadingDetail ? (
@@ -465,6 +634,79 @@ export function HomeEmailTab({
                 <div className="rounded-xl border border-[#D4AF37]/20 bg-[#FAF7F0] p-4 text-sm leading-relaxed text-[#2C261A] whitespace-pre-wrap break-words dark:bg-[#0B0A07] dark:text-[#EAE2CF]">
                   {selectedMessage.text || 'Empty message body'}
                 </div>
+
+                {onSendEmail && composeOpen && activeEmail && (
+                  <form
+                    onSubmit={(e) => void handleSubmitSend(e)}
+                    className="rounded-xl border border-[#D4AF37]/30 bg-[#FAF7F0] p-3.5 space-y-2.5 dark:bg-[#0B0A07]"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
+                        Reply from {activeEmail.address}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setComposeOpen(false)}
+                        aria-label="Close reply box"
+                        className="rounded-lg p-1 text-[#6E6552] hover:bg-black/5 cursor-pointer dark:text-[#A89F8C]"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                    <input
+                      type="email"
+                      required
+                      value={toAddress}
+                      onChange={(e) => setToAddress(e.target.value)}
+                      placeholder="Recipient email"
+                      className="h-9 w-full rounded-lg border border-[#D4AF37]/25 bg-white px-2.5 font-mono text-xs text-[#1A160D] focus:border-[#D4AF37] focus:outline-none dark:bg-[#14120D] dark:text-[#FAF6EC]"
+                    />
+                    <input
+                      type="text"
+                      required
+                      value={composeSubject}
+                      onChange={(e) => setComposeSubject(e.target.value)}
+                      placeholder="Subject"
+                      className="h-9 w-full rounded-lg border border-[#D4AF37]/25 bg-white px-2.5 text-xs text-[#1A160D] focus:border-[#D4AF37] focus:outline-none dark:bg-[#14120D] dark:text-[#FAF6EC]"
+                    />
+                    <textarea
+                      rows={3}
+                      required
+                      value={composeBody}
+                      onChange={(e) => setComposeBody(e.target.value)}
+                      placeholder="Write your reply..."
+                      className="w-full rounded-lg border border-[#D4AF37]/25 bg-white p-2.5 text-xs text-[#1A160D] focus:border-[#D4AF37] focus:outline-none dark:bg-[#14120D] dark:text-[#FAF6EC]"
+                    />
+                    {sendFeedback && (
+                      <p
+                        className={`rounded-lg px-2.5 py-1.5 text-[11px] font-semibold ${
+                          sendFeedback.type === 'success'
+                            ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+                            : 'bg-rose-500/10 text-rose-700 dark:text-rose-200'
+                        }`}
+                      >
+                        {sendFeedback.text}
+                      </p>
+                    )}
+                    <div className="flex items-center justify-end gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setComposeOpen(false)}
+                        className="min-h-[34px] rounded-lg px-3 text-xs font-bold text-[#6E6552] hover:bg-black/5 cursor-pointer dark:text-[#A89F8C]"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="submit"
+                        disabled={sendingEmail}
+                        className="inline-flex min-h-[34px] items-center gap-1.5 rounded-lg bg-[#D4AF37] px-3.5 text-xs font-extrabold text-[#0A0906] hover:bg-[#E5C150] disabled:opacity-60 cursor-pointer"
+                      >
+                        {sendingEmail ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
+                        <span>{sendingEmail ? 'Sending...' : 'Send Reply'}</span>
+                      </button>
+                    </div>
+                  </form>
+                )}
               </div>
             )}
           </div>

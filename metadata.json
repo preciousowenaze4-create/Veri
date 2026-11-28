@@ -1,6 +1,6 @@
 {
   "name": "veri-box",
-  "description": "Create and manage custom @veribox.name.ng email addresses and access dedicated SMS phone numbers for secure account verification in one streamlined app.",
+  "description": "Verified personal and professional communication suite, custom domain messaging, and secure workspace accounts.",
   "requestFramePermissions": [],
   "majorCapabilities": [
     "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"

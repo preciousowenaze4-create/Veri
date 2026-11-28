@@ -28,9 +28,11 @@ import type {
   PhoneNumberEntry,
   PlatformFilter,
   PrivateNumberOrder,
+  StrictBanEntry,
   TabId,
   TempEmailAccount,
   UserModerationAction,
+  UserModerationLockoutState,
   WalletTransferRecord,
 } from './types';
 import { parseJsonResponse } from './utils/apiFetch';
@@ -212,7 +214,9 @@ export default function App() {
   const [walletBalance, setWalletBalance] = useState<number>(() =>
     readStorage<number>(STORAGE_KEYS.walletBalance, 0)
   );
+  const [reservedBalance, setReservedBalance] = useState<number>(0);
   const [depositModalOpen, setDepositModalOpen] = useState<boolean>(false);
+  const [moderationLockout, setModerationLockout] = useState<UserModerationLockoutState | null>(null);
 
   // Owner Admin Diagnostics state (only active when signed in as preciousddkid@gmail.com)
   const [adminDiagnostics, setAdminDiagnostics] = useState<AdminDiagnosticsResponse | null>(null);
@@ -223,6 +227,8 @@ export default function App() {
   const [adminTestError, setAdminTestError] = useState<string | null>(null);
   const [profileInitialSubTab, setProfileInitialSubTab] = useState<ProfileSubTab>('account');
   const [adminUsers, setAdminUsers] = useState<AdminManagedUser[]>([]);
+  const [strictBans, setStrictBans] = useState<StrictBanEntry[]>([]);
+  const [banningVisitor, setBanningVisitor] = useState<boolean>(false);
   const [adminUsersLoading, setAdminUsersLoading] = useState<boolean>(false);
   const [adminUsersError, setAdminUsersError] = useState<string | null>(null);
   const [moderatingUserId, setModeratingUserId] = useState<string | null>(null);
@@ -420,6 +426,60 @@ export default function App() {
       return null;
     }
   }, []);
+
+  const handleModerationHttpFailure = useCallback(
+    (
+      status: number,
+      data: {
+        code?: string;
+        error?: string;
+        moderation?: UserModerationLockoutState;
+      }
+    ): boolean => {
+      if (status === 403 && data?.code === 'ACCOUNT_MODERATED') {
+        setModerationLockout(
+          data.moderation || {
+            blocked: true,
+            status: 'banned',
+            reason: data.error || 'Access blocked by administrator.',
+            strict: true,
+          }
+        );
+        return true;
+      }
+      return false;
+    },
+    []
+  );
+
+  const checkModerationStatus = useCallback(async () => {
+    if (isOwnerAdmin) {
+      setModerationLockout(null);
+      return;
+    }
+    try {
+      const token = await getAuthAccessToken();
+      const headers: Record<string, string> = {};
+      if (token) {
+        headers.Authorization = `Bearer ${token}`;
+      }
+      const query = walletUserId ? `?userId=${encodeURIComponent(walletUserId)}` : '';
+      const res = await fetch(`/api/auth/moderation-status${query}`, {
+        cache: 'no-store',
+        headers,
+        signal: AbortSignal.timeout(7000),
+      });
+      if (!res.ok) return;
+      const data = await parseJsonResponse<UserModerationLockoutState>(res);
+      if (data.blocked) {
+        setModerationLockout(data);
+      } else {
+        setModerationLockout(null);
+      }
+    } catch {
+      // Non-blocking
+    }
+  }, [isOwnerAdmin, getAuthAccessToken, walletUserId]);
 
   const fetchAdminDiagnostics = useCallback(
     async (silent = false) => {
@@ -627,11 +687,16 @@ export default function App() {
         headers: { Authorization: `Bearer ${token}` },
         signal: AbortSignal.timeout(9000),
       });
-      const data = await parseJsonResponse<{ users?: AdminManagedUser[]; error?: string }>(res);
+      const data = await parseJsonResponse<{
+        users?: AdminManagedUser[];
+        strictBans?: StrictBanEntry[];
+        error?: string;
+      }>(res);
       if (!res.ok) {
         throw new Error(`HTTP ${res.status}: ${data.error || res.statusText || 'Failed to load users'}`);
       }
       setAdminUsers(Array.isArray(data.users) ? data.users : []);
+      setStrictBans(Array.isArray(data.strictBans) ? data.strictBans : []);
     } catch (err) {
       setAdminUsersError(
         err instanceof Error ? err.message : 'Failed to load registered users'
@@ -642,7 +707,11 @@ export default function App() {
   }, [isOwnerAdmin, getAuthAccessToken]);
 
   const handleModerateUser = useCallback(
-    async (userId: string, action: UserModerationAction) => {
+    async (
+      userId: string,
+      action: UserModerationAction,
+      options?: { reason?: string; strict?: boolean }
+    ) => {
       if (!isOwnerAdmin) return;
       setModeratingUserId(userId);
       setAdminUsersError(null);
@@ -657,13 +726,19 @@ export default function App() {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${token}`,
           },
-          body: JSON.stringify({ action }),
+          body: JSON.stringify({
+            action,
+            reason: options?.reason?.trim() || undefined,
+            strict: options?.strict ?? action === 'ban',
+          }),
           signal: AbortSignal.timeout(9000),
         });
         const data = await parseJsonResponse<{
           ok?: boolean;
           status?: AdminManagedUser['status'];
           emailConfirmed?: boolean;
+          reason?: string | null;
+          strictBanned?: boolean;
           error?: string;
         }>(res);
         if (!res.ok) {
@@ -679,11 +754,22 @@ export default function App() {
                     typeof data.emailConfirmed === 'boolean'
                       ? data.emailConfirmed
                       : u.emailConfirmed,
+                  moderationReason:
+                    typeof data.reason !== 'undefined' ? data.reason : u.moderationReason,
+                  strictBanned:
+                    typeof data.strictBanned === 'boolean'
+                      ? data.strictBanned
+                      : u.strictBanned,
                 }
               : u
           )
         );
-        showToast(`User updated: ${data.status || action}`);
+        showToast(
+          action === 'ban'
+            ? 'User strictly banned & signed out everywhere'
+            : `User updated: ${data.status || action}`
+        );
+        void fetchAdminUsers();
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Failed to update user';
         setAdminUsersError(msg);
@@ -692,7 +778,87 @@ export default function App() {
         setModeratingUserId(null);
       }
     },
-    [isOwnerAdmin, getAuthAccessToken, showToast]
+    [isOwnerAdmin, getAuthAccessToken, showToast, fetchAdminUsers]
+  );
+
+  const handleBanVisitor = useCallback(
+    async (payload: { targetType: 'email' | 'ip'; targetValue: string; reason?: string }) => {
+      if (!isOwnerAdmin) return { ok: false, error: 'Owner access required' };
+      setBanningVisitor(true);
+      setAdminUsersError(null);
+      try {
+        const token = await getAuthAccessToken();
+        if (!token) {
+          throw new Error('HTTP 401: Missing active Supabase session token.');
+        }
+        const res = await fetch('/api/admin/bans', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(9000),
+        });
+        const data = await parseJsonResponse<{
+          ok?: boolean;
+          strictBans?: StrictBanEntry[];
+          error?: string;
+        }>(res);
+        if (!res.ok || !data.ok) {
+          throw new Error(data.error || `HTTP ${res.status}: Failed to apply strict ban`);
+        }
+        if (Array.isArray(data.strictBans)) {
+          setStrictBans(data.strictBans);
+        }
+        showToast(`Strict ${payload.targetType.toUpperCase()} ban applied: ${payload.targetValue}`);
+        void fetchAdminUsers();
+        return { ok: true };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Failed to ban visitor';
+        setAdminUsersError(msg);
+        showToast(msg);
+        return { ok: false, error: msg };
+      } finally {
+        setBanningVisitor(false);
+      }
+    },
+    [isOwnerAdmin, getAuthAccessToken, showToast, fetchAdminUsers]
+  );
+
+  const handleRemoveStrictBan = useCallback(
+    async (banId: string) => {
+      if (!isOwnerAdmin) return;
+      try {
+        const token = await getAuthAccessToken();
+        if (!token) return;
+        const res = await fetch('/api/admin/bans/remove', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ id: banId }),
+          signal: AbortSignal.timeout(9000),
+        });
+        const data = await parseJsonResponse<{
+          ok?: boolean;
+          strictBans?: StrictBanEntry[];
+          error?: string;
+        }>(res);
+        if (!res.ok || !data.ok) {
+          throw new Error(data.error || 'Could not remove ban');
+        }
+        if (Array.isArray(data.strictBans)) {
+          setStrictBans(data.strictBans);
+        }
+        showToast('Strict ban removed');
+        void fetchAdminUsers();
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : 'Could not remove ban');
+      }
+    },
+    [isOwnerAdmin, getAuthAccessToken, showToast, fetchAdminUsers]
   );
 
   const fetchAdminTransfers = useCallback(async () => {
@@ -852,6 +1018,7 @@ export default function App() {
       setAdminTestResult(null);
       setAdminTestError(null);
       setAdminUsers([]);
+      setStrictBans([]);
       setAdminUsersError(null);
       setAdminTransfers([]);
       setAdminTransfersError(null);
@@ -860,6 +1027,25 @@ export default function App() {
       setActiveTab((prev) => (prev === 'admin' ? 'home' : prev));
     }
   }, [isOwnerAdmin, authUser?.id, fetchAdminDiagnostics, fetchAdminUsers, fetchAdminTransfers]);
+
+  useEffect(() => {
+    void checkModerationStatus();
+    const handleFocus = () => {
+      if (document.visibilityState !== 'hidden') {
+        void checkModerationStatus();
+      }
+    };
+    window.addEventListener('focus', handleFocus);
+    const id = window.setInterval(() => {
+      if (document.visibilityState !== 'hidden') {
+        void checkModerationStatus();
+      }
+    }, 25000);
+    return () => {
+      window.clearInterval(id);
+      window.removeEventListener('focus', handleFocus);
+    };
+  }, [checkModerationStatus]);
 
   // Real-time Supabase Postgres subscription for owner admin
   useEffect(() => {
@@ -971,6 +1157,8 @@ export default function App() {
     setEmailError(null);
     setAuthUser(null);
     setWalletBalance(0);
+    setReservedBalance(0);
+    setModerationLockout(null);
     setUserTransfers([]);
     setUserTransfersError(null);
     setAdminDiagnostics(null);
@@ -978,6 +1166,7 @@ export default function App() {
     setAdminTestResult(null);
     setAdminTestError(null);
     setAdminUsers([]);
+    setStrictBans([]);
     setAdminUsersError(null);
     setAdminTransfers([]);
     setAdminTransfersError(null);
@@ -987,7 +1176,8 @@ export default function App() {
     setAuthModalOpen(false);
     setAuthActionReason(null);
     showToast('Signed out');
-  }, [showToast]);
+    void checkModerationStatus();
+  }, [showToast, checkModerationStatus]);
 
   // Hydrate Supabase Auth session and listen for Google OAuth / Email Sign-In events
   useEffect(() => {
@@ -1077,10 +1267,14 @@ export default function App() {
       if (!res.ok) return;
       const data = await parseJsonResponse<{
         balance?: number | null;
+        reservedBalance?: number;
         supabasePersisted?: boolean;
       }>(res);
       if (data.supabasePersisted && typeof data.balance === 'number') {
         setWalletBalance(data.balance);
+      }
+      if (typeof data.reservedBalance === 'number') {
+        setReservedBalance(data.reservedBalance);
       }
     } catch {
       // Keep local balance when offline
@@ -1387,31 +1581,99 @@ export default function App() {
     [walletUserId, showToast]
   );
 
+  const computedLocalHoldNgn = activeOrders.reduce((sum, o) => {
+    const waiting =
+      o.chargeOnCode !== false &&
+      !o.charged &&
+      o.sms.length === 0 &&
+      !['FINISHED', 'CANCELED', 'TIMEOUT', 'BANNED'].includes(o.status);
+    return sum + (waiting ? Math.round(o.price || 0) : 0);
+  }, 0);
+  const effectiveReservedBalance = Math.max(reservedBalance, computedLocalHoldNgn);
+
   const syncOrderIntoState = useCallback(
-    (updated: PrivateNumberOrder) => {
+    (
+      updated: PrivateNumberOrder,
+      serverBalances?: {
+        walletBalance?: number | null;
+        reservedBalance?: number;
+        chargedNow?: boolean;
+        chargedAmount?: number;
+      }
+    ) => {
       const existing =
         activeOrdersRef.current.find((o) => o.id === updated.id) ||
         numberHistoryRef.current.find((o) => o.id === updated.id);
 
       const mergedSms = Array.isArray(updated.sms) ? updated.sms : existing?.sms || [];
       const orderPrice = updated.price ?? existing?.price ?? 0;
+      const isChargeOnCode = updated.chargeOnCode ?? existing?.chargeOnCode ?? true;
+      const wasChargedBefore = Boolean(existing?.charged);
+      const isNowCharged = Boolean(updated.charged) || (mergedSms.length > 0 && wasChargedBefore);
+
+      if (typeof serverBalances?.walletBalance === 'number') {
+        setWalletBalance(serverBalances.walletBalance);
+      }
+      if (typeof serverBalances?.reservedBalance === 'number') {
+        setReservedBalance(serverBalances.reservedBalance);
+      }
 
       if (mergedSms.length > 0 && !notifiedSmsOrderIdsRef.current.has(updated.id)) {
         notifiedSmsOrderIdsRef.current.add(updated.id);
-        showToast('Verification code received! Charge finalized.');
+        const chargedLabel =
+          serverBalances?.chargedAmount && serverBalances.chargedAmount > 0
+            ? ` · ₦${serverBalances.chargedAmount.toLocaleString()} deducted`
+            : orderPrice > 0 && !wasChargedBefore
+              ? ` · ₦${orderPrice.toLocaleString()} deducted`
+              : '';
+        showToast(`Verification code received!${chargedLabel}`);
+
+        if (
+          typeof serverBalances?.walletBalance !== 'number' &&
+          orderPrice > 0 &&
+          !wasChargedBefore &&
+          !updated.charged
+        ) {
+          setWalletBalance((prev) => Math.max(0, prev - orderPrice));
+          void getAuthAccessToken().then((sbToken) => {
+            const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+            if (sbToken) headers.Authorization = `Bearer ${sbToken}`;
+            return fetch('/api/wallet/deduct', {
+              method: 'POST',
+              headers,
+              body: JSON.stringify({
+                userId: walletUserId,
+                amount: orderPrice,
+                reference: `order-${updated.id}`,
+                details: `${existing?.serviceName || updated.serviceName || 'Verification'} private number (${existing?.phone || updated.phone || updated.id})`,
+              }),
+            })
+              .then((r) => parseJsonResponse<{ balance?: number | null }>(r).then((d) => ({ ok: r.ok, d })))
+              .then(({ ok, d }) => {
+                if (ok && typeof d.balance === 'number') {
+                  setWalletBalance(d.balance);
+                }
+              })
+              .catch(() => undefined);
+          });
+        }
       }
 
       if (
         mergedSms.length === 0 &&
         ['CANCELED', 'TIMEOUT', 'BANNED'].includes(updated.status) &&
-        orderPrice > 0 &&
         !autoRefundedOrderIdsRef.current.has(updated.id)
       ) {
-        void refundOrderHold(
-          updated.id,
-          orderPrice,
-          `Order ${updated.status.toLowerCase()} · ₦${orderPrice.toLocaleString()} refunded`
-        );
+        autoRefundedOrderIdsRef.current.add(updated.id);
+        if (!isChargeOnCode && wasChargedBefore && orderPrice > 0) {
+          void refundOrderHold(
+            updated.id,
+            orderPrice,
+            `Order ${updated.status.toLowerCase()} · ₦${orderPrice.toLocaleString()} refunded`
+          );
+        } else {
+          showToast(`Number ${updated.status.toLowerCase()} · Hold released (₦0 charged)`);
+        }
       }
 
       const mergeOrder = (o: PrivateNumberOrder): PrivateNumberOrder => ({
@@ -1430,17 +1692,180 @@ export default function App() {
         expires: updated.expires || o.expires,
         createdAt: o.createdAt || updated.createdAt,
         sms: Array.isArray(updated.sms) ? updated.sms : o.sms,
+        chargeOnCode: updated.chargeOnCode ?? o.chargeOnCode,
+        charged: isNowCharged || Boolean(updated.charged),
+        chargeToken: updated.chargeToken || o.chargeToken,
       });
 
       setActiveOrders((prev) => prev.map((o) => (o.id === updated.id ? mergeOrder(o) : o)));
       setNumberHistory((prev) => prev.map((o) => (o.id === updated.id ? mergeOrder(o) : o)));
     },
-    [refundOrderHold, showToast]
+    [refundOrderHold, showToast, getAuthAccessToken, walletUserId]
+  );
+
+  const acquireNumbersForParams = useCallback(
+    async (params: {
+      provider: NumberProviderId;
+      countryId: string;
+      countryName: string;
+      service: string;
+      serviceName: string;
+      countrySlug: string;
+      countryCode?: string;
+      unitPriceNgn: number;
+      qty: number;
+    }): Promise<PrivateNumberOrder[] | null> => {
+      const availableBalance = Math.max(0, walletBalance - effectiveReservedBalance);
+      const requiredNgn = params.unitPriceNgn * params.qty;
+      if (requiredNgn > 0 && availableBalance < requiredNgn) {
+        setDepositModalOpen(true);
+        showToast(
+          `Insufficient available balance (₦${availableBalance.toLocaleString()}). Required: ₦${requiredNgn.toLocaleString()} — Top up to proceed.`
+        );
+        return null;
+      }
+
+      setAcquiring(true);
+      setAcquireError(null);
+      try {
+        const sbToken = await getAuthAccessToken();
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (sbToken) {
+          headers.Authorization = `Bearer ${sbToken}`;
+        }
+        const res = await fetch('/api/numbers/acquire', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            userId: walletUserId,
+            provider: params.provider,
+            countryId: params.countryId,
+            countryName: params.countryName,
+            service: params.service,
+            serviceName: params.serviceName,
+            country: params.countrySlug,
+            countryCode: params.countryCode,
+            quantity: params.qty,
+            walletBalance,
+          }),
+        });
+        const data = await parseJsonResponse<{
+          orders?: PrivateNumberOrder[];
+          walletBalance?: number | null;
+          reservedBalance?: number;
+          balance?: number;
+          code?: string;
+          moderation?: UserModerationLockoutState;
+          error?: string;
+        }>(res);
+        if (handleModerationHttpFailure(res.status, data)) {
+          throw new Error(data.error || 'Access restricted by administrator.');
+        }
+        if (res.status === 402) {
+          if (typeof data.balance === 'number') {
+            setWalletBalance(data.balance);
+          }
+          setDepositModalOpen(true);
+          throw new Error(data.error || 'Insufficient available wallet balance.');
+        }
+        if (!res.ok || !Array.isArray(data.orders) || data.orders.length === 0) {
+          throw new Error(data.error || 'Could not assign numbers right now.');
+        }
+
+        if (typeof data.walletBalance === 'number') {
+          setWalletBalance(data.walletBalance);
+        }
+        if (typeof data.reservedBalance === 'number') {
+          setReservedBalance(data.reservedBalance);
+        }
+
+        const preparedOrders: PrivateNumberOrder[] = data.orders.map((ord) => ({
+          ...ord,
+          charged: false,
+          chargeOnCode: true,
+        }));
+
+        setActiveOrders((prev) => {
+          const newIds = new Set(preparedOrders.map((o) => o.id));
+          return [...preparedOrders, ...prev.filter((o) => !newIds.has(o.id))];
+        });
+        setSelectedOrderId(preparedOrders[0].id);
+        setNumberHistory((prev) => {
+          const existingIds = new Set(preparedOrders.map((o) => o.id));
+          return [...preparedOrders, ...prev.filter((o) => !existingIds.has(o.id))].slice(0, 50);
+        });
+        setNumbersViewMode('receiver');
+        showToast(
+          preparedOrders.length === 1
+            ? `Assigned ${preparedOrders[0].phone} (₦0 charged until SMS arrives)`
+            : `Assigned ${preparedOrders.length} numbers (₦0 charged until SMS arrives)`
+        );
+        return preparedOrders;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Unable to assign numbers';
+        setAcquireError(msg);
+        showToast(msg);
+        return null;
+      } finally {
+        setAcquiring(false);
+      }
+    },
+    [walletBalance, effectiveReservedBalance, walletUserId, getAuthAccessToken, handleModerationHttpFailure, showToast]
+  );
+
+  const handleCheckOrder = useCallback(
+    async (orderId: number, providerOverride?: NumberProviderId, tokenOverride?: string) => {
+      const matched =
+        activeOrdersRef.current.find((o) => o.id === orderId) ||
+        numberHistoryRef.current.find((o) => o.id === orderId);
+      const provider = providerOverride || matched?.provider || 'fivesim';
+      const chargeToken = tokenOverride || matched?.chargeToken;
+      try {
+        const sbToken = await getAuthAccessToken();
+        const headers: Record<string, string> = {};
+        if (sbToken) {
+          headers.Authorization = `Bearer ${sbToken}`;
+        }
+        const qs = new URLSearchParams({
+          provider,
+          userId: walletUserId,
+        });
+        if (chargeToken) {
+          qs.set('chargeToken', chargeToken);
+        }
+        const res = await fetch(`/api/numbers/check/${orderId}?${qs.toString()}`, {
+          headers,
+        });
+        const data = await parseJsonResponse<{
+          order?: PrivateNumberOrder;
+          walletBalance?: number | null;
+          reservedBalance?: number;
+          chargedNow?: boolean;
+          chargedAmount?: number;
+          code?: string;
+          moderation?: UserModerationLockoutState;
+          error?: string;
+        }>(res);
+        if (handleModerationHttpFailure(res.status, data)) {
+          return;
+        }
+        if (res.ok && data.order) {
+          syncOrderIntoState(data.order, {
+            walletBalance: data.walletBalance,
+            reservedBalance: data.reservedBalance,
+            chargedNow: data.chargedNow,
+            chargedAmount: data.chargedAmount,
+          });
+        }
+      } catch {
+        // Non-blocking
+      }
+    },
+    [syncOrderIntoState, getAuthAccessToken, walletUserId, handleModerationHttpFailure]
   );
 
   const handleAcquireNumbers = useCallback(async () => {
     if (!selectedService || !selectedCountry) return;
-
     const chosenProvider: NumberProviderId =
       selectedProviderQuote?.provider ||
       selectedCountry.providers?.[0]?.provider ||
@@ -1455,185 +1880,103 @@ export default function App() {
       selectedProviderQuote?.inStockMinPrice ||
       selectedCountry.inStockMinPrice ||
       0;
-    const requiredNgn = unitPriceNgn * quantity;
-    if (walletBalance < requiredNgn) {
-      setDepositModalOpen(true);
-      showToast(
-        `Insufficient wallet balance (₦${walletBalance.toLocaleString()}). Required: ₦${requiredNgn.toLocaleString()} - Please deposit to proceed.`
-      );
-      return;
+
+    const acquired = await acquireNumbersForParams({
+      provider: chosenProvider,
+      countryId: chosenCountryId,
+      countryName: selectedCountry.country,
+      service: selectedService.id,
+      serviceName: selectedService.name,
+      countrySlug: selectedCountry.slug,
+      countryCode: selectedCountry.countryCode,
+      unitPriceNgn,
+      qty: quantity,
+    });
+    if (acquired?.[0]) {
+      void handleCheckOrder(acquired[0].id, acquired[0].provider || 'fivesim', acquired[0].chargeToken);
     }
-
-    setAcquiring(true);
-    setAcquireError(null);
-    try {
-      const res = await fetch('/api/numbers/acquire', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          userId: walletUserId,
-          provider: chosenProvider,
-          countryId: chosenCountryId,
-          countryName: selectedCountry.country,
-          service: selectedService.id,
-          serviceName: selectedService.name,
-          country: selectedCountry.slug,
-          countryCode: selectedCountry.countryCode,
-          quantity,
-          walletBalance,
-        }),
-      });
-      const data = await parseJsonResponse<{
-        orders?: PrivateNumberOrder[];
-        balance?: number;
-        error?: string;
-      }>(res);
-      if (res.status === 402) {
-        if (typeof data.balance === 'number') {
-          setWalletBalance(data.balance);
-        }
-        setDepositModalOpen(true);
-        throw new Error(data.error || 'Insufficient wallet balance for live operator price.');
-      }
-      if (!res.ok || !Array.isArray(data.orders) || data.orders.length === 0) {
-        throw new Error(data.error || 'Could not assign numbers right now.');
-      }
-
-      const actualChargedNgn = data.orders.reduce(
-        (sum, ord) => sum + (typeof ord.price === 'number' && ord.price > 0 ? ord.price : unitPriceNgn),
-        0
-      );
-
-      setWalletBalance((prev) => Math.max(0, prev - actualChargedNgn));
-      if (actualChargedNgn > 0) {
-        void fetch('/api/wallet/deduct', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            userId: walletUserId,
-            amount: actualChargedNgn,
-            reference: `order-${data.orders[0].id}`,
-          }),
-        })
-          .then((r) => parseJsonResponse<{ balance?: number | null }>(r).then((d) => ({ ok: r.ok, d })))
-          .then(({ ok, d }) => {
-            if (ok && typeof d.balance === 'number') {
-              setWalletBalance(d.balance);
-            }
-          })
-          .catch(() => undefined);
-      }
-
-      setActiveOrders((prev) => {
-        const newIds = new Set(data.orders!.map((o) => o.id));
-        return [...data.orders!, ...prev.filter((o) => !newIds.has(o.id))];
-      });
-      setSelectedOrderId(data.orders[0].id);
-      setNumberHistory((prev) => {
-        const existingIds = new Set(data.orders!.map((o) => o.id));
-        return [...data.orders!, ...prev.filter((o) => !existingIds.has(o.id))].slice(0, 50);
-      });
-      setNumbersViewMode('receiver');
-      // Immediately kick off a check on acquired numbers so incoming codes show with zero delay
-      void handleCheckOrder(data.orders[0].id, data.orders[0].provider || 'fivesim');
-      showToast(
-        data.orders.length === 1
-          ? `Assigned ${data.orders[0].phone} (₦${actualChargedNgn.toLocaleString()} deducted)`
-          : `Assigned ${data.orders.length} numbers (₦${actualChargedNgn.toLocaleString()} deducted)`
-      );
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Unable to assign numbers';
-      setAcquireError(msg);
-      showToast(msg);
-    } finally {
-      setAcquiring(false);
-    }
-  }, [
-    selectedCountry,
-    selectedProviderQuote,
-    selectedService,
-    quantity,
-    walletBalance,
-    walletUserId,
-    showToast,
-  ]);
-
-  const handleCheckOrder = useCallback(
-    async (orderId: number, providerOverride?: NumberProviderId) => {
-      const matched =
-        activeOrders.find((o) => o.id === orderId) ||
-        numberHistory.find((o) => o.id === orderId);
-      const provider = providerOverride || matched?.provider || 'fivesim';
-      try {
-        const res = await fetch(
-          `/api/numbers/check/${orderId}?provider=${encodeURIComponent(provider)}`
-        );
-        const data = await parseJsonResponse<{ order?: PrivateNumberOrder; error?: string }>(res);
-        if (res.ok && data.order) {
-          syncOrderIntoState(data.order);
-        }
-      } catch {
-        // Non-blocking
-      }
-    },
-    [activeOrders, numberHistory, syncOrderIntoState]
-  );
+  }, [selectedService, selectedCountry, selectedProviderQuote, quantity, acquireNumbersForParams, handleCheckOrder]);
 
   const handleCancelOrder = useCallback(
-    async (orderId: number) => {
-      const targetOrder = activeOrders.find((o) => o.id === orderId);
+    async (orderId: number, suppressNavigateSetup = false): Promise<boolean> => {
+      const targetOrder = activeOrdersRef.current.find((o) => o.id === orderId);
       const provider = targetOrder?.provider || 'fivesim';
       try {
+        const sbToken = await getAuthAccessToken();
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (sbToken) {
+          headers.Authorization = `Bearer ${sbToken}`;
+        }
         const res = await fetch(
           `/api/numbers/cancel/${orderId}?provider=${encodeURIComponent(provider)}`,
           {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers,
             body: JSON.stringify({
               userId: walletUserId,
               refundAmount: targetOrder?.price || 0,
+              chargeToken: targetOrder?.chargeToken,
+              wasCharged: Boolean(targetOrder?.charged && targetOrder?.chargeOnCode === false),
             }),
           }
         );
         const data = await parseJsonResponse<{
           cancelled?: boolean;
+          holdReleased?: boolean;
           alreadyHasSms?: boolean;
           refunded?: boolean;
           refundedAmount?: number;
           walletBalance?: number | null;
+          reservedBalance?: number;
           order?: PrivateNumberOrder;
+          code?: string;
+          moderation?: UserModerationLockoutState;
           error?: string;
         }>(res);
 
+        if (handleModerationHttpFailure(res.status, data)) {
+          return false;
+        }
+
         if (res.status === 409 && data.alreadyHasSms) {
           if (data.order) {
-            syncOrderIntoState(data.order);
+            syncOrderIntoState(data.order, {
+              walletBalance: data.walletBalance,
+              reservedBalance: data.reservedBalance,
+            });
           }
           showToast(data.error || 'Verification code already arrived — charge finalized.');
-          return;
+          return false;
         }
 
         if (!res.ok) {
           throw new Error(data.error || 'Could not cancel number session');
         }
 
+        autoRefundedOrderIdsRef.current.add(orderId);
+        if (typeof data.walletBalance === 'number') {
+          setWalletBalance(data.walletBalance);
+        }
+        if (typeof data.reservedBalance === 'number') {
+          setReservedBalance(data.reservedBalance);
+        }
+
         if (data.order) {
-          autoRefundedOrderIdsRef.current.add(orderId);
-          syncOrderIntoState(data.order);
+          syncOrderIntoState(data.order, {
+            walletBalance: data.walletBalance,
+            reservedBalance: data.reservedBalance,
+          });
         } else {
           setNumberHistory((prev) =>
             prev.map((o) => (o.id === orderId ? { ...o, status: 'CANCELED' } : o))
           );
         }
 
-        if (typeof data.walletBalance === 'number') {
-          autoRefundedOrderIdsRef.current.add(orderId);
-          setWalletBalance(data.walletBalance);
-        } else if (
-          targetOrder &&
-          targetOrder.sms.length === 0 &&
-          targetOrder.price &&
-          !autoRefundedOrderIdsRef.current.has(orderId)
+        if (
+          !data.holdReleased &&
+          data.refunded &&
+          typeof data.walletBalance !== 'number' &&
+          targetOrder?.price
         ) {
           await refundOrderHold(targetOrder.id, targetOrder.price);
         }
@@ -1641,23 +1984,66 @@ export default function App() {
         setActiveOrders((prev) => {
           const remaining = prev.filter((o) => o.id !== orderId);
           setSelectedOrderId((curr) => (curr === orderId ? remaining[0]?.id ?? null : curr));
-          if (remaining.length === 0) {
+          if (remaining.length === 0 && !suppressNavigateSetup) {
             setNumbersViewMode('setup');
           }
           return remaining;
         });
 
-        const refundedAmt = data.refundedAmount || (targetOrder?.sms.length === 0 ? targetOrder?.price : 0) || 0;
-        showToast(
-          refundedAmt > 0
-            ? `Number cancelled · ₦${refundedAmt.toLocaleString()} refunded`
-            : 'Number session cancelled'
-        );
+        const refundedAmt = data.refundedAmount || 0;
+        if (refundedAmt > 0) {
+          showToast(`Number cancelled · ₦${refundedAmt.toLocaleString()} refunded`);
+        } else if (!suppressNavigateSetup) {
+          showToast('Number cancelled · Hold released (₦0 charged)');
+        }
+        return true;
       } catch (err) {
         showToast(err instanceof Error ? err.message : 'Could not cancel number session');
+        return false;
       }
     },
-    [activeOrders, syncOrderIntoState, walletUserId, refundOrderHold, showToast]
+    [walletUserId, getAuthAccessToken, handleModerationHttpFailure, syncOrderIntoState, refundOrderHold, showToast]
+  );
+
+  const handleSwapNumber = useCallback(
+    async (order: PrivateNumberOrder) => {
+      const isWaiting =
+        order.sms.length === 0 && ['PENDING', 'RECEIVED'].includes(order.status);
+      if (isWaiting) {
+        const ok = await handleCancelOrder(order.id, true);
+        if (!ok) return;
+      }
+
+      const provider = order.provider || 'fivesim';
+      const matchingCountry =
+        countries.find(
+          (c) =>
+            c.slug.toLowerCase() === order.country.toLowerCase() ||
+            c.country.toLowerCase() === order.country.toLowerCase() ||
+            (order.countryCode && c.countryCode.toUpperCase() === order.countryCode.toUpperCase())
+        ) || selectedCountry;
+      const matchingQuote = matchingCountry?.providers?.find((p) => p.provider === provider);
+      const countryId =
+        matchingQuote?.countryId ||
+        matchingCountry?.slug ||
+        order.country.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+      const fresh = await acquireNumbersForParams({
+        provider,
+        countryId,
+        countryName: order.country,
+        service: order.service,
+        serviceName: order.serviceName,
+        countrySlug: matchingCountry?.slug || countryId,
+        countryCode: order.countryCode || matchingCountry?.countryCode,
+        unitPriceNgn: order.price || matchingQuote?.minPrice || 0,
+        qty: 1,
+      });
+      if (fresh?.[0]) {
+        void handleCheckOrder(fresh[0].id, fresh[0].provider || 'fivesim', fresh[0].chargeToken);
+      }
+    },
+    [handleCancelOrder, countries, selectedCountry, acquireNumbersForParams, handleCheckOrder]
   );
 
   const handleFinishOrder = useCallback(
@@ -1667,11 +2053,23 @@ export default function App() {
         numberHistory.find((o) => o.id === orderId);
       const provider = targetOrder?.provider || 'fivesim';
       try {
+        const sbToken = await getAuthAccessToken();
+        const headers: Record<string, string> = {};
+        if (sbToken) {
+          headers.Authorization = `Bearer ${sbToken}`;
+        }
         const res = await fetch(
           `/api/numbers/finish/${orderId}?provider=${encodeURIComponent(provider)}`,
-          { method: 'POST' }
+          { method: 'POST', headers }
         );
-        const data = await parseJsonResponse<{ order?: PrivateNumberOrder }>(res);
+        const data = await parseJsonResponse<{
+          order?: PrivateNumberOrder;
+          code?: string;
+          moderation?: UserModerationLockoutState;
+        }>(res);
+        if (handleModerationHttpFailure(res.status, data)) {
+          return;
+        }
         if (res.ok && data.order) {
           syncOrderIntoState(data.order);
         }
@@ -1680,7 +2078,7 @@ export default function App() {
         showToast('Could not complete session');
       }
     },
-    [activeOrders, numberHistory, syncOrderIntoState, showToast]
+    [activeOrders, numberHistory, getAuthAccessToken, handleModerationHttpFailure, syncOrderIntoState, showToast]
   );
 
   const handleReuseFromHistory = useCallback(
@@ -1691,7 +2089,7 @@ export default function App() {
       });
       setSelectedOrderId(order.id);
       setNumbersViewMode('receiver');
-      void handleCheckOrder(order.id, order.provider || 'fivesim');
+      void handleCheckOrder(order.id, order.provider || 'fivesim', order.chargeToken);
     },
     [handleCheckOrder]
   );
@@ -1721,18 +2119,32 @@ export default function App() {
     }
 
     const provider = selectedOrder.provider || 'fivesim';
-    const es = new EventSource(
-      `/api/numbers/stream/${selectedOrder.id}?provider=${encodeURIComponent(provider)}`
-    );
+    const qs = new URLSearchParams({
+      provider,
+      userId: walletUserId,
+    });
+    if (selectedOrder.chargeToken) {
+      qs.set('chargeToken', selectedOrder.chargeToken);
+    }
+    const es = new EventSource(`/api/numbers/stream/${selectedOrder.id}?${qs.toString()}`);
     es.onopen = () => setStreamConnected(true);
     es.onmessage = (event) => {
       try {
         const payload = JSON.parse(event.data) as {
           type?: string;
           order?: PrivateNumberOrder;
+          walletBalance?: number | null;
+          reservedBalance?: number;
+          chargedNow?: boolean;
+          chargedAmount?: number;
         };
         if (payload.type === 'order' && payload.order) {
-          syncOrderIntoState(payload.order);
+          syncOrderIntoState(payload.order, {
+            walletBalance: payload.walletBalance,
+            reservedBalance: payload.reservedBalance,
+            chargedNow: payload.chargedNow,
+            chargedAmount: payload.chargedAmount,
+          });
         }
       } catch {
         // Ignore parse glitch
@@ -1750,6 +2162,8 @@ export default function App() {
     selectedOrder?.id,
     selectedOrder?.provider,
     selectedOrder?.status,
+    selectedOrder?.chargeToken,
+    walletUserId,
     syncOrderIntoState,
   ]);
 
@@ -2031,6 +2445,68 @@ export default function App() {
       }
     },
     [activeEmail, getAuthAccessToken, showToast]
+  );
+
+  const handleSendEmail = useCallback(
+    async (payload: {
+      fromAddress: string;
+      toAddress: string;
+      subject: string;
+      text: string;
+    }): Promise<{ ok: boolean; id?: string | null; error?: string }> => {
+      try {
+        const sbToken = await getAuthAccessToken();
+        const matchingAcct =
+          activeEmail?.address.toLowerCase() === payload.fromAddress.toLowerCase()
+            ? activeEmail
+            : savedEmails.find(
+                (e) => e.address.toLowerCase() === payload.fromAddress.toLowerCase()
+              ) || null;
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+          'x-email-address': payload.fromAddress,
+        };
+        if (matchingAcct?.token) {
+          headers.Authorization = `Bearer ${matchingAcct.token}`;
+        } else if (sbToken) {
+          headers.Authorization = `Bearer ${sbToken}`;
+        }
+        if (sbToken) {
+          headers['x-supabase-token'] = sbToken;
+        }
+
+        const res = await fetch('/api/email/send', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(12000),
+        });
+        const data = await parseJsonResponse<{
+          ok?: boolean;
+          id?: string | null;
+          error?: string;
+        }>(res);
+        if (!res.ok || !data.ok) {
+          return {
+            ok: false,
+            error: data.error || `HTTP ${res.status}: Failed to send email`,
+          };
+        }
+        showToast(`Email sent to ${payload.toAddress}`);
+        return { ok: true, id: data.id || null };
+      } catch (err) {
+        return {
+          ok: false,
+          error:
+            err instanceof Error
+              ? err.name === 'TimeoutError' || err.name === 'AbortError'
+                ? 'Request timed out while sending email'
+                : err.message
+              : 'Failed to send email',
+        };
+      }
+    },
+    [activeEmail, savedEmails, getAuthAccessToken, showToast]
   );
 
   useEffect(() => {
@@ -2525,6 +3001,59 @@ export default function App() {
         </div>
       )}
 
+      {moderationLockout?.blocked && moderationLockout.status !== 'restricted' && !isOwnerAdmin ? (
+        <main className="mx-auto flex min-h-[75vh] w-full max-w-lg items-center justify-center px-4 py-10">
+          <div className="w-full rounded-3xl border-2 border-rose-500/60 bg-white p-6 text-center shadow-2xl dark:bg-[#14120D]">
+            <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-rose-500/15 text-rose-500">
+              <ShieldAlert className="h-7 w-7" />
+            </div>
+            <p className="mt-3 text-[11px] font-extrabold uppercase tracking-wider text-rose-600 dark:text-rose-400">
+              Account {moderationLockout.status}
+              {moderationLockout.matchType ? ` · ${moderationLockout.matchType.toUpperCase()} Block` : ''}
+            </p>
+            <h1 className="mt-1 font-display text-xl font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
+              Access Suspended by Administrator
+            </h1>
+            <p className="mt-2 rounded-xl border border-rose-500/25 bg-rose-500/10 p-3 text-xs font-medium text-rose-700 dark:text-rose-200">
+              {moderationLockout.reason ||
+                'Your access to VeriBox has been disabled by the platform owner.'}
+            </p>
+            <div className="mt-5 flex flex-wrap items-center justify-center gap-2.5">
+              {isAuthenticated && (
+                <button
+                  type="button"
+                  onClick={() => void handleSignOut()}
+                  className="rounded-xl border border-rose-500/35 px-4 py-2 text-xs font-bold text-rose-600 hover:bg-rose-500/10 dark:text-rose-300"
+                >
+                  Sign Out
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => void checkModerationStatus()}
+                className="inline-flex items-center gap-1.5 rounded-xl bg-[#D4AF37] px-4 py-2 text-xs font-extrabold text-[#0A0906] hover:bg-[#E5C150]"
+              >
+                <RefreshCw className="h-3.5 w-3.5" />
+                <span>Re-check Access</span>
+              </button>
+            </div>
+          </div>
+        </main>
+      ) : (
+        <>
+          {moderationLockout?.blocked && moderationLockout.status === 'restricted' && !isOwnerAdmin && (
+            <div className="mx-auto mt-3 w-full max-w-7xl px-3 sm:px-6">
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-amber-500/50 bg-amber-500/10 px-4 py-2.5 text-xs font-semibold text-amber-800 dark:text-amber-200">
+                <div className="flex items-center gap-2">
+                  <AlertTriangle className="h-4 w-4 shrink-0 text-amber-500" />
+                  <span>
+                    Your account is currently restricted: {moderationLockout.reason || 'Purchases and email actions are paused by the owner.'}
+                  </span>
+                </div>
+              </div>
+            </div>
+          )}
+
       <main className="mx-auto w-full max-w-7xl px-3 pb-24 pt-3 sm:px-6 sm:pt-5">
         {activeTab === 'home' && (
           <HomeEmailTab
@@ -2583,6 +3112,13 @@ export default function App() {
                 void handleDeleteEmailMessage(id);
               })
             }
+            onSendEmail={(payload) => {
+              if (!isAuthenticated) {
+                openAuthModal('Sign in to send emails from VeriBox');
+                return Promise.resolve({ ok: false, error: 'Sign in required' });
+              }
+              return handleSendEmail(payload);
+            }}
             onCopyText={handleCopyText}
           />
         )}
@@ -2648,6 +3184,7 @@ export default function App() {
             lowestDealsLoading={lowestDealsLoading}
             quantity={quantity}
             walletBalance={walletBalance}
+            reservedBalance={effectiveReservedBalance}
             activeOrders={activeOrders}
             selectedOrder={selectedOrder}
             acquiring={acquiring}
@@ -2705,6 +3242,11 @@ export default function App() {
             onSelectOrder={(ord) => setSelectedOrderId(ord.id)}
             onCheckOrder={(id) => void handleCheckOrder(id)}
             onCancelOrder={(id) => void handleCancelOrder(id)}
+            onSwapNumber={(ord) =>
+              requireAuth('Sign in to swap to a fresh phone number', () => {
+                void handleSwapNumber(ord);
+              })
+            }
             onFinishOrder={(id) => void handleFinishOrder(id)}
             onReuseFromHistory={handleReuseFromHistory}
             onDeleteFromHistory={handleDeleteFromHistory}
@@ -2716,6 +3258,10 @@ export default function App() {
           <ImageGenTab
             isOwnerAdmin={isOwnerAdmin}
             isAuthenticated={isAuthenticated}
+            getAuthToken={getAuthAccessToken}
+            onModerationBlocked={(status, payload) => {
+              handleModerationHttpFailure(status, payload);
+            }}
             onRequireAuth={(reason) =>
               openAuthModal(reason || 'Sign in to generate free AI images')
             }
@@ -2752,6 +3298,8 @@ export default function App() {
             adminLoading={adminLoading}
             adminError={adminError}
             adminUsers={isOwnerAdmin ? adminUsers : []}
+            strictBans={isOwnerAdmin ? strictBans : []}
+            banningVisitor={banningVisitor}
             adminUsersLoading={adminUsersLoading}
             adminUsersError={adminUsersError}
             moderatingUserId={moderatingUserId}
@@ -2808,13 +3356,18 @@ export default function App() {
             }
             onRefreshAdminUsers={isOwnerAdmin ? () => void fetchAdminUsers() : undefined}
             onModerateUser={
-              isOwnerAdmin ? (userId, action) => void handleModerateUser(userId, action) : undefined
+              isOwnerAdmin
+                ? (userId, action, options) => void handleModerateUser(userId, action, options)
+                : undefined
             }
+            onBanVisitor={isOwnerAdmin ? handleBanVisitor : undefined}
+            onRemoveStrictBan={isOwnerAdmin ? (id) => void handleRemoveStrictBan(id) : undefined}
             onRefreshAdminTransfers={isOwnerAdmin ? () => void fetchAdminTransfers() : undefined}
             onClearAdminAlerts={isOwnerAdmin ? () => void clearAdminAlerts() : undefined}
             onTestInbound={
               isOwnerAdmin ? (addr) => void handleTestInboundPipeline(addr) : undefined
             }
+            onSendEmail={isOwnerAdmin ? handleSendEmail : undefined}
           />
         )}
       </main>
@@ -2837,6 +3390,8 @@ export default function App() {
           setActiveTab(tab);
         }}
       />
+        </>
+      )}
     </div>
   );
 }

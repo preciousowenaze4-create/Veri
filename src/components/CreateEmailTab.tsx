@@ -1,18 +1,23 @@
 import { useEffect, useRef, useState } from 'react';
 import {
+  AlertTriangle,
   ArrowLeft,
   ArrowRight,
   Briefcase,
   Check,
   ChevronDown,
+  ChevronUp,
+  Dices,
   Eye,
   EyeOff,
+  Info,
   Loader2,
   Lock,
   Mail,
   RotateCw,
   Shield,
   ShieldCheck,
+  Sparkles,
   User,
   Wallet,
   X,
@@ -21,7 +26,9 @@ import type { AccountMode, EmailSuggestionOption, TempEmailAccount } from '../ty
 import { parseJsonResponse } from '../utils/apiFetch';
 import {
   CUSTOM_EMAIL_DOMAIN,
+  evaluateIdentityTrust,
   generateCustomDomainSuggestions,
+  getRandomRealisticPair,
   normalizeCustomUsername,
 } from '../utils/directEmailFallback';
 import { ensureSupabaseClient, getActiveSupabaseClient } from '../utils/supabase';
@@ -549,6 +556,22 @@ export function CreateEmailTab({
       setIsBrowserLoading(false);
       setTimeout(() => setBrowserProgress(0), 200);
     }
+  };
+
+  const [showAntiBanGuide, setShowAntiBanGuide] = useState(false);
+
+  const handleShuffleRealisticNames = () => {
+    const pair = getRandomRealisticPair();
+    const cleanFirst = pair.first;
+    const cleanLast = pair.last;
+    setFirstName(cleanFirst.charAt(0).toUpperCase() + cleanFirst.slice(1));
+    setLastName(cleanLast.charAt(0).toUpperCase() + cleanLast.slice(1));
+    const nextOptions = generateCustomDomainSuggestions(cleanFirst, cleanLast, activeDomain);
+    setOptions(nextOptions);
+    setSelectedOption(nextOptions[0]);
+    setCustomUsername('');
+    setCustomStatus(null);
+    onShowToast(`Loaded high-trust identity: ${cleanFirst}.${cleanLast}`);
   };
 
   const handleCheckCustomUsername = async (): Promise<EmailSuggestionOption | null> => {
@@ -1454,6 +1477,21 @@ export function CreateEmailTab({
                   </div>
                 )}
 
+                <div className="flex items-center justify-between gap-2 pt-1">
+                  <p className="text-xs font-bold text-[#1A160D] dark:text-[#FAF6EC] flex items-center gap-1.5">
+                    <Sparkles className="h-3.5 w-3.5 text-[#D4AF37]" />
+                    <span>Recommended High-Trust Addresses</span>
+                  </p>
+                  <button
+                    type="button"
+                    onClick={handleShuffleRealisticNames}
+                    className="inline-flex items-center gap-1 text-[11px] font-extrabold text-[#8A6208] hover:text-[#D4AF37] cursor-pointer dark:text-[#F5D77A]"
+                  >
+                    <Dices className="h-3.5 w-3.5" />
+                    <span>Shuffle Names</span>
+                  </button>
+                </div>
+
                 <div className="divide-y divide-[#D4AF37]/15 overflow-hidden rounded-2xl border border-[#D4AF37]/25 bg-[#FAF7F0]/70 dark:bg-[#0A0906]">
                   {options.map((opt) => {
                     const isSelected = selectedOption?.id === opt.id;
@@ -1578,6 +1616,71 @@ export function CreateEmailTab({
                           <span>Use {customStatus.suggestedAlternative}</span>
                         </button>
                       )}
+                    </div>
+                  )}
+                </div>
+
+                {/* Identity Trust Evaluation Pill */}
+                {selectedOption && (() => {
+                  const trust = evaluateIdentityTrust(selectedOption.username);
+                  return (
+                    <div
+                      className={`rounded-xl border p-2.5 text-xs space-y-1 ${
+                        trust.isSocialSafe
+                          ? 'border-emerald-500/35 bg-emerald-500/10 text-emerald-800 dark:text-emerald-300'
+                          : 'border-amber-500/35 bg-amber-500/10 text-amber-800 dark:text-amber-200'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-1.5 font-bold">
+                          {trust.isSocialSafe ? (
+                            <ShieldCheck className="h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                          ) : (
+                            <AlertTriangle className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+                          )}
+                          <span>{trust.label}</span>
+                        </div>
+                        <span className="font-mono text-[10px] font-extrabold rounded px-1.5 py-0.5 bg-black/5 dark:bg-white/10">
+                          {trust.score}% Trust Score
+                        </span>
+                      </div>
+                      {trust.reasons[0] && (
+                        <p className="text-[11px] opacity-90 leading-relaxed">
+                          {trust.reasons[0]}
+                        </p>
+                      )}
+                    </div>
+                  );
+                })()}
+
+                {/* Social Anti-Ban Tips accordion */}
+                <div className="rounded-xl border border-[#D4AF37]/25 bg-[#FAF7F0] p-2.5 dark:bg-[#0B0A07]">
+                  <button
+                    type="button"
+                    onClick={() => setShowAntiBanGuide((prev) => !prev)}
+                    className="flex w-full items-center justify-between text-xs font-bold text-[#6E6552] hover:text-[#1A160D] cursor-pointer dark:text-[#A89F8C] dark:hover:text-[#FAF6EC]"
+                  >
+                    <span className="flex items-center gap-1.5">
+                      <Shield className="h-3.5 w-3.5 text-[#D4AF37]" />
+                      <span>Facebook &amp; Instagram Anti-Ban Guide</span>
+                    </span>
+                    {showAntiBanGuide ? (
+                      <ChevronUp className="h-3.5 w-3.5" />
+                    ) : (
+                      <ChevronDown className="h-3.5 w-3.5" />
+                    )}
+                  </button>
+                  {showAntiBanGuide && (
+                    <div className="mt-2 space-y-1.5 text-[11px] text-[#6E6552] dark:text-[#A89F8C] pt-1 border-t border-[#D4AF37]/15">
+                      <p>
+                        <strong>1. Use Incognito / Fresh Browser:</strong> If Facebook recently refreshed or blocked a signup, old tracking cookies will auto-ban new accounts. Always open a fresh Incognito tab.
+                      </p>
+                      <p>
+                        <strong>2. Use Mobile 4G/5G Hotspot:</strong> Cellular carrier IP addresses have the highest trust rating with Meta. Avoid VPNs or dirty shared Wi-Fi IPs.
+                      </p>
+                      <p>
+                        <strong>3. Match Name on Facebook:</strong> Set the First &amp; Last Name on your Facebook profile to match your chosen email address.
+                      </p>
                     </div>
                   )}
                 </div>

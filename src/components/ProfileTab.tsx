@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import {
+  AlertTriangle,
   ArrowDownLeft,
   ArrowLeft,
   ArrowLeftRight,
@@ -42,6 +43,7 @@ import type {
   AdminTransferRecord,
   CopiedOtpRecord,
   PhoneNumberEntry,
+  StrictBanEntry,
   TempEmailAccount,
   UserModerationAction,
   UserModerationStatus,
@@ -76,6 +78,8 @@ interface ProfileTabProps {
   adminLoading?: boolean;
   adminError?: string | null;
   adminUsers?: AdminManagedUser[];
+  strictBans?: StrictBanEntry[];
+  banningVisitor?: boolean;
   adminUsersLoading?: boolean;
   adminUsersError?: string | null;
   moderatingUserId?: string | null;
@@ -105,10 +109,26 @@ interface ProfileTabProps {
   onOpenDeposit?: () => void;
   onRefreshAdmin?: () => void;
   onRefreshAdminUsers?: () => void;
-  onModerateUser?: (userId: string, action: UserModerationAction) => void;
+  onModerateUser?: (
+    userId: string,
+    action: UserModerationAction,
+    options?: { reason?: string; strict?: boolean }
+  ) => void;
+  onBanVisitor?: (payload: {
+    targetType: 'email' | 'ip';
+    targetValue: string;
+    reason?: string;
+  }) => Promise<{ ok: boolean; error?: string }>;
+  onRemoveStrictBan?: (banId: string) => void;
   onRefreshAdminTransfers?: () => void;
   onClearAdminAlerts?: () => void;
   onTestInbound?: (targetAddress: string) => void;
+  onSendEmail?: (payload: {
+    fromAddress: string;
+    toAddress: string;
+    subject: string;
+    text: string;
+  }) => Promise<{ ok: boolean; id?: string | null; error?: string }>;
 }
 
 type UserTransferFilter = 'all' | 'sent' | 'received' | 'deposit' | 'debit';
@@ -137,6 +157,8 @@ export function ProfileTab({
   adminLoading = false,
   adminError = null,
   adminUsers = [],
+  strictBans = [],
+  banningVisitor = false,
   adminUsersLoading = false,
   adminUsersError = null,
   moderatingUserId = null,
@@ -163,9 +185,12 @@ export function ProfileTab({
   onRefreshAdmin,
   onRefreshAdminUsers,
   onModerateUser,
+  onBanVisitor,
+  onRemoveStrictBan,
   onRefreshAdminTransfers,
   onClearAdminAlerts,
   onTestInbound,
+  onSendEmail,
 }: ProfileTabProps) {
   const [subTab, setSubTab] = useState<ProfileSubTab>(
     initialSubTab === 'admin' && isOwnerAdmin ? 'admin' : initialSubTab
@@ -203,18 +228,69 @@ export function ProfileTab({
   // Owner Admin Console state
   const [userSearch, setUserSearch] = useState('');
   const [userStatusFilter, setUserStatusFilter] = useState<'all' | UserModerationStatus>('all');
+  const [moderationReasonInput, setModerationReasonInput] = useState('');
+  const [visitorBanType, setVisitorBanType] = useState<'email' | 'ip'>('ip');
+  const [visitorBanValue, setVisitorBanValue] = useState('');
+  const [visitorBanReason, setVisitorBanReason] = useState('');
+  const [visitorBanFeedback, setVisitorBanFeedback] = useState<{
+    type: 'success' | 'error';
+    text: string;
+  } | null>(null);
   const [adminTransferSearch, setAdminTransferSearch] = useState('');
   const [adminTransferFilter, setAdminTransferFilter] = useState<AdminTransferFilter>('all');
   const [showInboundTools, setShowInboundTools] = useState(false);
   const [testAddress, setTestAddress] = useState(
     activeEmail?.address || `diag.test@${emailDomain}`
   );
+  const [copiedSpf, setCopiedSpf] = useState(false);
+  const [warmupFrom, setWarmupFrom] = useState(activeEmail?.address || `hello@${emailDomain}`);
+  const [warmupTo, setWarmupTo] = useState(ownerEmail);
+  const [warmupSubject, setWarmupSubject] = useState('Quick hello from VeriBox Mail');
+  const [warmupText, setWarmupText] = useState(
+    'Hi, testing real two-way email delivery from @veribox.name.ng. Reply from Gmail to verify live inbox delivery.'
+  );
+  const [warmupSending, setWarmupSending] = useState(false);
+  const [warmupStatus, setWarmupStatus] = useState<{ ok: boolean; text: string } | null>(null);
 
   useEffect(() => {
     if (activeEmail?.address) {
       setTestAddress(activeEmail.address);
+      setWarmupFrom(activeEmail.address);
     }
   }, [activeEmail?.address]);
+
+  const recommendedSpf =
+    adminDiagnostics?.dnsCheck?.recommendedSpfRecord || `v=spf1 include:send.${emailDomain} ~all`;
+
+  const handleCopySpf = () => {
+    void navigator.clipboard.writeText(recommendedSpf);
+    setCopiedSpf(true);
+    window.setTimeout(() => setCopiedSpf(false), 2200);
+  };
+
+  const handleSendWarmup = async () => {
+    if (!onSendEmail || warmupSending) return;
+    setWarmupSending(true);
+    setWarmupStatus(null);
+    const res = await onSendEmail({
+      fromAddress: warmupFrom.trim().toLowerCase(),
+      toAddress: warmupTo.trim().toLowerCase(),
+      subject: warmupSubject.trim(),
+      text: warmupText.trim(),
+    });
+    setWarmupSending(false);
+    if (res.ok) {
+      setWarmupStatus({
+        ok: true,
+        text: `Sent via Resend (${res.id || 'queued'}). Reply from ${warmupTo.trim()} to see replies arrive in ${warmupFrom.trim()}.`,
+      });
+    } else {
+      setWarmupStatus({
+        ok: false,
+        text: res.error || 'Could not send email via Resend.',
+      });
+    }
+  };
 
   const handleCopy = (id: string, value: string, label: string) => {
     onCopyText(value, label);
@@ -1176,6 +1252,15 @@ export function ProfileTab({
               />
             </div>
 
+            <input
+              type="text"
+              maxLength={140}
+              value={moderationReasonInput}
+              onChange={(e) => setModerationReasonInput(e.target.value)}
+              placeholder="Optional ban/restriction reason (applies to next Ban, Restrict, or Suspend)..."
+              className="h-9 w-full rounded-xl border border-[#D4AF37]/20 bg-[#FAF7F0] px-3 text-xs text-[#1A160D] placeholder:text-[#8A7F6A] focus:border-[#D4AF37] focus:outline-none dark:bg-[#0B0A07] dark:text-[#FAF6EC]"
+            />
+
             <div className="flex flex-wrap items-center gap-1.5">
               {(
                 [
@@ -1225,7 +1310,7 @@ export function ProfileTab({
                   const busy = moderatingUserId === u.id;
                   return (
                     <div key={u.id} className="py-3 space-y-2">
-                      {/* Action Row on Top (like reference IMG_5662) */}
+                      {/* Action Row on Top */}
                       <div className="flex flex-wrap items-center justify-between gap-2">
                         {onModerateUser && !isSelf ? (
                           <div className="flex flex-wrap items-center gap-1.5">
@@ -1233,7 +1318,14 @@ export function ProfileTab({
                               type="button"
                               disabled={busy}
                               onClick={() =>
-                                onModerateUser(u.id, u.status === 'banned' ? 'restore' : 'ban')
+                                onModerateUser(
+                                  u.id,
+                                  u.status === 'banned' ? 'restore' : 'ban',
+                                  {
+                                    reason: moderationReasonInput.trim() || undefined,
+                                    strict: true,
+                                  }
+                                )
                               }
                               className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[11px] font-bold cursor-pointer disabled:opacity-50 ${
                                 u.status === 'banned'
@@ -1242,7 +1334,7 @@ export function ProfileTab({
                               }`}
                             >
                               <Ban className="h-3 w-3" />
-                              <span>{u.status === 'banned' ? 'Banned' : 'Ban'}</span>
+                              <span>{u.status === 'banned' ? 'Banned (Unban)' : 'Strict Ban'}</span>
                             </button>
 
                             <button
@@ -1265,7 +1357,8 @@ export function ProfileTab({
                               onClick={() =>
                                 onModerateUser(
                                   u.id,
-                                  u.status === 'restricted' ? 'restore' : 'restrict'
+                                  u.status === 'restricted' ? 'restore' : 'restrict',
+                                  { reason: moderationReasonInput.trim() || undefined }
                                 )
                               }
                               className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[11px] font-bold cursor-pointer disabled:opacity-50 ${
@@ -1284,7 +1377,8 @@ export function ProfileTab({
                               onClick={() =>
                                 onModerateUser(
                                   u.id,
-                                  u.status === 'suspended' ? 'restore' : 'suspend'
+                                  u.status === 'suspended' ? 'restore' : 'suspend',
+                                  { reason: moderationReasonInput.trim() || undefined }
                                 )
                               }
                               className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[11px] font-bold cursor-pointer disabled:opacity-50 ${
@@ -1311,16 +1405,27 @@ export function ProfileTab({
                       {/* Identity & Wallet Summary */}
                       <div className="flex items-center justify-between gap-2">
                         <div className="min-w-0">
-                          <div className="flex items-center gap-1.5">
+                          <div className="flex flex-wrap items-center gap-1.5">
                             <p className="font-mono text-xs font-extrabold text-[#1A160D] truncate dark:text-[#FAF6EC]">
                               {u.email || u.id}
                             </p>
                             {u.status === 'verified' && (
                               <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-[#D4AF37]" />
                             )}
+                            {u.strictBanned && (
+                              <span className="rounded bg-rose-500/15 px-1.5 py-0.5 font-mono text-[9.5px] font-bold text-rose-600 dark:text-rose-300">
+                                STRICT BAN
+                              </span>
+                            )}
+                            {u.lastIp && (
+                              <span className="rounded bg-[#FAF7F0] px-1.5 py-0.5 font-mono text-[9.5px] text-[#6E6552] border border-[#D4AF37]/20 dark:bg-[#0B0A07] dark:text-[#A89F8C]">
+                                {u.lastIp}
+                              </span>
+                            )}
                           </div>
                           <p className="text-[11px] text-[#6E6552] truncate dark:text-[#A89F8C]">
                             {u.fullName || 'VeriBox User'} · {u.mailboxCount} emails
+                            {u.moderationReason ? ` · ${u.moderationReason}` : ''}
                           </p>
                         </div>
                         <span className="font-mono text-xs font-black text-[#8A6208] shrink-0 dark:text-[#F5D77A]">
@@ -1330,6 +1435,163 @@ export function ProfileTab({
                     </div>
                   );
                 })}
+              </div>
+            )}
+          </section>
+
+          {/* 1b. Strict Visitor & IP / Email Blocker */}
+          <section className="rounded-2xl border border-rose-500/30 bg-white p-4 space-y-3 dark:bg-[#14120D]">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 min-w-0">
+                <Ban className="h-4 w-4 text-rose-500 shrink-0" />
+                <div>
+                  <h2 className="font-display text-sm font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
+                    Visitor &amp; IP / Email Blocker ({strictBans.length})
+                  </h2>
+                  <p className="text-[11px] text-[#6E6552] dark:text-[#A89F8C]">
+                    Strictly block abusive visitors by IP address or email before they can use any VeriBox tool
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            {onBanVisitor && (
+              <form
+                onSubmit={async (e) => {
+                  e.preventDefault();
+                  setVisitorBanFeedback(null);
+                  const cleanVal = visitorBanValue.trim();
+                  if (!cleanVal) {
+                    setVisitorBanFeedback({
+                      type: 'error',
+                      text: `Enter a valid ${visitorBanType === 'ip' ? 'IP address' : 'email address'} to block.`,
+                    });
+                    return;
+                  }
+                  const res = await onBanVisitor({
+                    targetType: visitorBanType,
+                    targetValue: cleanVal,
+                    reason: visitorBanReason.trim() || undefined,
+                  });
+                  if (res.ok) {
+                    setVisitorBanValue('');
+                    setVisitorBanReason('');
+                    setVisitorBanFeedback({
+                      type: 'success',
+                      text: `Blocked ${visitorBanType.toUpperCase()} "${cleanVal}" strictly.`,
+                    });
+                  } else {
+                    setVisitorBanFeedback({
+                      type: 'error',
+                      text: res.error || 'Could not apply visitor ban.',
+                    });
+                  }
+                }}
+                className="space-y-2"
+              >
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {(['ip', 'email'] as const).map((t) => (
+                    <button
+                      key={t}
+                      type="button"
+                      onClick={() => setVisitorBanType(t)}
+                      className={`rounded-lg px-2.5 py-1 text-[11px] font-bold cursor-pointer ${
+                        visitorBanType === t
+                          ? 'bg-rose-600 text-white'
+                          : 'border border-[#D4AF37]/25 bg-[#FAF7F0] text-[#6E6552] dark:bg-[#0B0A07] dark:text-[#D5CCB8]'
+                      }`}
+                    >
+                      {t === 'ip' ? 'Ban Visitor IP' : 'Ban Email'}
+                    </button>
+                  ))}
+                </div>
+
+                <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                  <input
+                    type="text"
+                    value={visitorBanValue}
+                    onChange={(e) => setVisitorBanValue(e.target.value)}
+                    placeholder={
+                      visitorBanType === 'ip'
+                        ? 'IP address (e.g. 102.89.40.12)'
+                        : 'Email address (e.g. abuser@gmail.com)'
+                    }
+                    className="h-9 w-full rounded-xl border border-[#D4AF37]/25 bg-[#FAF7F0] px-3 font-mono text-xs text-[#1A160D] placeholder:text-[#8A7F6A] focus:border-rose-500 focus:outline-none dark:bg-[#0B0A07] dark:text-[#FAF6EC]"
+                  />
+                  <input
+                    type="text"
+                    maxLength={140}
+                    value={visitorBanReason}
+                    onChange={(e) => setVisitorBanReason(e.target.value)}
+                    placeholder="Reason (optional)"
+                    className="h-9 w-full rounded-xl border border-[#D4AF37]/25 bg-[#FAF7F0] px-3 text-xs text-[#1A160D] placeholder:text-[#8A7F6A] focus:border-rose-500 focus:outline-none dark:bg-[#0B0A07] dark:text-[#FAF6EC]"
+                  />
+                </div>
+
+                <div className="flex items-center justify-between gap-2">
+                  {visitorBanFeedback ? (
+                    <span
+                      className={`text-[11px] font-semibold ${
+                        visitorBanFeedback.type === 'success'
+                          ? 'text-emerald-700 dark:text-emerald-300'
+                          : 'text-rose-600 dark:text-rose-300'
+                      }`}
+                    >
+                      {visitorBanFeedback.text}
+                    </span>
+                  ) : (
+                    <span className="text-[11px] text-[#8A7F6A] dark:text-[#A89F8C]">
+                      Blocks all API &amp; UI access immediately
+                    </span>
+                  )}
+                  <button
+                    type="submit"
+                    disabled={banningVisitor}
+                    className="inline-flex min-h-[36px] items-center gap-1.5 rounded-xl bg-rose-600 px-3.5 py-1.5 text-xs font-extrabold text-white hover:bg-rose-500 disabled:opacity-60 cursor-pointer shrink-0"
+                  >
+                    {banningVisitor ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Ban className="h-3.5 w-3.5" />
+                    )}
+                    <span>Block Visitor</span>
+                  </button>
+                </div>
+              </form>
+            )}
+
+            {strictBans.length === 0 ? (
+              <p className="rounded-xl border border-dashed border-[#D4AF37]/20 py-4 text-center text-xs text-[#6E6552] dark:text-[#A89F8C]">
+                No strict email or IP bans active.
+              </p>
+            ) : (
+              <div className="divide-y divide-[#D4AF37]/15 max-h-60 overflow-y-auto">
+                {strictBans.map((entry) => (
+                  <div key={entry.id} className="flex items-center justify-between gap-2 py-2">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-1.5">
+                        <span className="rounded bg-rose-500/15 px-1.5 py-0.5 font-mono text-[9.5px] font-extrabold uppercase text-rose-600 dark:text-rose-300">
+                          {entry.targetType}
+                        </span>
+                        <span className="font-mono text-xs font-bold text-[#1A160D] truncate dark:text-[#FAF6EC]">
+                          {entry.targetValue}
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-[#6E6552] truncate dark:text-[#A89F8C]">
+                        {entry.reason || 'Strict ban active'} · {formatRelativeTime(entry.createdAt)}
+                      </p>
+                    </div>
+                    {onRemoveStrictBan && (
+                      <button
+                        type="button"
+                        onClick={() => onRemoveStrictBan(entry.id)}
+                        className="rounded-lg border border-[#D4AF37]/30 px-2.5 py-1 text-[11px] font-bold text-[#8A6208] hover:bg-[#D4AF37]/10 cursor-pointer shrink-0 dark:text-[#F5D77A]"
+                      >
+                        Unban
+                      </button>
+                    )}
+                  </div>
+                ))}
               </div>
             )}
           </section>
@@ -1656,10 +1918,179 @@ export function ProfileTab({
                             ))}
                           </div>
                         )}
+                        {adminTestResult.dnsCheck && !adminTestResult.dnsCheck.spfOk && (
+                          <div className="rounded-lg border border-rose-500/35 bg-rose-500/10 p-2.5 text-[10px] text-rose-700 dark:text-rose-200 space-y-1.5">
+                            <p className="font-bold flex items-center gap-1.5">
+                              <AlertTriangle className="h-3 w-3 shrink-0 text-rose-600" />
+                              <span>Missing Root SPF TXT Record on Cloudflare DNS</span>
+                            </p>
+                            <p className="opacity-95 leading-relaxed">
+                              Do <strong>NOT</strong> turn on Cloudflare Email Routing (it conflicts with Resend MX records). Instead go to <strong>Cloudflare → DNS → Records → Add TXT</strong> with Name <code className="font-mono">@</code> and Content:
+                            </p>
+                            <div className="flex items-center justify-between gap-2 rounded bg-white/80 px-2 py-1 font-mono dark:bg-[#14120D]">
+                              <span className="font-bold select-all break-all">
+                                {adminTestResult.dnsCheck.recommendedSpfRecord || recommendedSpf}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={handleCopySpf}
+                                className="shrink-0 rounded bg-[#D4AF37] px-2 py-0.5 text-[10px] font-extrabold text-[#0A0906] cursor-pointer"
+                              >
+                                {copiedSpf ? 'Copied' : 'Copy'}
+                              </button>
+                            </div>
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>
                 )}
+              </div>
+            )}
+          </section>
+
+          {/* 4. Domain Trust (Cloudflare DNS Fix) & Gmail Two-Way Warmup */}
+          <section className="rounded-2xl border border-[#D4AF37]/30 bg-white p-4 space-y-3 dark:bg-[#14120D]">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <ShieldCheck className="h-4 w-4 text-[#D4AF37]" />
+                <h2 className="font-display text-sm font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
+                  Domain Trust &amp; Two-Way Gmail Chat
+                </h2>
+              </div>
+              {typeof adminDiagnostics?.dnsCheck?.trustScore === 'number' && (
+                <span
+                  className={`rounded-md px-2 py-0.5 font-mono text-[10px] font-bold ${
+                    adminDiagnostics.dnsCheck.trustScore >= 90
+                      ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+                      : 'bg-amber-500/15 text-amber-800 dark:text-amber-300'
+                  }`}
+                >
+                  DNS Trust: {adminDiagnostics.dnsCheck.trustScore}/100
+                </span>
+              )}
+            </div>
+
+            {adminDiagnostics?.dnsCheck && (
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 text-[10px] font-mono">
+                <div className="rounded-lg border border-[#D4AF37]/20 bg-[#FAF7F0] px-2.5 py-1.5 dark:bg-[#0B0A07]">
+                  <p className="text-[#6E6552] dark:text-[#A89F8C]">Resend MX</p>
+                  <p className={adminDiagnostics.dnsCheck.mxOk ? 'font-bold text-emerald-600 dark:text-emerald-400' : 'font-bold text-rose-600'}>
+                    {adminDiagnostics.dnsCheck.mxOk ? 'Active' : 'Missing'}
+                  </p>
+                </div>
+                <div className="rounded-lg border border-[#D4AF37]/20 bg-[#FAF7F0] px-2.5 py-1.5 dark:bg-[#0B0A07]">
+                  <p className="text-[#6E6552] dark:text-[#A89F8C]">Root SPF (@)</p>
+                  <p className={adminDiagnostics.dnsCheck.spfOk ? 'font-bold text-emerald-600 dark:text-emerald-400' : 'font-bold text-rose-600'}>
+                    {adminDiagnostics.dnsCheck.spfOk ? 'Valid' : 'Missing'}
+                  </p>
+                </div>
+                <div className="rounded-lg border border-[#D4AF37]/20 bg-[#FAF7F0] px-2.5 py-1.5 dark:bg-[#0B0A07]">
+                  <p className="text-[#6E6552] dark:text-[#A89F8C]">Resend DKIM</p>
+                  <p className={adminDiagnostics.dnsCheck.dkimOk ? 'font-bold text-emerald-600 dark:text-emerald-400' : 'font-bold text-amber-600'}>
+                    {adminDiagnostics.dnsCheck.dkimOk ? 'Verified' : 'Pending'}
+                  </p>
+                </div>
+                <div className="rounded-lg border border-[#D4AF37]/20 bg-[#FAF7F0] px-2.5 py-1.5 dark:bg-[#0B0A07]">
+                  <p className="text-[#6E6552] dark:text-[#A89F8C]">DMARC</p>
+                  <p className={adminDiagnostics.dnsCheck.dmarcOk ? 'font-bold text-emerald-600 dark:text-emerald-400' : 'font-bold text-amber-600'}>
+                    {adminDiagnostics.dnsCheck.dmarcOk ? 'Configured' : 'Missing'}
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {adminDiagnostics?.dnsCheck && !adminDiagnostics.dnsCheck.spfOk && (
+              <div className="rounded-xl border border-rose-500/40 bg-rose-500/10 p-3 text-[11px] text-rose-800 dark:text-rose-200 space-y-2">
+                <p className="font-extrabold flex items-center gap-1.5">
+                  <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-rose-600" />
+                  <span>Cloudflare Fix: Add Root SPF in DNS → Records (Not Email Routing)</span>
+                </p>
+                <p className="leading-relaxed">
+                  Cloudflare Email Routing fails with <em>&quot;Existing non-Cloudflare MX records conflict&quot;</em> because Resend already owns your MX records. Leave Email Routing turned OFF and open <strong>Cloudflare → DNS → Records → Add record</strong> (Type: <strong>TXT</strong>, Name: <strong>@</strong>):
+                </p>
+                <div className="flex items-center justify-between gap-2 rounded-lg border border-rose-500/25 bg-white/90 px-2.5 py-1.5 font-mono dark:bg-[#0B0A07]">
+                  <span className="font-bold text-[#1A160D] dark:text-[#F5D77A] select-all break-all">
+                    {recommendedSpf}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={handleCopySpf}
+                    className="inline-flex items-center gap-1 shrink-0 rounded-md bg-[#D4AF37] px-2.5 py-1 text-[10px] font-extrabold text-[#0A0906] hover:bg-[#E5C150] cursor-pointer"
+                  >
+                    {copiedSpf ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+                    <span>{copiedSpf ? 'Copied' : 'Copy'}</span>
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {onSendEmail && (
+              <div className="rounded-xl border border-[#D4AF37]/20 bg-[#FAF7F0] p-3 space-y-2 dark:bg-[#0B0A07]">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-extrabold text-[#1A160D] dark:text-[#FAF6EC]">
+                    Send Warmup Email to Gmail (Real Resend Outbound)
+                  </span>
+                  <span className="font-mono text-[10px] text-[#6E6552] dark:text-[#A89F8C]">
+                    Two-way reply enabled
+                  </span>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <input
+                    type="email"
+                    value={warmupFrom}
+                    onChange={(e) => setWarmupFrom(e.target.value)}
+                    placeholder={`From (@${emailDomain})`}
+                    className="h-9 rounded-lg border border-[#D4AF37]/25 bg-white px-2.5 font-mono text-xs text-[#1A160D] focus:border-[#D4AF37] focus:outline-none dark:bg-[#14120D] dark:text-[#FAF6EC]"
+                  />
+                  <input
+                    type="email"
+                    value={warmupTo}
+                    onChange={(e) => setWarmupTo(e.target.value)}
+                    placeholder="Recipient Gmail (e.g. name@gmail.com)"
+                    className="h-9 rounded-lg border border-[#D4AF37]/25 bg-white px-2.5 font-mono text-xs text-[#1A160D] focus:border-[#D4AF37] focus:outline-none dark:bg-[#14120D] dark:text-[#FAF6EC]"
+                  />
+                </div>
+                <input
+                  type="text"
+                  value={warmupSubject}
+                  onChange={(e) => setWarmupSubject(e.target.value)}
+                  placeholder="Subject"
+                  className="h-9 w-full rounded-lg border border-[#D4AF37]/25 bg-white px-2.5 text-xs text-[#1A160D] focus:border-[#D4AF37] focus:outline-none dark:bg-[#14120D] dark:text-[#FAF6EC]"
+                />
+                <textarea
+                  rows={2}
+                  value={warmupText}
+                  onChange={(e) => setWarmupText(e.target.value)}
+                  placeholder="Write a conversational message to Gmail..."
+                  className="w-full rounded-lg border border-[#D4AF37]/25 bg-white p-2.5 text-xs text-[#1A160D] focus:border-[#D4AF37] focus:outline-none dark:bg-[#14120D] dark:text-[#FAF6EC]"
+                />
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    disabled={warmupSending}
+                    onClick={() => void handleSendWarmup()}
+                    className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg bg-[#D4AF37] px-3 text-xs font-extrabold text-[#0A0906] hover:bg-[#E5C150] disabled:opacity-60 cursor-pointer"
+                  >
+                    {warmupSending ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Send className="h-3.5 w-3.5" />
+                    )}
+                    <span>{warmupSending ? 'Sending...' : 'Send to Gmail'}</span>
+                  </button>
+                  {warmupStatus && (
+                    <p
+                      className={`text-[11px] font-semibold ${
+                        warmupStatus.ok
+                          ? 'text-emerald-700 dark:text-emerald-300'
+                          : 'text-rose-600 dark:text-rose-300'
+                      }`}
+                    >
+                      {warmupStatus.text}
+                    </p>
+                  )}
+                </div>
               </div>
             )}
           </section>
